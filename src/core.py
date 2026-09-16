@@ -286,14 +286,46 @@ def _unpack_vector(blob: bytes, dimension: int) -> tuple[float, ...]:
 
 class _StdlibTokenizer:
     def __init__(self, bundle: Path):
-        vocab_path = bundle / "vocab.txt"
-        vocabulary = vocab_path.read_text(encoding="utf-8").splitlines()
-        self.vocabulary = {token: index for index, token in enumerate(vocabulary)}
         settings = MODEL_BUNDLE_MANIFEST["tokenizer"]
-        self.lower_case = bool(settings["do_lower_case"])
+        tokenizer_files = settings["files"]
+        if "tokenizer.json" not in tokenizer_files:
+            raise SemanticError("tokenizer manifest does not include tokenizer.json")
+        try:
+            tokenizer = json.loads((bundle / "tokenizer.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SemanticError("tokenizer.json is unreadable") from exc
+        model = tokenizer.get("model")
+        normalizer = tokenizer.get("normalizer")
+        if not isinstance(model, dict) or model.get("type") != "WordPiece":
+            raise SemanticError("tokenizer model is not WordPiece")
+        if not isinstance(normalizer, dict) or normalizer.get("type") != "BertNormalizer":
+            raise SemanticError("tokenizer normalizer is not BertNormalizer")
+        vocabulary = model.get("vocab")
+        if not isinstance(vocabulary, dict) or not all(isinstance(key, str) and isinstance(value, int)
+                                                       for key, value in vocabulary.items()):
+            raise SemanticError("tokenizer vocabulary is invalid")
+        self.vocabulary = vocabulary
+        self.lower_case = bool(normalizer.get("lowercase", settings["do_lower_case"]))
+        self.strip_accents = normalizer.get("strip_accents")
+        if self.strip_accents is None:
+            self.strip_accents = self.lower_case
+        self.clean_text = bool(normalizer.get("clean_text", True))
+        self.handle_chinese_chars = bool(normalizer.get("handle_chinese_chars", True))
         self.max_length = int(settings["max_length"])
+        self.max_input_chars_per_word = int(model.get("max_input_chars_per_word", 100))
+        self.unknown_token = str(model.get("unk_token", settings["special_tokens"]["unk"]))
+        self.cls_token = str(settings["special_tokens"]["cls"])
+        self.sep_token = str(settings["special_tokens"]["sep"])
+        self.special_tokens = {
+            item["content"]: item["id"]
+            for item in tokenizer.get("added_tokens", [])
+            if isinstance(item, dict) and item.get("special") is True
+            and isinstance(item.get("content"), str) and isinstance(item.get("id"), int)
+        }
 
     def _wordpiece(self, token: str) -> list[str]:
+        if len(token) > self.max_input_chars_per_word:
+            return [self.unknown_token]
         if token in self.vocabulary:
             return [token]
         pieces: list[str] = []
@@ -315,16 +347,91 @@ class _StdlibTokenizer:
             start = end
         return pieces
 
-    def tokens(self, text: str) -> list[int]:
+    @staticmethod
+    def _is_control(character: str) -> bool:
+        return unicodedata.category(character) in {"Cc", "Cf"} and character not in "\t\n\r"
+
+    @staticmethod
+    def _is_whitespace(character: str) -> bool:
+        return character in " \t\n\r" or unicodedata.category(character) == "Zs"
+
+    @staticmethod
+    def _is_chinese_character(character: str) -> bool:
+        codepoint = ord(character)
+        return (
+            0x4E00 <= codepoint <= 0x9FFF
+            or 0x3400 <= codepoint <= 0x4DBF
+            or 0x20000 <= codepoint <= 0x2A6DF
+            or 0x2A700 <= codepoint <= 0x2B73F
+            or 0x2B740 <= codepoint <= 0x2B81F
+            or 0x2B820 <= codepoint <= 0x2CEAF
+            or 0xF900 <= codepoint <= 0xFAFF
+            or 0x2F800 <= codepoint <= 0x2FA1F
+        )
+
+    @staticmethod
+    def _is_punctuation(character: str) -> bool:
+        codepoint = ord(character)
+        return (33 <= codepoint <= 47 or 58 <= codepoint <= 64 or 91 <= codepoint <= 96
+                or 123 <= codepoint <= 126 or unicodedata.category(character).startswith("P"))
+
+    def _normalize(self, text: str) -> str:
+        characters: list[str] = []
+        for character in text:
+            if self.clean_text and (character == "\x00" or self._is_control(character)):
+                continue
+            if self.handle_chinese_chars and self._is_chinese_character(character):
+                characters.extend((" ", character, " "))
+            else:
+                characters.append(character)
+        text = "".join(characters)
+        if self.strip_accents:
+            text = unicodedata.normalize("NFD", text)
+            text = "".join(character for character in text if unicodedata.category(character) != "Mn")
         if self.lower_case:
             text = text.lower()
-        text = unicodedata.normalize("NFD", text)
-        text = "".join(character for character in text if unicodedata.category(character) != "Mn")
-        basic = re.findall(r"[\w]+|[^\w\s]", text, flags=re.UNICODE)
-        pieces = [piece for token in basic for piece in self._wordpiece(token)]
-        ids = [self.vocabulary.get("[CLS]", 101)]
-        ids.extend(self.vocabulary.get(piece, self.vocabulary.get("[UNK]", 100)) for piece in pieces[: self.max_length - 2])
-        ids.append(self.vocabulary.get("[SEP]", 102))
+        return text
+
+    def _pretokenize(self, text: str) -> list[str]:
+        tokens: list[str] = []
+        current: list[str] = []
+        for character in text:
+            if self._is_whitespace(character):
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+            elif self._is_punctuation(character):
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+                tokens.append(character)
+            else:
+                current.append(character)
+        if current:
+            tokens.append("".join(current))
+        return tokens
+
+    def tokens(self, text: str) -> list[int]:
+        body: list[int] = []
+        remaining = text
+        while remaining:
+            matches = [(remaining.find(token), token, token_id) for token, token_id in self.special_tokens.items()
+                       if remaining.find(token) >= 0]
+            if not matches:
+                pieces = [piece for token in self._pretokenize(self._normalize(remaining)) for piece in self._wordpiece(token)]
+                body.extend(self.vocabulary.get(piece, self.vocabulary[self.unknown_token]) for piece in pieces)
+                break
+            position, token, token_id = min(matches, key=lambda item: (item[0], -len(item[1])))
+            if position:
+                pieces = [piece for chunk in self._pretokenize(self._normalize(remaining[:position]))
+                          for piece in self._wordpiece(chunk)]
+                body.extend(self.vocabulary.get(piece, self.vocabulary[self.unknown_token]) for piece in pieces)
+            body.append(token_id)
+            remaining = remaining[position + len(token):]
+        body = body[: self.max_length - 2]
+        ids = [self.vocabulary[self.cls_token]]
+        ids.extend(body)
+        ids.append(self.vocabulary[self.sep_token])
         return ids
 
 
@@ -432,6 +539,16 @@ def _remove_file(connection: sqlite3.Connection, canonical: str) -> None:
     connection.execute("DELETE FROM files WHERE canonical_path = ?", (canonical,))
 
 
+def _sources_unchanged(found: dict[str, tuple[Root, Path]], observed: dict[str, str]) -> bool:
+    for canonical, (_, path) in found.items():
+        try:
+            if content_hash(path.read_bytes()) != observed.get(canonical):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def index(config: Config, rebuild: bool = False, encoder: object | None = None) -> int:
     found = _files(config)
     config.database.parent.mkdir(parents=True, exist_ok=True)
@@ -450,12 +567,14 @@ def index(config: Config, rebuild: bool = False, encoder: object | None = None) 
         old_generation = int(generation_row["value"]) if generation_row else 0
         generation = old_generation + 1
         existing = {row["canonical_path"]: row for row in connection.execute("SELECT * FROM files")}
+        observed_source_hashes: dict[str, str] = {}
         for canonical, (root, path) in found.items():
             stat = path.stat()
             old = existing.get(canonical)
             raw_bytes = path.read_bytes()
             content = raw_bytes.decode("utf-8")
             document = split_markdown(canonical, content, config.section_bytes, raw_bytes)
+            observed_source_hashes[canonical] = document.content_hash
             if old and old["root_id"] == root.id and old["mtime_ns"] == stat.st_mtime_ns and old["content_hash"] == document.content_hash:
                 connection.execute("UPDATE sections SET index_generation = ? WHERE canonical_path = ?",
                                    (generation, canonical))
@@ -518,15 +637,6 @@ def index(config: Config, rebuild: bool = False, encoder: object | None = None) 
                             (row["section_id"], generation, row["content_hash"], EMBEDDING_VERSION,
                              EMBEDDING_FORMAT_VERSION, expected_manifest, vector),
                         )
-                encoded_paths = {row["canonical_path"] for row in to_encode}
-                changed_during_encode = any(
-                    content_hash(Path(path).read_bytes()) != next(
-                        item["content_hash"] for item in section_rows if item["canonical_path"] == path
-                    )
-                    for path in encoded_paths
-                )
-                if changed_during_encode:
-                    raise SemanticError("source changed during embedding")
                 for row in section_rows:
                     connection.execute(
                         "UPDATE embeddings SET generation = ? WHERE section_id = ?",
@@ -548,6 +658,9 @@ def index(config: Config, rebuild: bool = False, encoder: object | None = None) 
                     connection.execute("DELETE FROM embeddings WHERE section_id = ?", (row["section_id"],))
                 semantic_state = SEMANTIC_STATE_STALE
                 semantic_reason = SEMANTIC_REASON_REFRESH_FAILED
+        if not _sources_unchanged(found, observed_source_hashes):
+            connection.rollback()
+            return old_generation
         connection.execute("INSERT INTO metadata(key, value) VALUES ('generation', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(generation),))
         _publish_generation(connection, generation, semantic_state, semantic_reason)
         connection.commit()
@@ -789,27 +902,18 @@ def _scope(config: Config, project: str | None, root_id: str | None, all_project
     return scope_root_ids, global_paths, effective_project
 
 
-def _mark_semantic_stale(config: Config, generation: int, reason: str) -> None:
-    connection = connect(config.database, initialize=False)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'semantic_state'",
-            (SEMANTIC_STATE_STALE,),
-        )
-        connection.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'semantic_reason'",
-            (reason,),
-        )
-        connection.execute(
-            "UPDATE embedding_metadata SET semantic_state = ?, semantic_reason = ? WHERE generation = ?",
-            (SEMANTIC_STATE_STALE, reason, generation),
-        )
-        connection.commit()
-    except sqlite3.DatabaseError:
-        connection.rollback()
-    finally:
-        connection.close()
+def _load_vector_matrix(numpy, rows: Sequence[sqlite3.Row], dimension: int):
+    matrix = numpy.empty((len(rows), dimension), dtype=numpy.float32)
+    expected_size = dimension * 4
+    vector_dtype = numpy.dtype("<f4")
+    for row_number, row in enumerate(rows):
+        blob = row["vector"]
+        if len(blob) != expected_size:
+            raise SemanticError("vector BLOB has the wrong size")
+        matrix[row_number, :] = numpy.frombuffer(blob, dtype=vector_dtype, count=dimension)
+    if rows and not bool(numpy.isfinite(matrix).all()):
+        raise SemanticError("vector BLOB contains non-finite values")
+    return matrix
 
 
 def scan_vectors(
@@ -843,6 +947,7 @@ def scan_vectors(
 
     connection = connect(config.database, initialize=False, readonly=True)
     try:
+        connection.execute("BEGIN")
         _require_schema_version(connection)
         state = dict(connection.execute("SELECT key, value FROM metadata WHERE key IN ('generation', 'semantic_state', 'semantic_generation')").fetchall())
         if state.get("semantic_state") != SEMANTIC_STATE_READY or state.get("generation") != state.get("semantic_generation"):
@@ -850,8 +955,6 @@ def scan_vectors(
         generation = int(state["generation"])
         metadata = connection.execute("SELECT manifest_fingerprint FROM embedding_metadata WHERE generation = ?", (generation,)).fetchone()
         if metadata is None or metadata["manifest_fingerprint"] != manifest_fingerprint():
-            connection.close()
-            _mark_semantic_stale(config, generation, SEMANTIC_REASON_MANIFEST_CHANGED)
             return []
         complete_count = connection.execute(
             """SELECT count(*) FROM sections s JOIN embeddings e ON e.section_id = s.section_id
@@ -864,8 +967,6 @@ def scan_vectors(
         ).fetchone()[0]
         section_count = connection.execute("SELECT count(*) FROM sections WHERE index_generation = ?", (generation,)).fetchone()[0]
         if complete_count != section_count:
-            connection.close()
-            _mark_semantic_stale(config, generation, SEMANTIC_REASON_VECTOR_TABLE_CORRUPT)
             return []
         conditions = [
             "s.index_generation = ?",
@@ -888,18 +989,16 @@ def scan_vectors(
             + " AND ".join(conditions),
             params,
         ).fetchall()
+        dimension = int(MODEL_BUNDLE_MANIFEST["dimension"])
+        try:
+            matrix = _load_vector_matrix(numpy, rows, dimension)
+            scores = matrix @ query if rows else numpy.empty(0, dtype=numpy.float32)
+        except (SemanticError, ValueError, TypeError, RuntimeError):
+            return []
     finally:
         connection.close()
 
     scored: list[tuple[float, sqlite3.Row]] = []
-    dimension = int(MODEL_BUNDLE_MANIFEST["dimension"])
-    try:
-        matrix = numpy.asarray([_unpack_vector(row["vector"], dimension) for row in rows], dtype=numpy.float32)
-        scores = matrix @ query if rows else numpy.empty(0, dtype=numpy.float32)
-    except (SemanticError, ValueError, TypeError, RuntimeError):
-        if rows:
-            _mark_semantic_stale(config, generation, SEMANTIC_REASON_VECTOR_TABLE_CORRUPT)
-        return []
     scored = sorted(
         ((float(score), row) for score, row in zip(scores, rows, strict=True)),
         key=lambda item: (-item[0], item[1]["section_id"]),

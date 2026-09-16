@@ -208,11 +208,15 @@ def test_index_creates_missing_database_parent(tmp_path: Path):
     assert search(config, "database parent", project="phoebe")
 
 
-def test_schema_v2_records_disabled_embedding_generation_metadata(tmp_path: Path):
+def test_schema_v2_records_missing_model_generation_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "note.md").write_text("# Schema\nrecord generation metadata\n")
     config = make_config(tmp_path, [("vault", "phoebe", root)])
+    monkeypatch.setattr(core, "package_version", lambda name: {
+        "numpy": core.MODEL_BUNDLE_MANIFEST["numpy_version"],
+        "onnxruntime": core.MODEL_BUNDLE_MANIFEST["runtime"]["version"],
+    }[name])
 
     assert index(config) == 1
 
@@ -223,12 +227,12 @@ def test_schema_v2_records_disabled_embedding_generation_metadata(tmp_path: Path
         assert state["generation"] == "1"
         assert state["semantic_generation"] == "1"
         assert state["semantic_state"] == "disabled"
-        assert state["semantic_reason"] == "EXTRA_MISSING"
+        assert state["semantic_reason"] == "MODEL_MISSING"
 
         metadata = connection.execute("SELECT * FROM embedding_metadata").fetchone()
         assert metadata["generation"] == 1
         assert metadata["semantic_state"] == "disabled"
-        assert metadata["semantic_reason"] == "EXTRA_MISSING"
+        assert metadata["semantic_reason"] == "MODEL_MISSING"
         assert metadata["model_id"] == "sentence-transformers/all-MiniLM-L6-v2"
         assert metadata["model_hash"]
         assert metadata["tokenizer_fingerprint"]

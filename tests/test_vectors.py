@@ -1,4 +1,5 @@
 import sqlite3
+import struct
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,30 @@ def test_refresh_reembeds_only_changed_sections(tmp_path: Path):
     assert encoder.texts == ["changed alpha"]
 
 
+def test_source_race_keeps_previous_generation_active(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Note\nold alpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    core.index(config, encoder=FakeEncoder())
+    note.write_text("# Note\nnew alpha\n")
+
+    class RacingEncoder(FakeEncoder):
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            note.write_text("# Note\nchanged during refresh\n")
+            return super().encode(texts)
+
+    assert core.index(config, encoder=RacingEncoder()) == 1
+    connection = sqlite3.connect(config.database)
+    try:
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "1"
+        assert connection.execute("SELECT text FROM sections").fetchone()[0] == "old alpha"
+    finally:
+        connection.close()
+
+
 def test_failed_vector_refresh_publishes_lexical_generation_as_stale(tmp_path: Path):
     pytest.importorskip("numpy")
     root = tmp_path / "vault"
@@ -121,7 +146,7 @@ def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path, monkeypat
         connection.close()
 
 
-def test_corrupt_vector_table_falls_back_and_marks_stale(tmp_path: Path):
+def test_corrupt_vector_table_falls_back_without_mutating_database(tmp_path: Path):
     pytest.importorskip("numpy")
     root = tmp_path / "vault"
     root.mkdir()
@@ -135,17 +160,39 @@ def test_corrupt_vector_table_falls_back_and_marks_stale(tmp_path: Path):
         connection.commit()
     finally:
         connection.close()
+    before = config.database.read_bytes()
 
     results = core.semantic_search(config, "alpha", project="p", encoder=encoder)
 
     assert results[0].heading == "Note"
+    assert config.database.read_bytes() == before
     connection = sqlite3.connect(config.database)
     try:
         state = dict(connection.execute("SELECT key, value FROM metadata"))
-        assert state["semantic_state"] == "stale"
-        assert state["semantic_reason"] == "VECTOR_TABLE_CORRUPT"
+        assert state["semantic_state"] == "ready"
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_vector_falls_back_without_scoring_nan(tmp_path: Path, bad_value: float):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\nalpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    core.index(config, encoder=FakeEncoder())
+    bad_vector = struct.pack("<384f", bad_value, *([0.0] * 383))
+    connection = sqlite3.connect(config.database)
+    try:
+        connection.execute("UPDATE embeddings SET vector = ?", (bad_vector,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    results = core.semantic_search(config, "alpha", project="p", encoder=FakeEncoder())
+
+    assert [result.heading for result in results] == ["Note"]
 
 
 def test_default_search_does_not_use_vectors(tmp_path: Path):
