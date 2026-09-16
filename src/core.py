@@ -1,18 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import struct
 import time
+import unicodedata
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Config, Root, _contained
-from .model_bundle import MODEL_BUNDLE_MANIFEST, manifest_fingerprint
+from .model_bundle import (
+    MODEL_BUNDLE_MANIFEST,
+    BundleError,
+    _resolve_active_bundle,
+    manifest_fingerprint,
+    package_version,
+    verify_bundle,
+)
 from .splitter import content_hash, explicit_links, split_markdown
-
 
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
@@ -21,6 +31,13 @@ EMBEDDING_VERSION = 1
 EMBEDDING_FORMAT_VERSION = 1
 SEMANTIC_STATE_DISABLED = "disabled"
 SEMANTIC_DISABLED_REASON = "EXTRA_MISSING"
+SEMANTIC_STATE_READY = "ready"
+SEMANTIC_STATE_STALE = "stale"
+SEMANTIC_REASON_MANIFEST_CHANGED = "MANIFEST_CHANGED"
+SEMANTIC_REASON_VECTOR_TABLE_CORRUPT = "VECTOR_TABLE_CORRUPT"
+SEMANTIC_REASON_REFRESH_FAILED = "REFRESH_FAILED"
+SEMANTIC_REASON_MODEL_MISSING = "MODEL_MISSING"
+SEMANTIC_REASON_MODEL_HASH_MISMATCH = "MODEL_HASH_MISMATCH"
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
 
@@ -50,6 +67,15 @@ CREATE TABLE IF NOT EXISTS sections (
 );
 CREATE INDEX IF NOT EXISTS sections_path_idx ON sections(canonical_path);
 CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5(section_id UNINDEXED, heading, text);
+CREATE TABLE IF NOT EXISTS embeddings (
+    section_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    embedding_version INTEGER NOT NULL,
+    embedding_format_version INTEGER NOT NULL,
+    manifest_fingerprint TEXT NOT NULL,
+    vector BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS embedding_metadata (
     generation INTEGER PRIMARY KEY,
@@ -78,6 +104,7 @@ CREATE TABLE IF NOT EXISTS embedding_metadata (
 SCHEMA_STATEMENTS = tuple(statement.strip() for statement in SCHEMA.split(";") if statement.strip())
 DROP_SCHEMA_STATEMENTS = (
     "DROP TABLE IF EXISTS embedding_metadata",
+    "DROP TABLE IF EXISTS embeddings",
     "DROP TABLE IF EXISTS sections_fts",
     "DROP TABLE IF EXISTS sections",
     "DROP TABLE IF EXISTS files",
@@ -140,7 +167,12 @@ def _embedding_metadata() -> dict[str, object]:
     }
 
 
-def _publish_generation(connection: sqlite3.Connection, generation: int) -> None:
+def _publish_generation(
+    connection: sqlite3.Connection,
+    generation: int,
+    semantic_state: str = SEMANTIC_STATE_DISABLED,
+    semantic_reason: str = SEMANTIC_DISABLED_REASON,
+) -> None:
     metadata = _embedding_metadata()
     connection.execute(
         """INSERT INTO embedding_metadata
@@ -150,7 +182,7 @@ def _publish_generation(connection: sqlite3.Connection, generation: int) -> None
             dimension, dtype, pooling, normalization, metric, embedding_version,
             embedding_format_version, manifest_fingerprint)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (generation, time.time(), SEMANTIC_STATE_DISABLED, SEMANTIC_DISABLED_REASON,
+        (generation, time.time(), semantic_state, semantic_reason,
          *(metadata[key] for key in (
             "model_id", "model_hash", "model_fingerprint", "model_version",
             "tokenizer_version", "tokenizer_fingerprint", "runtime_name", "runtime_version",
@@ -166,7 +198,7 @@ def _publish_generation(connection: sqlite3.Connection, generation: int) -> None
            ('semantic_generation', ?),
            ('semantic_manifest_fingerprint', ?)
            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-        (SEMANTIC_STATE_DISABLED, SEMANTIC_DISABLED_REASON, str(generation), fingerprint),
+        (semantic_state, semantic_reason, str(generation), fingerprint),
     )
 
 
@@ -200,6 +232,141 @@ class Candidate:
     created_date: str | None
     score: float
     reason: str
+
+
+class SemanticError(RuntimeError):
+    """Raised internally when the optional semantic lane is unavailable."""
+
+
+def _optional_numpy():
+    try:
+        import numpy
+    except ImportError as exc:
+        raise SemanticError(SEMANTIC_DISABLED_REASON) from exc
+    return numpy
+
+
+def _semantic_backend_reason(config: Config) -> str | None:
+    if (package_version("numpy") != MODEL_BUNDLE_MANIFEST["numpy_version"]
+            or package_version("onnxruntime") != MODEL_BUNDLE_MANIFEST["runtime"]["version"]):
+        return SEMANTIC_DISABLED_REASON
+    bundle = config.bundle_dir
+    if not bundle.exists() and not bundle.is_symlink():
+        return SEMANTIC_REASON_MODEL_MISSING
+    try:
+        verify_bundle(bundle)
+    except BundleError as exc:
+        if "hash mismatch" in str(exc):
+            return SEMANTIC_REASON_MODEL_HASH_MISMATCH
+        return SEMANTIC_REASON_MODEL_MISSING
+    return None
+
+
+def _normalize_vector(values: Iterable[float]) -> tuple[float, ...]:
+    vector = tuple(float(value) for value in values)
+    norm = math.sqrt(sum(value * value for value in vector))
+    if not vector or not math.isfinite(norm) or norm == 0:
+        raise SemanticError("embedding vector is not finite and non-zero")
+    return tuple(value / norm for value in vector)
+
+
+def _pack_vector(values: Iterable[float]) -> bytes:
+    vector = _normalize_vector(values)
+    if len(vector) != int(MODEL_BUNDLE_MANIFEST["dimension"]):
+        raise SemanticError("embedding dimension does not match the manifest")
+    return struct.pack("<" + "f" * len(vector), *vector)
+
+
+def _unpack_vector(blob: bytes, dimension: int) -> tuple[float, ...]:
+    expected_size = dimension * 4
+    if len(blob) != expected_size:
+        raise SemanticError("vector BLOB has the wrong size")
+    return struct.unpack("<" + "f" * dimension, blob)
+
+
+class _StdlibTokenizer:
+    def __init__(self, bundle: Path):
+        vocab_path = bundle / "vocab.txt"
+        vocabulary = vocab_path.read_text(encoding="utf-8").splitlines()
+        self.vocabulary = {token: index for index, token in enumerate(vocabulary)}
+        settings = MODEL_BUNDLE_MANIFEST["tokenizer"]
+        self.lower_case = bool(settings["do_lower_case"])
+        self.max_length = int(settings["max_length"])
+
+    def _wordpiece(self, token: str) -> list[str]:
+        if token in self.vocabulary:
+            return [token]
+        pieces: list[str] = []
+        start = 0
+        while start < len(token):
+            end = len(token)
+            match = None
+            while start < end:
+                candidate = token[start:end]
+                if start:
+                    candidate = "##" + candidate
+                if candidate in self.vocabulary:
+                    match = candidate
+                    break
+                end -= 1
+            if match is None:
+                return ["[UNK]"]
+            pieces.append(match)
+            start = end
+        return pieces
+
+    def tokens(self, text: str) -> list[int]:
+        if self.lower_case:
+            text = text.lower()
+        text = unicodedata.normalize("NFD", text)
+        text = "".join(character for character in text if unicodedata.category(character) != "Mn")
+        basic = re.findall(r"[\w]+|[^\w\s]", text, flags=re.UNICODE)
+        pieces = [piece for token in basic for piece in self._wordpiece(token)]
+        ids = [self.vocabulary.get("[CLS]", 101)]
+        ids.extend(self.vocabulary.get(piece, self.vocabulary.get("[UNK]", 100)) for piece in pieces[: self.max_length - 2])
+        ids.append(self.vocabulary.get("[SEP]", 102))
+        return ids
+
+
+class _OnnxEncoder:
+    def __init__(self, bundle: Path):
+        try:
+            import onnxruntime
+        except ImportError as exc:
+            raise SemanticError(SEMANTIC_DISABLED_REASON) from exc
+        numpy = _optional_numpy()
+        self.numpy = numpy
+        self.tokenizer = _StdlibTokenizer(bundle)
+        self.session = onnxruntime.InferenceSession(
+            str(bundle / "onnx" / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+
+    def encode(self, texts: Sequence[str]):
+        if not texts:
+            return self.numpy.empty((0, int(MODEL_BUNDLE_MANIFEST["dimension"])), dtype=self.numpy.float32)
+        encoded = [self.tokenizer.tokens(text) for text in texts]
+        width = max(len(item) for item in encoded)
+        pad_id = self.tokenizer.vocabulary.get("[PAD]", 0)
+        input_ids = self.numpy.asarray([item + [pad_id] * (width - len(item)) for item in encoded], dtype=self.numpy.int64)
+        attention = (input_ids != pad_id).astype(self.numpy.int64)
+        token_types = self.numpy.zeros_like(input_ids)
+        names = {item.name for item in self.session.get_inputs()}
+        inputs = {"input_ids": input_ids, "attention_mask": attention, "token_type_ids": token_types}
+        outputs = self.session.run(None, {name: value for name, value in inputs.items() if name in names})
+        hidden = self.numpy.asarray(outputs[0], dtype=self.numpy.float32)
+        if hidden.ndim == 2:
+            norms = self.numpy.linalg.norm(hidden, axis=1, keepdims=True)
+            return (hidden / self.numpy.maximum(norms, self.numpy.finfo(self.numpy.float32).tiny)).astype(self.numpy.float32)
+        mask = attention[..., None].astype(self.numpy.float32)
+        pooled = (hidden * mask).sum(axis=1) / self.numpy.maximum(mask.sum(axis=1), 1.0)
+        norms = self.numpy.linalg.norm(pooled, axis=1, keepdims=True)
+        return (pooled / self.numpy.maximum(norms, self.numpy.finfo(self.numpy.float32).tiny)).astype(self.numpy.float32)
+
+
+def _encoder_vectors(encoder: object, texts: Sequence[str]) -> list[bytes]:
+    raw = encoder.encode(texts) if hasattr(encoder, "encode") else encoder(texts)
+    return [_pack_vector(vector) for vector in raw]
 
 
 def connect(database: Path, initialize: bool = True, readonly: bool = False) -> sqlite3.Connection:
@@ -259,12 +426,13 @@ def _files(config: Config) -> dict[str, tuple[Root, Path]]:
 
 
 def _remove_file(connection: sqlite3.Connection, canonical: str) -> None:
+    connection.execute("DELETE FROM embeddings WHERE section_id IN (SELECT section_id FROM sections WHERE canonical_path = ?)", (canonical,))
     connection.execute("DELETE FROM sections_fts WHERE section_id IN (SELECT section_id FROM sections WHERE canonical_path = ?)", (canonical,))
     connection.execute("DELETE FROM sections WHERE canonical_path = ?", (canonical,))
     connection.execute("DELETE FROM files WHERE canonical_path = ?", (canonical,))
 
 
-def index(config: Config, rebuild: bool = False) -> int:
+def index(config: Config, rebuild: bool = False, encoder: object | None = None) -> int:
     found = _files(config)
     config.database.parent.mkdir(parents=True, exist_ok=True)
     connection = connect(config.database, initialize=False)
@@ -311,8 +479,77 @@ def index(config: Config, rebuild: bool = False) -> int:
         current = set(found)
         for canonical in set(existing) - current:
             _remove_file(connection, canonical)
+        semantic_state = SEMANTIC_STATE_DISABLED
+        semantic_reason = SEMANTIC_DISABLED_REASON
+        backend_reason = None if encoder is not None else _semantic_backend_reason(config)
+        if backend_reason is not None:
+            semantic_reason = backend_reason
+        else:
+            to_encode: list[sqlite3.Row] = []
+            try:
+                section_rows = connection.execute("SELECT section_id, canonical_path, text, content_hash FROM sections").fetchall()
+                stored_embeddings = {
+                    row["section_id"]: row
+                    for row in connection.execute("SELECT * FROM embeddings").fetchall()
+                }
+                expected_manifest = manifest_fingerprint()
+                to_encode = [
+                    row for row in section_rows
+                    if (row["section_id"] not in stored_embeddings
+                        or stored_embeddings[row["section_id"]]["content_hash"] != row["content_hash"]
+                        or stored_embeddings[row["section_id"]]["manifest_fingerprint"] != expected_manifest
+                        or stored_embeddings[row["section_id"]]["embedding_version"] != EMBEDDING_VERSION
+                        or stored_embeddings[row["section_id"]]["embedding_format_version"] != EMBEDDING_FORMAT_VERSION
+                        or len(stored_embeddings[row["section_id"]]["vector"]) != int(MODEL_BUNDLE_MANIFEST["dimension"]) * 4)
+                ]
+                if to_encode:
+                    if encoder is None:
+                        encoder = _OnnxEncoder(_resolve_active_bundle(config.bundle_dir))
+                    vectors = _encoder_vectors(encoder, [row["text"] for row in to_encode])
+                    if len(vectors) != len(to_encode):
+                        raise SemanticError("embedding backend returned the wrong number of vectors")
+                    for row, vector in zip(to_encode, vectors, strict=True):
+                        connection.execute(
+                            "INSERT INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?) "
+                            "ON CONFLICT(section_id) DO UPDATE SET generation=excluded.generation, "
+                            "content_hash=excluded.content_hash, embedding_version=excluded.embedding_version, "
+                            "embedding_format_version=excluded.embedding_format_version, "
+                            "manifest_fingerprint=excluded.manifest_fingerprint, vector=excluded.vector",
+                            (row["section_id"], generation, row["content_hash"], EMBEDDING_VERSION,
+                             EMBEDDING_FORMAT_VERSION, expected_manifest, vector),
+                        )
+                encoded_paths = {row["canonical_path"] for row in to_encode}
+                changed_during_encode = any(
+                    content_hash(Path(path).read_bytes()) != next(
+                        item["content_hash"] for item in section_rows if item["canonical_path"] == path
+                    )
+                    for path in encoded_paths
+                )
+                if changed_during_encode:
+                    raise SemanticError("source changed during embedding")
+                for row in section_rows:
+                    connection.execute(
+                        "UPDATE embeddings SET generation = ? WHERE section_id = ?",
+                        (generation, row["section_id"]),
+                    )
+                valid_vectors = connection.execute(
+                    """SELECT count(*) FROM sections s JOIN embeddings e ON e.section_id = s.section_id
+                       WHERE e.generation = ? AND e.content_hash = s.content_hash
+                         AND e.embedding_version = ? AND e.embedding_format_version = ?
+                         AND e.manifest_fingerprint = ?""",
+                    (generation, EMBEDDING_VERSION, EMBEDDING_FORMAT_VERSION, expected_manifest),
+                ).fetchone()[0]
+                if valid_vectors != len(section_rows):
+                    raise SemanticError("vector table is incomplete")
+                semantic_state = SEMANTIC_STATE_READY
+                semantic_reason = ""
+            except (BundleError, IndexError, OSError, SemanticError, TypeError, ValueError, RuntimeError, sqlite3.DatabaseError):
+                for row in to_encode:
+                    connection.execute("DELETE FROM embeddings WHERE section_id = ?", (row["section_id"],))
+                semantic_state = SEMANTIC_STATE_STALE
+                semantic_reason = SEMANTIC_REASON_REFRESH_FAILED
         connection.execute("INSERT INTO metadata(key, value) VALUES ('generation', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(generation),))
-        _publish_generation(connection, generation)
+        _publish_generation(connection, generation, semantic_state, semantic_reason)
         connection.commit()
         return generation
     except Exception:
@@ -412,7 +649,10 @@ def _token_set(value: str) -> set[str]:
 
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
-           all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None) -> list[Candidate]:
+           all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
+           semantic: bool = False) -> list[Candidate]:
+    if semantic:
+        return semantic_search(config, query, project, root_id, all_projects, limit, refresh)
     if limit < 1:
         raise ValueError("limit must be positive")
     if not config.database.exists():
@@ -530,6 +770,222 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                                  row["created_date"], score, ", ".join(reasons) or "text match"))
     results.sort(key=lambda item: (-item.score, item.section_id))
     return results[:limit]
+
+
+def _scope(config: Config, project: str | None, root_id: str | None, all_projects: bool) -> tuple[list[str], list[str], str | None]:
+    if root_id and not any(root.id == root_id for root in config.roots):
+        return [], [], None
+    global_paths = sorted(str(path) for path in config.global_notes)
+    selected_root = next((root for root in config.roots if root.id == root_id), None)
+    effective_project = project or (selected_root.project if root_id and not all_projects else None)
+    if all_projects:
+        scope_root_ids = [root.id for root in config.roots]
+    elif effective_project is None:
+        scope_root_ids = []
+    else:
+        scope_root_ids = [root.id for root in config.roots if root.project == effective_project]
+    if root_id:
+        scope_root_ids = [candidate_id for candidate_id in scope_root_ids if candidate_id == root_id]
+    return scope_root_ids, global_paths, effective_project
+
+
+def _mark_semantic_stale(config: Config, generation: int, reason: str) -> None:
+    connection = connect(config.database, initialize=False)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'semantic_state'",
+            (SEMANTIC_STATE_STALE,),
+        )
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'semantic_reason'",
+            (reason,),
+        )
+        connection.execute(
+            "UPDATE embedding_metadata SET semantic_state = ?, semantic_reason = ? WHERE generation = ?",
+            (SEMANTIC_STATE_STALE, reason, generation),
+        )
+        connection.commit()
+    except sqlite3.DatabaseError:
+        connection.rollback()
+    finally:
+        connection.close()
+
+
+def scan_vectors(
+    config: Config,
+    query_vector: Sequence[float],
+    project: str | None = None,
+    root_id: str | None = None,
+    all_projects: bool = False,
+    limit: int = 20,
+    refresh: set[str] | None = None,
+) -> list[Candidate]:
+    """Return bounded, scope-filtered exact cosine candidates for a vector."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if not config.database.exists():
+        return []
+    scope_root_ids, global_paths, effective_project = _scope(config, project, root_id, all_projects)
+    if root_id and not scope_root_ids:
+        return []
+    try:
+        numpy = _optional_numpy()
+        normalized_query = _normalize_vector(query_vector)
+        if len(normalized_query) != int(MODEL_BUNDLE_MANIFEST["dimension"]):
+            raise SemanticError("query embedding dimension does not match the manifest")
+        query = numpy.asarray(normalized_query, dtype=numpy.float32)
+    except (SemanticError, ValueError, TypeError):
+        return []
+
+    def placeholders(values: list[str]) -> str:
+        return ", ".join("?" for _ in values) or "NULL"
+
+    connection = connect(config.database, initialize=False, readonly=True)
+    try:
+        _require_schema_version(connection)
+        state = dict(connection.execute("SELECT key, value FROM metadata WHERE key IN ('generation', 'semantic_state', 'semantic_generation')").fetchall())
+        if state.get("semantic_state") != SEMANTIC_STATE_READY or state.get("generation") != state.get("semantic_generation"):
+            return []
+        generation = int(state["generation"])
+        metadata = connection.execute("SELECT manifest_fingerprint FROM embedding_metadata WHERE generation = ?", (generation,)).fetchone()
+        if metadata is None or metadata["manifest_fingerprint"] != manifest_fingerprint():
+            connection.close()
+            _mark_semantic_stale(config, generation, SEMANTIC_REASON_MANIFEST_CHANGED)
+            return []
+        complete_count = connection.execute(
+            """SELECT count(*) FROM sections s JOIN embeddings e ON e.section_id = s.section_id
+                 WHERE s.index_generation = ? AND e.generation = ?
+                   AND e.content_hash = s.content_hash AND e.embedding_version = ?
+                 AND e.embedding_format_version = ? AND e.manifest_fingerprint = ?
+                 AND length(e.vector) = ?""",
+            (generation, generation, EMBEDDING_VERSION, EMBEDDING_FORMAT_VERSION, manifest_fingerprint(),
+             int(MODEL_BUNDLE_MANIFEST["dimension"]) * 4),
+        ).fetchone()[0]
+        section_count = connection.execute("SELECT count(*) FROM sections WHERE index_generation = ?", (generation,)).fetchone()[0]
+        if complete_count != section_count:
+            connection.close()
+            _mark_semantic_stale(config, generation, SEMANTIC_REASON_VECTOR_TABLE_CORRUPT)
+            return []
+        conditions = [
+            "s.index_generation = ?",
+            "e.generation = ?",
+            "e.embedding_version = ?",
+            "e.embedding_format_version = ?",
+            "e.manifest_fingerprint = ?",
+        ]
+        params: list[object] = [generation, generation, EMBEDDING_VERSION, EMBEDDING_FORMAT_VERSION, manifest_fingerprint()]
+        scope_conditions: list[str] = []
+        if scope_root_ids:
+            scope_conditions.append(f"s.root_id IN ({placeholders(scope_root_ids)})")
+            params.extend(scope_root_ids)
+        if global_paths:
+            scope_conditions.append(f"s.canonical_path IN ({placeholders(global_paths)})")
+            params.extend(global_paths)
+        conditions.append("(" + " OR ".join(scope_conditions) + ")" if scope_conditions else "0")
+        rows = connection.execute(
+            "SELECT s.*, e.vector FROM sections s JOIN embeddings e ON e.section_id = s.section_id WHERE "
+            + " AND ".join(conditions),
+            params,
+        ).fetchall()
+    finally:
+        connection.close()
+
+    scored: list[tuple[float, sqlite3.Row]] = []
+    dimension = int(MODEL_BUNDLE_MANIFEST["dimension"])
+    try:
+        matrix = numpy.asarray([_unpack_vector(row["vector"], dimension) for row in rows], dtype=numpy.float32)
+        scores = matrix @ query if rows else numpy.empty(0, dtype=numpy.float32)
+    except (SemanticError, ValueError, TypeError, RuntimeError):
+        if rows:
+            _mark_semantic_stale(config, generation, SEMANTIC_REASON_VECTOR_TABLE_CORRUPT)
+        return []
+    scored = sorted(
+        ((float(score), row) for score, row in zip(scores, rows, strict=True)),
+        key=lambda item: (-item[0], item[1]["section_id"]),
+    )[: min(MAX_CANDIDATES, max(limit * 5, 50))]
+
+    results: list[Candidate] = []
+    source_cache: dict[str, tuple[Root, Path] | None] = {}
+    hash_cache: dict[str, str | None] = {}
+    for score, row in scored:
+        canonical = row["canonical_path"]
+        if canonical not in source_cache:
+            source_cache[canonical] = _safe_source(config, canonical)
+        source = source_cache[canonical]
+        if source is None:
+            if refresh is not None:
+                refresh.add(canonical)
+            continue
+        current_root = source[0]
+        is_global = config.is_global(source[1])
+        if root_id and current_root.id != root_id and not is_global:
+            continue
+        if not all_projects:
+            if effective_project is None:
+                if not is_global:
+                    continue
+            elif current_root.project != effective_project and not is_global:
+                continue
+        if canonical not in hash_cache:
+            try:
+                hash_cache[canonical] = content_hash(source[1].read_bytes())
+            except OSError:
+                hash_cache[canonical] = None
+        if hash_cache[canonical] != row["content_hash"]:
+            if refresh is not None:
+                refresh.add(canonical)
+            continue
+        reason = "global-note inclusion, semantic match" if is_global else "semantic match"
+        results.append(Candidate(
+            row["section_id"], canonical, row["heading"], tuple(filter(None, row["heading_path"].split("\n"))),
+            row["line_start"], row["line_end"], current_root.id, current_root.project, row["text"],
+            row["content_hash"], row["note_type"], row["updated_date"], row["created_date"], score, reason,
+        ))
+    return results[:limit]
+
+
+def vector_candidates(
+    config: Config,
+    query: str,
+    project: str | None = None,
+    root_id: str | None = None,
+    all_projects: bool = False,
+    limit: int = 20,
+    refresh: set[str] | None = None,
+    encoder: object | None = None,
+) -> list[Candidate]:
+    """Encode a query and return bounded exact cosine candidates."""
+    if encoder is None:
+        if _semantic_backend_reason(config) is not None:
+            return []
+        try:
+            encoder = _OnnxEncoder(_resolve_active_bundle(config.bundle_dir))
+        except (BundleError, OSError, SemanticError):
+            return []
+    try:
+        vector = _encoder_vectors(encoder, [query])[0]
+        return scan_vectors(config, _unpack_vector(vector, int(MODEL_BUNDLE_MANIFEST["dimension"])), project, root_id,
+                            all_projects, limit, refresh)
+    except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError, sqlite3.DatabaseError):
+        return []
+
+
+def semantic_search(
+    config: Config,
+    query: str,
+    project: str | None = None,
+    root_id: str | None = None,
+    all_projects: bool = False,
+    limit: int = 20,
+    refresh: set[str] | None = None,
+    encoder: object | None = None,
+) -> list[Candidate]:
+    """Use semantic candidates when ready, with lexical fallback on failure."""
+    candidates = vector_candidates(config, query, project, root_id, all_projects, limit, refresh, encoder)
+    if candidates:
+        return candidates
+    return search(config, query, project, root_id, all_projects, limit, refresh)
 
 
 def excerpt(text: str, max_chars: int = 500) -> str:

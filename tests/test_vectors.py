@@ -1,0 +1,158 @@
+import sqlite3
+from pathlib import Path
+
+import pytest
+from pausanias import core
+from pausanias.config import load_config
+
+
+class FakeEncoder:
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        self.texts.extend(texts)
+        vectors = []
+        for text in texts:
+            vector = [0.0] * 384
+            vector[0] = 1.0 if "alpha" in text else 0.0
+            vector[1] = 1.0 if "beta" in text else 0.0
+            vectors.append(vector)
+        return vectors
+
+
+def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes: list[Path] | None = None):
+    global_notes = global_notes or []
+    lines = [f'database = "{tmp_path / "index.sqlite3"}"']
+    if global_notes:
+        lines.append("global_notes = [" + ", ".join(f'"{path}"' for path in global_notes) + "]")
+    for root_id, project, path in roots:
+        lines.extend(["", "[[roots]]", f'id = "{root_id}"', f'project = "{project}"', f'path = "{path}"'])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("\n".join(lines))
+    return load_config(config_path)
+
+
+def test_vector_store_scans_normalized_float32_vectors_with_scope(tmp_path: Path):
+    pytest.importorskip("numpy")
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    (one / "alpha.md").write_text("# Alpha\nalpha memory\n")
+    (two / "beta.md").write_text("# Beta\nbeta memory\n")
+    config = make_config(tmp_path, [("one", "first", one), ("two", "second", two)])
+    encoder = FakeEncoder()
+
+    assert core.index(config, encoder=encoder) == 1
+    results = core.semantic_search(config, "alpha paraphrase", project="first", encoder=encoder)
+
+    assert results[0].heading == "Alpha"
+    assert all(result.project_scope == "first" for result in results)
+    connection = sqlite3.connect(config.database)
+    try:
+        assert connection.execute("SELECT length(vector) FROM embeddings").fetchall() == [(1536,), (1536,)]
+        state = dict(connection.execute("SELECT key, value FROM metadata"))
+        assert state["semantic_state"] == "ready"
+    finally:
+        connection.close()
+
+
+def test_refresh_reembeds_only_changed_sections(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    first = root / "first.md"
+    second = root / "second.md"
+    first.write_text("# First\nalpha\n")
+    second.write_text("# Second\nbeta\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    encoder = FakeEncoder()
+
+    core.index(config, encoder=encoder)
+    encoder.texts.clear()
+    core.index(config, encoder=encoder)
+    assert encoder.texts == []
+    first.write_text("# First\nchanged alpha\n")
+    core.index(config, encoder=encoder)
+
+    assert encoder.texts == ["changed alpha"]
+
+
+def test_failed_vector_refresh_publishes_lexical_generation_as_stale(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Note\nold alpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    core.index(config, encoder=FakeEncoder())
+    note.write_text("# Note\nnew alpha\n")
+
+    class FailingEncoder:
+        def encode(self, texts: list[str]):
+            raise RuntimeError("encoder interrupted")
+
+    assert core.index(config, encoder=FailingEncoder()) == 2
+    connection = sqlite3.connect(config.database)
+    try:
+        state = dict(connection.execute("SELECT key, value FROM metadata"))
+        assert state["semantic_state"] == "stale"
+        assert state["semantic_reason"] == "REFRESH_FAILED"
+    finally:
+        connection.close()
+
+
+def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\nlexical fallback\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    monkeypatch.setattr(core, "package_version", lambda _: None)
+
+    core.index(config)
+    results = core.semantic_search(config, "lexical fallback", project="p")
+
+    assert [result.heading for result in results] == ["Note"]
+    connection = sqlite3.connect(config.database)
+    try:
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'semantic_reason'").fetchone()[0] == "EXTRA_MISSING"
+    finally:
+        connection.close()
+
+
+def test_corrupt_vector_table_falls_back_and_marks_stale(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\nalpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    encoder = FakeEncoder()
+    core.index(config, encoder=encoder)
+    connection = sqlite3.connect(config.database)
+    try:
+        connection.execute("UPDATE embeddings SET vector = ?", (b"bad",))
+        connection.commit()
+    finally:
+        connection.close()
+
+    results = core.semantic_search(config, "alpha", project="p", encoder=encoder)
+
+    assert results[0].heading == "Note"
+    connection = sqlite3.connect(config.database)
+    try:
+        state = dict(connection.execute("SELECT key, value FROM metadata"))
+        assert state["semantic_state"] == "stale"
+        assert state["semantic_reason"] == "VECTOR_TABLE_CORRUPT"
+    finally:
+        connection.close()
+
+
+def test_default_search_does_not_use_vectors(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\nalpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    core.index(config)
+
+    assert core.search(config, "alpha", project="p") == core.search(config, "alpha", project="p", semantic=False)
