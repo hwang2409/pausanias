@@ -81,7 +81,10 @@ Indexing runs separately from the request path. A failed or slow index refresh m
 | CLI | Search, inspect sources, rebuild the index, and inspect turn decisions |
 | Evaluation runner | Replay test conversations and compare answer quality |
 
-Use Python and its standard-library SQLite support for the initial implementation. Check FTS5 availability during setup. Avoid adding a daemon or separate database server until measurements justify one.
+Use Python and its standard-library SQLite support for the initial implementation. Check
+FTS5 availability during setup. Use a persistent local semantic worker only for the
+optional embedding lane. The worker keeps model and vector caches warm; lexical retrieval
+remains usable without it.
 
 ## Source and index model
 
@@ -218,7 +221,11 @@ Measure:
 - Retrieval latency, added tokens, and explicit follow-up searches.
 - Compliance with malicious instructions embedded in retrieved material.
 
-Start with at least 40 reviewed cases spanning the categories above. Treat results as a pilot, not a statistical guarantee. Choose a larger evaluation size after measuring baseline variation.
+The current case file and all current metric baselines are PROVISIONAL. The 57 cases,
+including 12 paraphrase cases and 4 held-out cases, are a DRAFT pending Henry's human
+review. After review, keep at least 40 cases spanning the categories above. Treat results
+as a pilot, not a statistical guarantee. Choose a larger evaluation size after measuring
+baseline variation.
 
 The first release requires no source-boundary violations in the test set, correct deletion handling, and bounded timeout behavior. Adopt automatic retrieval by default only if paired evaluation improves useful recall without increasing unsupported or stale claims. Record thresholds before tuning on the development set, then test on held-out cases.
 
@@ -235,9 +242,10 @@ Do not build automatic memory writing as part of these steps. Existing vault aut
 
 ## Semantic retrieval
 
-Arc 1 established the lexical baseline. Arc 2 adds a local semantic lane because all 16
-paraphrase and held-out cases currently fail. This section is a foundation design, not a
-commitment to ship semantic results before the evaluation gates pass.
+Arc 1 has a PROVISIONAL lexical baseline. Arc 2 adds a local semantic lane because the
+DRAFT results currently show failures on all 16 paraphrase and held-out cases. This
+section is a foundation design, not a commitment to ship semantic results before the
+evaluation gates pass.
 
 ### Recommendation summary
 
@@ -249,6 +257,11 @@ commitment to ship semantic results before the evaluation gates pass.
 | Query expansion | A small versioned operator synonym table as a lexical complement | Corpus-derived co-occurrence terms | Automatic terms add noise and are harder to audit |
 | Refresh | Re-embed only sections whose source or model version changed | Re-embed every indexed section | Full re-embedding wastes the existing source-version contract |
 | Evaluation | Separate semantic, lexical, scope, abstention, and latency gates | One aggregate recall threshold | An aggregate can hide a semantic gain or a lexical regression |
+
+All current counts, scores, and latency figures are PROVISIONAL. The evaluation file is
+DRAFT until Henry completes human review. The development and held-out case sets must be
+reviewed and FROZEN before any ticket tunes embeddings, ranking, synonyms, budgets, or
+acceptance thresholds.
 
 ### Embedding runtime
 
@@ -266,16 +279,29 @@ closed to the lexical lane if the bundle is missing. Neither path downloads a mo
 The model is Apache-2.0 licensed. ONNX Runtime is MIT licensed. These licenses do not
 replace review of the model's training-data and redistribution terms.
 
-ONNX Runtime has a stable Python API, CPU wheels for the target platforms, and no need
-for a separate daemon. Keep it outside the default dependency set. Use one model session
-per process and batch section encoding during refresh. Encode one query per request.
+ONNX Runtime has a stable Python API and CPU wheels for the target platforms. Keep it
+outside the default dependency set. A persistent local semantic worker owns one model
+session and the vector-matrix cache. The hook's short-lived CLI connects to that worker
+over a permissioned local socket, so a fresh CLI does not reload the 90 MB model. Batch
+section encoding during refresh and encode one query per request.
 
 The main determinism contract is the manifest, not bit-for-bit equality across every CPU.
-The same manifest and inputs must produce the same ranking on one supported platform.
-Across platforms, small floating-point differences may change near ties. Store the model
-fingerprint, tokenizer fingerprint, dimension, dtype, normalization, and metric with each
-index generation. Sort ties by lexical rank, then section ID. Reject mixed model
-generations instead of silently comparing incompatible vectors.
+For the same manifest and inputs, repeated runs on one platform must have a maximum
+absolute vector-component difference of `1e-6` and identical ranking. Across supported
+platforms, the cosine difference must be at most `1e-4`; otherwise the manifest or
+backend is incompatible. Rank-stability fixtures must have at least `0.002` fused-score
+gap between adjacent expected results. A gap below `0.001` is a near tie and may reorder,
+but its order must still be deterministic by lexical rank, then section ID. Gaps below
+`0.002` are not valid evidence for a cross-platform rank-stability claim.
+
+Evaluate macOS arm64, Linux x86_64, and Windows x86_64 separately when those platforms
+are supported. Each platform must meet the same 300 ms warm p95 and 750 ms cold p95
+limits; do not pool percentiles across platforms or borrow another platform's result.
+Record the platform, CPU provider, runtime version, and manifest in every report. If a
+platform cannot install the optional backend, mark semantic gates disabled and require
+the lexical gates. Store the model fingerprint, tokenizer fingerprint, dimension, dtype,
+normalization, and metric with each index generation. Reject mixed model generations
+instead of silently comparing incompatible vectors.
 
 **Runner-up:** a llama.cpp-style GGUF embedder. It can use a small quantized artifact and
 keep Python's default dependencies at zero. It loses because it needs a separately shipped
@@ -331,14 +357,25 @@ lexical guard for exact identifiers and quoted phrases.
 1. Resolve the allowed root IDs and global-note paths with the existing scope logic.
 2. Run FTS, including conservative synonym variants, only against that scope.
 3. Scan only vectors from that same scope. Do not let vector similarity widen access.
-4. Take bounded top candidates from each lane, union by `section_id`, and cap the union
-   at the existing candidate bound before source validation.
+4. Take bounded top candidates from each lane. Use `C = min(MAX_CANDIDATES,
+   max(5 * limit, 50))` as the lane and union bound. For a guarded query, admit the
+   lexical candidates first, then vector candidates until the union reaches `C`.
 5. For each candidate, add `1 / (60 + rank)` for each lane that returned it. Keep rank 1
    as the best rank. Use deterministic lexical and section-ID tie breakers.
-6. Protect a lexical hit for an exact ticket identifier or a quoted phrase from being
-   displaced by a vector-only result. Keep the existing identifier and heading boosts.
-7. Validate source existence and content hash, remove duplicates, and return at most the
-   requested `limit`.
+6. Detect a guarded query when the normalized prompt contains an identifier matching
+   `[A-Za-z][A-Za-z0-9]*-[0-9]+` or a non-empty quoted phrase. A lexical candidate is
+   protected only when it matches that exact identifier or phrase in indexed heading or
+   text and also matches the complete primary FTS query. For a compound query, an
+   unmatched ordinary term does not become a protected partial hit.
+7. Reserve output positions for protected lexical candidates in ascending lexical rank.
+   If several protected atoms match, use the best atom rank, then `section_id`. Remove
+   reserved candidates before RRF. Fill remaining positions with the fused candidates.
+   Thus a vector-only candidate can never rank above a protected lexical candidate, even
+   when its vector rank is better. If protected hits exceed `limit`, return their first
+   `limit`; if they exceed `C`, the cap still keeps the first `C` lexical hits.
+8. Validate source existence and content hash, remove duplicates, and return at most the
+   requested `limit`. Apply the cap before validation, but never discard a protected
+   lexical candidate in favor of a vector candidate.
 
 RRF avoids treating BM25 and cosine values as comparable confidence scores. The lexical
 guard protects the current exact-query behavior while the vector lane supplies recall
@@ -405,33 +442,109 @@ change is intentionally a full rebuild cost.
 source edit would pay the full corpus cost and would make scheduled refreshes less useful.
 Use it only as a repair command after manifest or storage corruption.
 
+### Semantic index-state contract
+
+Expose one semantic state for each database: `ready`, `stale`, or `disabled`.
+
+| State | Meaning | Query behavior | Recovery |
+| --- | --- | --- | --- |
+| `ready(g)` | FTS and vectors are complete for generation `g`, with one matching manifest | Run lexical and semantic lanes against `g` | A source or manifest change moves the state out of `ready` |
+| `stale(g, reason)` | FTS has advanced, or vectors are absent or incompatible with the active FTS generation | Run lexical retrieval only; never combine an old vector with new FTS rows | Refresh changed vectors or run a full re-embedding |
+| `disabled(reason)` | The optional extra, model bundle, NumPy, schema, or database is unavailable or invalid | Run lexical retrieval only and emit one diagnostic per state change | Install or repair the cause, then rebuild and atomically enter `ready` |
+
+Refresh may advance FTS when the model or optional extra is missing. It commits the new
+FTS generation with `stale` or `disabled` metadata. It must not present old vectors as
+current semantic results. A temporary encode or source-hash failure leaves the previous
+complete generation intact but marks the active state `stale`; a model-manifest change
+requires a full re-embedding. State changes, generation IDs, manifest fingerprints, and
+reasons commit in the same transaction as their derived rows.
+
+Readers pin one complete generation at query start and check the state before opening the
+vector lane. A refresh builds changed vectors off to the side, rechecks source hashes,
+then atomically publishes FTS, vectors, and metadata. Cleanup removes superseded vectors
+after publication and removes orphaned temporary rows at startup. A failed cleanup does
+not make a published generation unreadable. A repair command can set `disabled`, rebuild
+all derived tables, and publish `ready`; no query retries a known disabled backend.
+
+### Cold-path architecture
+
+**Recommendation:** use one persistent local semantic worker per configured database.
+The hook's short-lived CLI connects to the worker over a permissioned local socket. On a
+socket miss, the CLI starts one worker under a lock and waits only until the adapter's
+remaining deadline. If the worker is not ready, the CLI returns the lexical result and
+leaves the worker to finish for the next turn. This removes repeated model and matrix
+loads from normal turns without making semantic retrieval a prerequisite for a turn.
+
+The worker lifecycle is bounded and recoverable:
+
+- Keep one ONNX session per model-manifest fingerprint and one vector matrix per index
+  generation plus scope key. Load each lazily on the first request that needs it.
+- On refresh, publish the new complete generation first. Drop the old matrix only after
+  the swap. Never answer with FTS rows and vectors from different generations.
+- Exit after a configurable idle period, with 30 minutes as the initial default. A
+  stale socket, crashed worker, or failed load is removed or replaced on the next start.
+- A missing extra, model bundle, NumPy, or compatible manifest marks the semantic lane
+  disabled. The hook uses lexical retrieval and records the reason; it does not retry
+  the same failed load on every turn.
+- The worker stores no source text outside the SQLite database and memory. A local socket
+  permission check and database ownership check enforce the existing scope boundary.
+
+The existing 750 ms hard adapter deadline remains a safety bound, not a semantic latency
+target. The hook must stop waiting at that deadline, terminate its retrieval child, and
+continue without memory or with the lexical fallback. A cold semantic request passes only
+when the full hook path returns semantic context before the deadline; a timeout is a
+fallback and a cold-gate failure.
+
+A bounded probe on this machine produced the following non-binding numbers: macOS
+26.6.2, arm64, 15 CPU cores, 52 GB RAM, Python 3.13.13, ONNX Runtime 1.30.0, NumPy
+2.5.3, and tokenizers 0.23.2. Loading the 97 MB ONNX file took 70.23 ms. The first
+32-token encode took 2.86 ms; warm encode p95 over 50 runs was 2.17 ms. The probe did
+not measure worker startup or vector-matrix loading. These are probe-derived observations,
+not product baselines or cross-platform promises.
+
+The runner-up is a fresh process with lazy model and matrix loading plus an honest cold
+budget. It has less lifecycle code, but it makes every hook turn pay process startup and
+risks repeated 90 MB model loads. The persistent worker is the single recommendation
+because it makes the measured warm path match normal use while retaining a bounded cold
+fallback.
+
 ### Performance budgets
 
-**Recommendation:** enforce the existing 300 ms warm p95 gate on the complete hybrid
-path, including query encoding, and expose every stage as a separate benchmark metric.
+**Recommendation:** enforce end-to-end gates on the real hook path, including the fresh
+CLI process, worker IPC, query encoding, FTS, vector scan, fusion, source validation, and
+packet packing. Do not enforce a semantic gate from an in-process `search()` call alone.
 
-The existing 300 ms warm p95 target holds for hybrid retrieval end to end. Query encoding
-is inside this target. Model startup and first model load are separate cold metrics, but
-the adapter deadline still applies and must allow lexical fallback when the model is not
-ready.
+The base design's 750 ms first-query target uses a warm OS page cache and is a lexical
+refresh diagnostic. The base 300 ms warm-local target is likewise insufficient for the
+semantic lane. The gates below replace those shortcuts for semantic acceptance; the
+existing 750 ms adapter deadline remains the hard fallback bound.
+
+`pausanias bench --hook-path` must launch the actual adapter command as a child for every
+trial. The warm workload uses a running worker with its session and matrix cache loaded.
+The warm semantic gate is total hook-path p95 at or below 300 ms, with no semantic
+fallbacks. A separate cold workload stops the worker, clears its session and matrix, and
+invokes the same hook path. Its cold semantic gate is total p95 at or below 750 ms, with
+every trial completing before the adapter deadline and no fallback. A cold timeout or
+fallback fails that gate; the adapter still returns lexical or empty context before its
+hard deadline. If the optional backend is unavailable, report the semantic gates as
+disabled and enforce the lexical gate instead.
 
 | Stage | Warm p95 planning budget |
 | --- | ---: |
-| Config, scope resolution, and SQLite open | 20 ms |
-| Query tokenization and embedding | 100 ms |
+| Hook process, config, IPC, and SQLite open | 35 ms |
+| Query tokenization and embedding | 50 ms |
 | FTS and synonym-lane search | 35 ms |
-| Vector BLOB load and exact scan | 75 ms |
-| RRF, dedupe, source validation, and packing | 45 ms |
+| Vector matrix lookup and exact scan | 75 ms |
+| RRF, dedupe, source validation, and packing | 80 ms |
 | Instrumentation and scheduling margin | 25 ms |
 | **Total** | **300 ms** |
 
-The numbers are budgets, not measurements. `pausanias bench` must report p50, p95, and
-maximum values for query encoding, FTS search, vector scan, hybrid overhead, and total
-semantic search. It must also report model-load time, encoded-section throughput, vector
-candidate count, and the corpus section count. Keep the existing lexical report and
-gate. Add a semantic gate only when the semantic backend is installed and the benchmark
-records its model manifest. A semantic p95 failure must never be hidden by a fast FTS
-fallback.
+The warm stage numbers are budgets, not measurements. `pausanias bench` must report p50, p95,
+and maximum values for hook total, worker startup, model load, matrix load, query
+encoding, FTS search, vector scan, hybrid overhead, and fallback count. It must also
+report encoded-section throughput, vector candidate count, corpus section count, worker
+cache state, platform, and model manifest. Keep the existing lexical report and gate. A
+semantic p95 failure must never be hidden by a fast FTS fallback.
 
 **Runner-up:** retain only the current aggregate FTS timing. It loses because it cannot
 show whether encoding, vector scanning, or fusion consumed the budget. Stage metrics are
@@ -506,7 +619,9 @@ hypothesis. This remains the fallback if optional wheels are unavailable on a pl
 ### Ticket ladder
 
 The lanes are ordered so that storage, versioning, and evaluation exist before ranking
-polish. PAUS-8 lands before the retrieval it judges.
+polish. PAUS-8 lands before the retrieval it judges. No ticket may tune an embedding,
+ranking rule, synonym, budget, or threshold until PAUS-8 has completed Henry's human
+review and frozen both the development and held-out case sets.
 
 - **PAUS-5:** Define the model bundle manifest, offline fetch, hash verification, license
   record, tokenizer contract, and optional dependency extra. Depends on PAUS-4.
@@ -515,17 +630,26 @@ polish. PAUS-8 lands before the retrieval it judges.
 - **PAUS-7:** Add the scope-safe BLOB store, in-memory NumPy matrix, exact cosine scan,
   bounded candidate API, and lexical fallback. Depends on PAUS-6.
 - **PAUS-8:** Extend the eval runner with category reports, Arc 2 hypothesis thresholds,
-  drift fixtures, and verbatim regression gates. Depends on PAUS-5; lands before PAUS-9.
-- **PAUS-9:** Extend `pausanias bench` with model-load, encode, scan, hybrid, and total
-  latency metrics plus the 300 ms semantic gate. Depends on PAUS-7 and PAUS-8.
+  drift fixtures, and verbatim regression gates. Depends on PAUS-6. Its exit gate is
+  human review and freeze of the development and held-out case sets.
+- **PAUS-9:** Add report-only benchmark scaffolding for the persistent worker and real
+  hook path, including worker startup, model-load, matrix-load, encode, scan, hybrid,
+  total latency, and fallback metrics. It does not activate the semantic gate. Depends
+  on PAUS-5, PAUS-6, and PAUS-7, and does not depend on PAUS-10.
 - **PAUS-10:** Implement scope-preserving RRF, exact lexical guards, deterministic
   tie-breaking, diagnostics, and bounded result packing. Depends on PAUS-7, PAUS-8,
   and PAUS-9.
 - **PAUS-11:** Add the versioned operator synonym table and conservative lexical query
-  variants. Depends on PAUS-10 and the semantic eval results.
-- **PAUS-12:** Run the full Arc 2 evaluation, document measured thresholds and corpus
-  envelope, and decide whether semantic retrieval becomes the default. Depends on
-  PAUS-9, PAUS-10, and PAUS-11.
+  variants. Depends on PAUS-10 and the frozen PAUS-8 fixtures.
+- **PAUS-12:** Activate the warm and cold semantic gates, run the full Arc 2 evaluation,
+  document measured thresholds and the corpus envelope, and decide whether semantic
+  retrieval becomes the default. Depends on PAUS-9, PAUS-10, and PAUS-11.
+
+The verified dependency edges are `PAUS-5 -> PAUS-6 -> PAUS-7`, `PAUS-6 -> PAUS-8`,
+`PAUS-5,6,7 -> PAUS-9`, `PAUS-7,8,9 -> PAUS-10`, `PAUS-10 -> PAUS-11`, and
+`PAUS-9,10,11 -> PAUS-12`. The cold-path worker belongs to PAUS-9, so its real hook
+measurement is available before ranking polish. Gate activation belongs to PAUS-12,
+after the complete path exists. These edges contain no cycle.
 
 ### References
 
