@@ -3,5 +3,5 @@
 recall_at_4 = 0.659574468
 precision_at_4 = 0.659574468
 mrr = 0.659574468
-abstention_accuracy = 0.719298245
+abstention_accuracy = 1.0
 forbidden_violations = 0

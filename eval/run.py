@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -149,9 +150,35 @@ def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, data
     return Config(roots, global_notes, source.private_paths, database, source.section_bytes)
 
 
-def _case_path(runtime_corpus: Path, value: str) -> Path:
-    path = Path(value)
-    return path if path.is_absolute() else runtime_corpus / path
+def _delete_path(runtime_corpus: Path, value: str) -> Path:
+    corpus = runtime_corpus.resolve()
+    requested = Path(value).expanduser()
+    candidate = requested if requested.is_absolute() else corpus / requested
+    try:
+        path = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"delete source does not exist: {value}") from exc
+    try:
+        path.relative_to(corpus)
+    except ValueError as exc:
+        raise ValueError(f"delete source is outside evaluation corpus: {value}") from exc
+    if path == corpus or not path.is_file():
+        raise ValueError(f"delete source is not a file in evaluation corpus: {value}")
+    return path
+
+
+@contextmanager
+def _temporarily_deleted(runtime_corpus: Path, source_paths: tuple[str, ...]):
+    deleted: list[tuple[Path, bytes]] = []
+    try:
+        for source_path in source_paths:
+            path = _delete_path(runtime_corpus, source_path)
+            deleted.append((path, path.read_bytes()))
+            path.unlink()
+        yield
+    finally:
+        for path, content in deleted:
+            path.write_bytes(content)
 
 
 def _relative_path(runtime_corpus: Path, value: str) -> str:
@@ -188,6 +215,7 @@ def score_case(case: Case, results: list[Candidate], runtime_corpus: Path, elaps
 
 def _aggregate(scores: list[CaseScore]) -> dict[str, float | int]:
     retrieval_scores = [score for score in scores if score.recall_at_k is not None]
+    abstention_scores = [score for score in scores if score.case.abstain]
 
     def average(name: str) -> float:
         values = [getattr(score, name) for score in retrieval_scores]
@@ -196,10 +224,15 @@ def _aggregate(scores: list[CaseScore]) -> dict[str, float | int]:
     return {
         "cases": len(scores),
         "retrieval_cases": len(retrieval_scores),
+        "abstention_cases": len(abstention_scores),
         "recall_at_4": average("recall_at_k"),
         "precision_at_4": average("precision_at_k"),
         "mrr": average("reciprocal_rank"),
-        "abstention_accuracy": sum(score.abstention_correct for score in scores) / len(scores) if scores else 1.0,
+        "abstention_accuracy": (
+            sum(score.abstention_correct for score in abstention_scores) / len(abstention_scores)
+            if abstention_scores
+            else 1.0
+        ),
         "forbidden_violations": sum(len(score.forbidden_paths) for score in scores),
         "average_latency_ms": sum(score.latency_ms for score in scores) / len(scores) if scores else 0.0,
     }
@@ -224,24 +257,18 @@ def run_cases(
         index(config, rebuild=True)
         scores: list[CaseScore] = []
         for case in cases:
-            deleted: list[tuple[Path, bytes]] = []
-            for source_path in case.delete_sources:
-                path = _case_path(runtime_corpus, source_path)
-                deleted.append((path, path.read_bytes()))
-                path.unlink()
-            started = time.perf_counter()
-            results = search(
-                config,
-                case.query,
-                project=case.scope.get("project"),
-                root_id=case.scope.get("root"),
-                all_projects=bool(case.scope.get("all_projects", False)),
-                limit=K,
-            )
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            scores.append(score_case(case, results, runtime_corpus, elapsed_ms))
-            for path, content in deleted:
-                path.write_bytes(content)
+            with _temporarily_deleted(runtime_corpus, case.delete_sources):
+                started = time.perf_counter()
+                results = search(
+                    config,
+                    case.query,
+                    project=case.scope.get("project"),
+                    root_id=case.scope.get("root"),
+                    all_projects=bool(case.scope.get("all_projects", False)),
+                    limit=K,
+                )
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                scores.append(score_case(case, results, runtime_corpus, elapsed_ms))
         return scores, _aggregate(scores)
 
 
@@ -293,7 +320,7 @@ def _print_table(
         f"recall@4={aggregate['recall_at_4']:.3f} "
         f"precision@4={aggregate['precision_at_4']:.3f} "
         f"mrr={aggregate['mrr']:.3f} "
-        f"abstention={aggregate['abstention_accuracy']:.3f} "
+        f"abstention={aggregate['abstention_accuracy']:.3f} ({aggregate['abstention_cases']} cases) "
         f"forbidden={aggregate['forbidden_violations']}"
     )
     if single_case:
