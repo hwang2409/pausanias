@@ -289,10 +289,12 @@ The main determinism contract is the manifest, not bit-for-bit equality across e
 For the same manifest and inputs, repeated runs on one platform must have a maximum
 absolute vector-component difference of `1e-6` and identical ranking. Across supported
 platforms, the cosine difference must be at most `1e-4`; otherwise the manifest or
-backend is incompatible. Rank-stability fixtures must have at least `0.002` fused-score
-gap between adjacent expected results. A gap below `0.001` is a near tie and may reorder,
-but its order must still be deterministic by lexical rank, then section ID. Gaps below
-`0.002` are not valid evidence for a cross-platform rank-stability claim.
+backend is incompatible. Rank-stability fixtures must specify both a `0.002` minimum
+fused-score gap and a raw-cosine contract. Adjacent expected vector-lane results must
+have a raw-cosine gap of at least `0.001`, or the fixture must allow a rank displacement
+of at most one position. A fixture with a smaller raw-cosine gap cannot claim stable
+vector-lane ordering, even when its fused-score gap passes. Any permitted displacement
+must still produce deterministic output by lexical rank, then section ID.
 
 Evaluate macOS arm64, Linux x86_64, and Windows x86_64 separately when those platforms
 are supported. Each platform must meet the same 300 ms warm p95 and 750 ms cold p95
@@ -320,7 +322,9 @@ default for a portable Python core.
 then load the in-scope vectors into one NumPy matrix for an exact cosine scan. Normalize
 vectors at write time and normalize the query before the scan. Store vectors in a table
 keyed by `section_id`, with the source content hash and embedding manifest fingerprint.
-Do not store a second external index.
+Do not store a second external index. Configure `sections_fts` with the exact FTS5
+tokenizer `unicode61 remove_diacritics 1`; guard normalization and indexing must use this
+configuration rather than a separate application tokenizer.
 
 At 384 dimensions, the raw vector costs 1,536 bytes. Ten thousand sections use about 15
 MiB of vector data. Fifty thousand use about 73 MiB. One hundred thousand use about 146
@@ -362,20 +366,32 @@ lexical guard for exact identifiers and quoted phrases.
    lexical candidates first, then vector candidates until the union reaches `C`.
 5. For each candidate, add `1 / (60 + rank)` for each lane that returned it. Keep rank 1
    as the best rank. Use deterministic lexical and section-ID tie breakers.
-6. Detect a guarded query when the normalized prompt contains an identifier matching
+6. Normalize guard atoms before matching. Apply Unicode NFC, Unicode `casefold()`,
+   collapse runs of Unicode whitespace to one ASCII space, and remove only the outer
+   quote delimiters from a quoted phrase. Tokenize the normalized atom with the exact
+   FTS5 tokenizer configured for `sections_fts`: `unicode61 remove_diacritics 1`.
+   The same tokenizer and normalization apply when indexing heading and text. An atom
+   matches only when its complete normalized token sequence occurs in either field.
+   Detect a guarded query when the normalized prompt contains an identifier matching
    `[A-Za-z][A-Za-z0-9]*-[0-9]+` or a non-empty quoted phrase. A lexical candidate is
-   protected only when it matches that exact identifier or phrase in indexed heading or
-   text and also matches the complete primary FTS query. For a compound query, an
-   unmatched ordinary term does not become a protected partial hit.
-7. Reserve output positions for protected lexical candidates in ascending lexical rank.
-   If several protected atoms match, use the best atom rank, then `section_id`. Remove
-   reserved candidates before RRF. Fill remaining positions with the fused candidates.
-   Thus a vector-only candidate can never rank above a protected lexical candidate, even
-   when its vector rank is better. If protected hits exceed `limit`, return their first
-   `limit`; if they exceed `C`, the cap still keeps the first `C` lexical hits.
+   protected only when it matches that exact atom and also matches the complete primary
+   FTS query. An unmatched ordinary term never becomes a protected partial hit.
+7. For each protected candidate, compute one key:
+   `(primary_fts_rank, first_matching_atom_ordinal, section_id)`. Sort all protected
+   candidates by that key and reserve output positions in that order. Remove reserved
+   candidates before RRF, then fill remaining positions with fused candidates. Thus a
+   vector-only candidate can never rank above a protected lexical candidate, even when
+   its vector rank is better. If protected hits exceed `limit`, return the first `limit`.
+   If they exceed `C`, the cap still keeps the first `C` lexical hits.
 8. Validate source existence and content hash, remove duplicates, and return at most the
    requested `limit`. Apply the cap before validation, but never discard a protected
    lexical candidate in favor of a vector candidate.
+
+For example, query `Why did PAUS-4 beat "cold path"?` has guard atoms `PAUS-4` (ordinal
+1) and `cold path` (ordinal 2). Suppose section `sec-c` matches `PAUS-4` and ranks 1 in
+the complete FTS query, `sec-b` matches `cold path` and ranks 2, and `sec-a` matches
+both atoms and ranks 2. The protected keys are `(1, 1, sec-c)`, `(2, 1, sec-a)`, and
+`(2, 2, sec-b)`, so the exact protected order is `sec-c`, `sec-a`, `sec-b`.
 
 RRF avoids treating BM25 and cosine values as comparable confidence scores. The lexical
 guard protects the current exact-query behavior while the vector lane supplies recall
@@ -444,20 +460,32 @@ Use it only as a repair command after manifest or storage corruption.
 
 ### Semantic index-state contract
 
-Expose one semantic state for each database: `ready`, `stale`, or `disabled`.
+Expose one semantic state for each readable database: `ready`, `stale`, or `disabled`.
 
 | State | Meaning | Query behavior | Recovery |
 | --- | --- | --- | --- |
 | `ready(g)` | FTS and vectors are complete for generation `g`, with one matching manifest | Run lexical and semantic lanes against `g` | A source or manifest change moves the state out of `ready` |
 | `stale(g, reason)` | FTS has advanced, or vectors are absent or incompatible with the active FTS generation | Run lexical retrieval only; never combine an old vector with new FTS rows | Refresh changed vectors or run a full re-embedding |
-| `disabled(reason)` | The optional extra, model bundle, NumPy, schema, or database is unavailable or invalid | Run lexical retrieval only and emit one diagnostic per state change | Install or repair the cause, then rebuild and atomically enter `ready` |
+| `disabled(reason)` | The optional extra, model bundle, NumPy, schema, or runtime manifest is unavailable or invalid, while FTS remains readable | Run lexical retrieval only and emit one diagnostic per state change | Install or repair the cause, then rebuild and atomically enter `ready` |
 
-Refresh may advance FTS when the model or optional extra is missing. It commits the new
-FTS generation with `stale` or `disabled` metadata. It must not present old vectors as
-current semantic results. A temporary encode or source-hash failure leaves the previous
-complete generation intact but marks the active state `stale`; a model-manifest change
-requires a full re-embedding. State changes, generation IDs, manifest fingerprints, and
-reasons commit in the same transaction as their derived rows.
+The causes have exact transitions. A missing optional extra moves any readable database
+to `disabled(EXTRA_MISSING)`; a missing model moves it to `disabled(MODEL_MISSING)`;
+and a model hash mismatch moves it to `disabled(MODEL_HASH_MISMATCH)`. In each case,
+the lexical lane continues. A model-manifest upgrade is different: it moves the database
+to `stale(MANIFEST_CHANGED)` and requires a full re-embedding. A corrupt vector table
+moves it to `stale(VECTOR_TABLE_CORRUPT)`; FTS remains usable while repair rebuilds the
+vector tables. A temporary encode or source-hash failure moves it to
+`stale(REFRESH_FAILED)` and leaves the last complete generation visible to readers.
+State changes, generation IDs, manifest fingerprints, and reasons commit in the same
+transaction as their derived rows.
+
+These are `SEMANTIC_FAILURE` cases. They run lexical retrieval, keep the normal `ok` or
+`empty` result status, and emit one diagnostic per state change. A whole unreadable
+SQLite database is `TOTAL_INDEX_FAILURE`, not `disabled`: `pausanias search` and the
+structured `context` command return a nonzero or `error` result with code
+`index_unavailable` and no items. The hook records that error, injects no packet, and
+continues the user turn. It must not claim that lexical fallback ran when FTS was
+unreadable.
 
 Readers pin one complete generation at query start and check the state before opening the
 vector lane. A refresh builds changed vectors off to the side, rechecks source hashes,
@@ -479,8 +507,24 @@ The worker lifecycle is bounded and recoverable:
 
 - Keep one ONNX session per model-manifest fingerprint and one vector matrix per index
   generation plus scope key. Load each lazily on the first request that needs it.
-- On refresh, publish the new complete generation first. Drop the old matrix only after
-  the swap. Never answer with FTS rows and vectors from different generations.
+- Before each request, read the committed active generation and manifest fingerprint from
+  SQLite. A worker cache key is `(database identity, generation, scope key, manifest
+  fingerprint)`, so a new generation invalidates every older matrix for that database.
+  New requests use only the new key. A request that already pinned the old generation
+  owns one reference and may finish on its old matrix; after its SQLite read transaction
+  and response close, the worker drops that reference and frees the matrix when it reaches
+  zero. The worker never starts new work on a retiring generation.
+- Publish a new complete generation before marking the old matrix retiring. During the
+  swap, new requests wait for the new matrix up to their remaining deadline. If loading
+  fails, the request rereads the generation once and retries the load once; a second
+  failure or deadline returns the lexical fallback, while the old matrix is freed only
+  after its in-flight references finish. Never answer with FTS rows and vectors from
+  different generations.
+- The first CLI to acquire the per-database startup lock owns worker launch. Other queries
+  wait for that worker socket and submit their own requests; they do not launch a second
+  worker or load a second model session. If the owner exits before readiness, the lock
+  release lets one waiter become the next owner. A waiter that reaches its deadline uses
+  lexical fallback.
 - Exit after a configurable idle period, with 30 minutes as the initial default. A
   stale socket, crashed worker, or failed load is removed or replaced on the next start.
 - A missing extra, model bundle, NumPy, or compatible manifest marks the semantic lane
@@ -520,14 +564,21 @@ semantic lane. The gates below replace those shortcuts for semantic acceptance; 
 existing 750 ms adapter deadline remains the hard fallback bound.
 
 `pausanias bench --hook-path` must launch the actual adapter command as a child for every
-trial. The warm workload uses a running worker with its session and matrix cache loaded.
-The warm semantic gate is total hook-path p95 at or below 300 ms, with no semantic
+trial. It has two ordered phases. Phase A, owned by PAUS-9, runs the semantic scan path
+without RRF and records warm and cold hook-path measurements as soon as storage exists.
+The warm workload uses a running worker with its session and matrix cache loaded. The
+warm scan-path gate is total hook-path p95 at or below 300 ms, with no semantic
 fallbacks. A separate cold workload stops the worker, clears its session and matrix, and
-invokes the same hook path. Its cold semantic gate is total p95 at or below 750 ms, with
-every trial completing before the adapter deadline and no fallback. A cold timeout or
-fallback fails that gate; the adapter still returns lexical or empty context before its
-hard deadline. If the optional backend is unavailable, report the semantic gates as
-disabled and enforce the lexical gate instead.
+invokes the same hook path. Its cold scan-path gate is total p95 at or below 750 ms, with
+every trial completing before the adapter deadline and no fallback. These gates are active
+acceptance checks before PAUS-10 starts.
+
+Phase B, owned by PAUS-10 after RRF exists, repeats both workloads through the fused
+path, records fusion overhead separately, and activates the fused warm and cold gates.
+A cold timeout or fallback fails its active gate; the adapter still returns lexical or
+empty context before its hard deadline. If the optional backend is unavailable, report
+the semantic gates as disabled and enforce the lexical gate instead. PAUS-12 reruns the
+already active gates for final evaluation; it does not defer their activation.
 
 | Stage | Warm p95 planning budget |
 | --- | ---: |
@@ -541,7 +592,7 @@ disabled and enforce the lexical gate instead.
 
 The warm stage numbers are budgets, not measurements. `pausanias bench` must report p50, p95,
 and maximum values for hook total, worker startup, model load, matrix load, query
-encoding, FTS search, vector scan, hybrid overhead, and fallback count. It must also
+encoding, FTS search, vector scan, hybrid overhead, and fallback count in both phases. It must also
 report encoded-section throughput, vector candidate count, corpus section count, worker
 cache state, platform, and model manifest. Keep the existing lexical report and gate. A
 semantic p95 failure must never be hidden by a fast FTS fallback.
@@ -618,38 +669,42 @@ hypothesis. This remains the fallback if optional wheels are unavailable on a pl
 
 ### Ticket ladder
 
-The lanes are ordered so that storage, versioning, and evaluation exist before ranking
-polish. PAUS-8 lands before the retrieval it judges. No ticket may tune an embedding,
-ranking rule, synonym, budget, or threshold until PAUS-8 has completed Henry's human
-review and frozen both the development and held-out case sets.
+The lanes are ordered so that storage, versioning, evaluation, and recorded hook-path
+baselines exist before ranking polish. PAUS-8 lands before the retrieval it judges. No
+ticket may tune an embedding, ranking rule, synonym, budget, or threshold until PAUS-8
+has completed Henry's human review and frozen both the development and held-out case sets.
 
 - **PAUS-5:** Define the model bundle manifest, offline fetch, hash verification, license
   record, tokenizer contract, and optional dependency extra. Depends on PAUS-4.
-- **PAUS-6:** Add schema version 2, embedding metadata, atomic generation handling, and
-  changed-section refresh without changing result ranking. Depends on PAUS-5.
+- **PAUS-6:** Add schema version 2, embedding metadata, and atomic generation metadata
+  without changing result ranking. Depends on PAUS-5.
 - **PAUS-7:** Add the scope-safe BLOB store, in-memory NumPy matrix, exact cosine scan,
-  bounded candidate API, and lexical fallback. Depends on PAUS-6.
+  bounded candidate API, lexical fallback, and changed-section vector refresh. Depends
+  on PAUS-6, so refresh never precedes the storage it updates.
 - **PAUS-8:** Extend the eval runner with category reports, Arc 2 hypothesis thresholds,
-  drift fixtures, and verbatim regression gates. Depends on PAUS-6. Its exit gate is
+  drift fixtures, and verbatim regression gates. Depends on PAUS-7. Its exit gate is
   human review and freeze of the development and held-out case sets.
-- **PAUS-9:** Add report-only benchmark scaffolding for the persistent worker and real
-  hook path, including worker startup, model-load, matrix-load, encode, scan, hybrid,
-  total latency, and fallback metrics. It does not activate the semantic gate. Depends
-  on PAUS-5, PAUS-6, and PAUS-7, and does not depend on PAUS-10.
+- **PAUS-9:** Add Phase A report-only benchmark scaffolding for the persistent worker and
+  real hook path. Measure recorded warm and cold scan-path totals, worker startup,
+  model-load, matrix-load, encode, scan, and fallback metrics. Activate the scan-path
+  gates before ranking work. Depends on PAUS-5, PAUS-6, PAUS-7, and PAUS-8.
 - **PAUS-10:** Implement scope-preserving RRF, exact lexical guards, deterministic
-  tie-breaking, diagnostics, and bounded result packing. Depends on PAUS-7, PAUS-8,
-  and PAUS-9.
+  tie-breaking, diagnostics, and bounded result packing. Then run Phase B of the hook-path
+  benchmark, measure fusion overhead, and activate the fused warm and cold gates. Depends
+  on PAUS-7, PAUS-8, and PAUS-9; its fusion measurements occur after fusion exists.
 - **PAUS-11:** Add the versioned operator synonym table and conservative lexical query
-  variants. Depends on PAUS-10 and the frozen PAUS-8 fixtures.
-- **PAUS-12:** Activate the warm and cold semantic gates, run the full Arc 2 evaluation,
-  document measured thresholds and the corpus envelope, and decide whether semantic
-  retrieval becomes the default. Depends on PAUS-9, PAUS-10, and PAUS-11.
+  variants. Depends on PAUS-10 and the frozen PAUS-8 fixtures. The active fused gates
+  must pass before synonym thresholds are tuned.
+- **PAUS-12:** Rerun the active scan-path and fused hook-path gates, run the full Arc 2
+  evaluation, document measured thresholds and the corpus envelope, and decide whether
+  semantic retrieval becomes the default. It does not activate a deferred gate. Depends
+  on PAUS-9, PAUS-10, and PAUS-11.
 
-The verified dependency edges are `PAUS-5 -> PAUS-6 -> PAUS-7`, `PAUS-6 -> PAUS-8`,
-`PAUS-5,6,7 -> PAUS-9`, `PAUS-7,8,9 -> PAUS-10`, `PAUS-10 -> PAUS-11`, and
-`PAUS-9,10,11 -> PAUS-12`. The cold-path worker belongs to PAUS-9, so its real hook
-measurement is available before ranking polish. Gate activation belongs to PAUS-12,
-after the complete path exists. These edges contain no cycle.
+The verified dependency edges are `PAUS-5 -> PAUS-6 -> PAUS-7 -> PAUS-8 -> PAUS-9`,
+`PAUS-9 -> PAUS-10 -> PAUS-11 -> PAUS-12`. PAUS-9 records warm and cold hook-path
+measurements before PAUS-10 ranking work. PAUS-10 measures fusion overhead only after
+implementing fusion and activates the fused gates before PAUS-11 tuning. PAUS-12 only
+reruns active gates and evaluates the final result. These edges contain no cycle.
 
 ### References
 
