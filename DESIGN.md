@@ -674,9 +674,27 @@ The dataset is never committed to this repository. Fetch it to the gitignored
 reuse that cache when its recorded URL, commit, and hash match. A missing or mismatched
 cache requires an explicit refetch; a run never silently uses an unverified file.
 
-Common ingest renders one file per session as UTF-8 Markdown with LF line endings and one
-final newline. Sort sessions by parsed session date, then numeric session number. Name
-files `conversation-{conversation_index:02d}--session-{session_number:02d}.md`. Render:
+Common ingest renders one file per session as UTF-8 Markdown. `conversation_index` is the
+zero-based index in the dataset array. `session_number` is the numeric suffix of the
+source `session_N` key. Sort sessions by parsed session date, then numeric session
+number. The `:02d` width is a minimum width, not a truncation. Name files
+`conversation-{conversation_index:02d}--session-{session_number:02d}.md`.
+
+Construct each file with this exact algorithm:
+
+1. Normalize every source string by replacing CRLF and CR with LF. Preserve all other
+   characters, including spaces and source newlines.
+2. Start with the conversation and session headings below. Use the literal separator
+   `\n\n` between every heading and its following field, and between turn blocks.
+3. For each turn in source order, emit one turn heading and its `turn_text`. A turn
+   with a `query` or `blip_caption` field gets one metadata line after its text:
+   `[image query: {query}; caption: {blip_caption}]`. A missing or null field is empty.
+   Add one LF before that line only when non-empty text does not already end in LF.
+   An image-only turn uses the metadata line as its text.
+4. Append one generated LF after the assembled document. Do not trim source trailing
+   spaces or newlines. Drop image pixels, URLs, and unknown multimodal fields.
+
+Render:
 
 ```markdown
 # conversation {conversation_index:02d}
@@ -688,35 +706,72 @@ files `conversation-{conversation_index:02d}--session-{session_number:02d}.md`. 
 {turn_text}
 ```
 
-Use source strings exactly after converting CRLF and CR to LF. Do not trim internal
-spaces. For a turn with `query` or `blip_caption`, append one metadata line after the
-text: `[image query: {query}; caption: {blip_caption}]`, using an empty value for a
-missing field. For an image-only turn, use that line as the turn text. Drop image pixels,
-URLs, and unknown multimodal fields. Include turns in source order, including image-only
-turns. Fixed headings, separators, field order, and the final newline make the same
-dataset produce byte-identical files.
+For example, `conversation_index=0`, `session_number=1`, and two source turns produce
+these bytes (every displayed line ending is LF):
+
+```markdown
+# conversation 00
+
+## session 01 | timestamp: 1:56 pm on 8 May, 2023
+
+### turn D1:0 | speaker: Alex | timestamp: 1:56 pm on 8 May, 2023
+
+Hi there.
+
+### turn D1:1 | speaker: Sam | timestamp: 1:56 pm on 8 May, 2023
+
+[image query: a red kite; caption: park]
+```
+
+Fixed indexes, headings, separators, field order, source-text preservation, and the
+generated final LF make the same dataset produce byte-identical files.
 
 Common search sends each question to `pausanias search`, records every result through
 `top-k` in rank order, and maps evidence turn references to the rendered note path and
 line range. At cutoff `k`, select the first `k` ranked results. For the mem0 answerer
 prompt, map `{question}` to the benchmark question, `{reference_date}` to the newest
-session timestamp in the conversation, and `{memories}` to those excerpts. Present the
-selected excerpts in ascending `(session_timestamp, source_path, line_start, rank)` order,
-with one `(timestamp) excerpt` entry per result. The result artifact keeps retrieval
-rank order; only the prompt view uses this stable chronological order. The judge slots
-map `{question}`, `{answer}`, and `{response}` to the benchmark question, ground truth,
-and generated answer. Evidence slots use listed evidence turns in dataset order.
-Common evaluate uses the vendored mem0 prompt and judge convention at every cutoff.
-`CORRECT` maps to score `1.0`, every other judgment maps to `0.0`, and a score of at
-least `0.5` passes.
+sorted session's raw `session_date_time` string, and `{memories}` to the selected
+excerpts. If no reference date exists, pass null and use mem0's prompt default `2023`.
+For each cutoff, pass at most the first 200 selected results to the vendored
+`get_answer_generation_prompt` behavior. It builds the memory block in ascending
+`(session_timestamp, source_path, line_start, rank)` order, with one
+`(timestamp) excerpt` entry per result, and shows no rank or score. Use mem0's
+`_to_human_date` formatting for an available result timestamp and `(unknown date)` for a
+missing timestamp. Call the answerer with an empty system string. The answerer sees this
+memory block only; evidence turns and the gold answer never enter its prompt. An optional
+user profile, when configured, precedes the memory block using mem0's profile formatter.
+
+For the judge, preprocess only the gold answer as `preprocess_answer` does: category 3
+uses the text before the first semicolon after stripping it, and all other categories
+remain unchanged. Map `{question}`, `{answer}`, and `{response}` to the benchmark
+question, processed gold answer, and generated answer. If evidence is enabled, add the
+vendored `## Evidence (actual conversation messages containing the answer)` block to
+the judge prompt only, with evidence turns in dataset order. Use the mem0 judge system
+prompt (`You are evaluating conversational AI memory recall. Return JSON only with the
+format requested.`) and the same prompt and rubric at every cutoff. After the answerer
+returns, extract the answer with `response.rsplit("ANSWER:", 1)[-1].strip()` when
+`ANSWER:` occurs; otherwise keep the full response unchanged. `CORRECT` maps to score
+`1.0`, every other judgment maps to `0.0`, and a score of at least `0.5` passes.
+
+Evidence matching uses a canonical section identity. Normalize `source_path` to a
+repository-relative POSIX path. Set `heading_path` to the ordered literal headings from
+conversation through the section, and set `section_id` to
+`{source_path}#{heading_path}@{line_start}-{line_end}` with inclusive line ranges.
+Map each LOCOMO evidence turn to its rendered source path and inclusive turn line range.
+A retrieved section hits an evidence turn when it has the same source path and its
+inclusive line range contains the complete evidence-turn range; exact section-id
+equality is not required, so a containing session or section is a hit. Count each
+evidence target once. Sort equal-score results by `section_id` ascending, assign unique
+ranks in that order, and use the first ranked hit for MRR. The result artifact keeps
+retrieval rank order; only the prompt view uses chronological order.
 
 Vendor the LOCOMO prompts under `eval/vendor/mem0/locomo/`, with the source repository
 commit, copyright notices, Apache-2.0 license text, and any required NOTICE text. Do not
-rewrite the prompts or judge rubric. Record prompt version, answerer model, judge model,
-provider, cutoff list, and token usage when the client provides it. A normal full matching
-run makes `1,540 * 4 * 2 = 12,320` LLM calls: one answerer and one judge request per
-cutoff and question. This reviewer-verified scale is an explicit cost choice; retries can
-add calls.
+rewrite the prompts or judge rubric. Record prompt version, answerer model and provider,
+judge model and provider, cutoff list, and token usage when the client provides it. A
+normal full matching run makes `1,540 * 4 * 2 = 12,320` LLM calls: one answerer and one
+judge request per cutoff and question. This reviewer-verified scale is an explicit cost
+choice; retries can add calls.
 
 The internal runner needs no API key. The common search and ingest stages also need none.
 The answerer reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` plus
@@ -730,9 +785,11 @@ Each LLM call follows mem0's client policy: at most five attempts, with waits of
 6, and 8 seconds between attempts. After the final answerer failure, record a cutoff
 with `judgment: ERROR`, `score: 0.0`, `error: answerer_error`, and no generated answer.
 After the final judge failure or invalid judge JSON, preserve the generated answer and
-record `judgment: ERROR`, `score: 0.0`, and `error: judge_error`. Count every cutoff with
-`judgment: ERROR` or a non-null `error` in `metrics.errors` and the matching cutoff and
-category error counts. Do not convert an operational failure into `WRONG`; this preserves
+record `judgment: ERROR`, `score: 0.0`, and `error: judge_error`. Define the primary
+cutoff as the largest configured cutoff. Count at most one error per evaluation in
+top-level `metrics.errors` and primary-cutoff `by_category` errors, using only that
+cutoff's `judgment: ERROR` or non-null `error`. Count errors independently inside each
+`by_cutoff[k]` block. Do not convert an operational failure into `WRONG`; this preserves
 mem0's error accounting semantics.
 
 The common result is comparable to mem0's published tables only when the dataset version,
@@ -770,9 +827,11 @@ The stdlib schema uses `dataclasses` and `json`, not pydantic. The top-level obj
 - `metadata`: `benchmark`, `run_id`, `dataset`, `corpus_fingerprint`, `index_generation`,
   `case_set_fingerprint`, `prompt_version`, `answerer_prompt_hash`,
   `judge_prompt_hash`, `config`, `started_at`, and `finished_at`. Timestamps are UTC RFC
-  3339 strings. `config` contains `retrieval_mode`, `top_k`, `cutoffs`,
-  `answerer_model`, `judge_model`, and `provider`, with null model/provider values for
-  the internal run. `dataset` contains the dataset name, version or source commit, and
+ 3339 strings. `config` contains `retrieval_mode`, `top_k`, `cutoffs`,
+  `answerer_model`, `answerer_provider`, `judge_model`, and `judge_provider`. The
+  answerer provider is the `--provider` value. The judge provider is `--judge-provider`
+  or the answerer provider when omitted. Model and provider values are null for the
+  internal run. `dataset` contains the dataset name, version or source commit, and
   dataset fingerprint;
 - `metrics`: `overall_accuracy`, `overall_avg_score`, `total`, `correct`, `errors`,
   `by_category`, `by_cutoff`, `latency_ms`, and `deterministic_gates`;
@@ -793,13 +852,15 @@ Each `cutoff_outcomes[k]` object has `retrieved_count`, `relevant_count`, `recal
 `precision`, `mrr`, `abstention_correct`, `forbidden_sources`, `score`, `passed`,
 `generated_answer`, `judgment`, `reason`, `model`, and `error`. It also has
 `prompt_metadata` with `answerer` and `judge` objects. Each object records the prompt
-version, template hash, slot names, model, `prompt_tokens`, and `completion_tokens`.
+version, template hash, slot names, provider, model, `prompt_tokens`, and
+`completion_tokens`.
 Token counts are null when the provider gives no usage data. The answer and judge fields
 are null for the internal deterministic run unless its optional judge is enabled. The
 common runner fills them for every cutoff. `score` at the top level is the outcome at
 the largest configured cutoff.
 
-For cutoff `k`, let `R_k` be the first `k` ranked sources and `E` the expected sources.
+For cutoff `k`, let `R_k` be the first `k` ranked sources and `E` the expected evidence
+targets matched by the canonical identity above.
 For non-empty `E`, recall is `|R_k intersect E| / |E|`, precision is
 `|R_k intersect E| / |R_k|` and is zero when `R_k` is empty, and MRR is `1 / rank` for
 the first expected source or zero when none is present. For an abstention case, score is
@@ -808,12 +869,16 @@ score is recall, forced to `0.0` for any forbidden source. `passed` means score 
 Common score and judgment follow the mem0 rule above. `error` repeats the per-case failure
 code when that cutoff could not be evaluated.
 
-`metrics.by_category` contains `total`, `correct`, `accuracy`, `avg_score`, and `errors`
-for `verbatim`, `paraphrase`, `held-out`, `abstention`, and `wrong-project`; future
-adapters may add `temporal` and `multi-hop`. `metrics.by_cutoff[k]` contains `cutoff`, an
-`overall` object with those same five fields, and the matching `by_category` map. Accuracy
-and average score are percentages, as in mem0's tables: `100 * correct / total` and
-`100 * mean(score)`. Empty groups have zero totals and zero percentages.
+For LOCOMO, `metrics.by_category` and every `metrics.by_cutoff[k].by_category` map
+contain all four comparable categories: `single-hop`, `multi-hop`, `temporal`, and
+`open-domain`. They map dataset categories 4, 1, 2, and 3 respectively. Category 5
+(`adversarial`) is excluded. Each category object contains `total`, `correct`,
+`accuracy`, `avg_score`, and `errors`, including zero-valued objects for categories with
+no in-scope questions. `metrics.by_cutoff[k]` contains `cutoff`, an `overall` object
+with those fields, and the matching four-category map. The internal harness may use its
+own case categories. Accuracy and average score are percentages, as in mem0's tables:
+`100 * correct / total` and `100 * mean(score)`. Empty groups have zero totals and zero
+percentages.
 
 `metrics.deterministic_gates` is populated for the internal harness. Its `by_cutoff` map
 contains raw `recall`, `precision`, and `mrr` means over non-abstention cases,
