@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
 from .core import excerpt, index, read_source, search
 
@@ -28,6 +29,19 @@ def parser() -> argparse.ArgumentParser:
     read_parser.add_argument("path")
     read_parser.add_argument("--heading")
     read_parser.add_argument("--max-bytes", type=int, default=20000)
+    bench_parser = commands.add_parser("bench", help="measure index and search performance")
+    bench_parser.add_argument("--files", "--file-count", dest="file_count", type=int, default=2000,
+                              help="synthetic Markdown files to generate (default: 2000)")
+    bench_parser.add_argument("--queries", dest="query_count", type=int, default=200,
+                              help="warm search queries to measure (default: 200)")
+    bench_parser.add_argument("--seed", type=int, default=0, help="synthetic corpus seed (default: 0)")
+    bench_parser.add_argument("--corpus-dir", help="reuse or create a synthetic corpus at DIR")
+    bench_parser.add_argument(
+        "--real",
+        metavar="DIR",
+        help="benchmark an existing Markdown directory read-only; results reflect local cost only",
+    )
+    bench_parser.add_argument("--json", action="store_true", help="write the report as JSON")
     return root
 
 
@@ -47,6 +61,19 @@ def _result(candidate) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "bench":
+            report = run_benchmark(
+                file_count=args.file_count,
+                query_count=args.query_count,
+                seed=args.seed,
+                corpus_dir=args.corpus_dir,
+                real_dir=args.real,
+            )
+            if args.json:
+                print(json.dumps(report, sort_keys=True))
+            else:
+                print(format_report(report))
+            return 1 if report["gate"]["enforced"] and not report["gate"]["passed"] else 0
         config = load_config(args.config)
         if args.command == "index":
             print(f"index generation {index(config, args.rebuild)}")
