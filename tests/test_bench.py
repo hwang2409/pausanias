@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from pausanias.bench import run_benchmark
+from pausanias.bench import format_report, run_benchmark
 from pausanias.synth import generate_corpus
 
 
@@ -33,3 +33,32 @@ def test_benchmark_report_has_positive_metrics():
     assert report["gate"]["enforced"] is False
     assert all(isinstance(value, (int, float)) and value > 0 for value in report["metrics"].values())
     assert set(report["metrics"]) == set(report["checks"])
+
+
+def test_benchmark_query_modes_have_hits():
+    report = run_benchmark(file_count=30, query_count=60, seed=41)
+
+    modes = report["queries"]["modes"]
+    assert set(modes) == {"single", "phrase", "identifier", "multi", "scoped", "global", "miss"}
+    for mode in set(modes) - {"miss"}:
+        assert modes[mode]["hit_count_p50"] > 0
+        assert modes[mode]["warm_search_p95_ms"] > 0
+    assert modes["miss"]["hit_count_max"] == 0
+
+
+def test_benchmark_gate_is_only_enforced_for_built_in_corpus(tmp_path: Path):
+    corpus = tmp_path / "corpus"
+    generate_corpus(corpus, file_count=30, seed=41)
+
+    report = run_benchmark(corpus_dir=corpus, seed=41)
+
+    assert report["source"]["file_count"] == 30
+    assert report["gate"]["enforced"] is False
+
+
+def test_targetless_metrics_are_not_reported_as_passed():
+    report = run_benchmark(file_count=30, query_count=20, seed=41)
+
+    for name in ("index_build_ms", "incremental_refresh_ms", "warm_search_p50_ms"):
+        assert report["checks"][name]["passed"] is None
+    assert "n/a" in format_report(report)

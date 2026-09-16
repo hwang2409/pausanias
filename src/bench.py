@@ -14,6 +14,7 @@ import time
 
 from .config import Config, load_config
 from .core import index, search
+from .splitter import split_markdown
 from .synth import generate_corpus
 
 
@@ -28,6 +29,7 @@ STOP_WORDS = {
 @dataclass(frozen=True)
 class QuerySpec:
     query: str
+    mode: str = "single"
     project: str | None = None
     root_id: str | None = None
     all_projects: bool = False
@@ -38,7 +40,7 @@ class Document:
     path: Path
     project: str
     root_id: str
-    text: str
+    indexed_texts: tuple[str, ...]
     global_note: bool
 
 
@@ -100,12 +102,14 @@ def _documents(config: Config, source: Path) -> list[Document]:
     documents: list[Document] = []
     for path in _markdown_files(source):
         root_id, project = _root_for(config, path)
+        text = path.read_text(encoding="utf-8")
+        split = split_markdown(str(path), text, config.section_bytes)
         documents.append(
             Document(
                 path,
                 project,
                 root_id,
-                path.read_text(encoding="utf-8"),
+                tuple(f"{section.heading or ''}\n{section.text}" for section in split.sections),
                 path.name.startswith("global-"),
             )
         )
@@ -127,10 +131,40 @@ def _tokens(text: str) -> list[str]:
 
 
 def _phrase_tokens(text: str) -> tuple[str, str] | None:
-    words = [word.lower() for word in WORD.findall(text) if word.lower() not in STOP_WORDS]
-    if len(words) < 2:
-        return None
-    return words[0], words[1]
+    matches = list(WORD.finditer(text))
+    for left, right in zip(matches, matches[1:]):
+        left_word = left.group().lower()
+        right_word = right.group().lower()
+        if left_word not in STOP_WORDS and right_word not in STOP_WORDS:
+            return left_word, right_word
+    return None
+
+
+def _indexed_tokens(document: Document) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for text in document.indexed_texts:
+        for token in _tokens(text):
+            if token.lower() not in seen:
+                tokens.append(token)
+                seen.add(token.lower())
+    return tokens
+
+
+def _phrase_for(document: Document) -> tuple[str, str] | None:
+    for text in document.indexed_texts:
+        phrase = _phrase_tokens(text)
+        if phrase is not None:
+            return phrase
+    return None
+
+
+def _multi_for(document: Document) -> list[str]:
+    for text in document.indexed_texts:
+        tokens = _tokens(text)
+        if len(tokens) >= 2:
+            return tokens[:3]
+    return []
 
 
 def _make_queries(documents: list[Document], count: int, seed: int) -> list[QuerySpec]:
@@ -141,32 +175,39 @@ def _make_queries(documents: list[Document], count: int, seed: int) -> list[Quer
     global_documents = [document for document in documents if document.global_note]
     modes = ("single", "phrase", "identifier", "multi", "scoped", "global")
     for number in range(count):
+        if number % 10 == 9:
+            document = documents[rng.randrange(len(documents))]
+            queries.append(QuerySpec(
+                f"pausanias-benchmark-miss-{seed}-{number}",
+                "miss",
+                project=document.project,
+            ))
+            continue
         mode = modes[number % len(modes)]
         document = documents[rng.randrange(len(documents))]
-        tokens = _tokens(document.text)
-        if not tokens:
-            tokens = [document.path.stem]
+        tokens = _indexed_tokens(document) or [document.path.stem]
+        words = [token for token in tokens if not IDENTIFIER.fullmatch(token)] or tokens
         identifier = next((token for token in tokens if IDENTIFIER.fullmatch(token)), tokens[0])
-        phrase = _phrase_tokens(document.text)
-        if mode == "phrase" and phrase:
+        phrase = _phrase_for(document)
+        multi = _multi_for(document)
+        if mode == "phrase" and phrase is not None:
             query = f'"{phrase[0]} {phrase[1]}"'
         elif mode == "identifier":
             query = identifier
-        elif mode == "multi":
-            selected = tokens[:3]
-            query = " ".join(selected)
+        elif mode == "multi" and multi:
+            query = " ".join(multi)
         elif mode == "global" and global_documents:
             global_document = global_documents[rng.randrange(len(global_documents))]
-            global_tokens = _tokens(global_document.text)
+            global_tokens = _indexed_tokens(global_document)
             query = global_tokens[0] if global_tokens else global_document.path.stem
-            queries.append(QuerySpec(query, all_projects=True))
+            queries.append(QuerySpec(query, "global", all_projects=True))
             continue
         else:
-            query = tokens[0]
+            query = words[0]
         if mode == "scoped":
-            queries.append(QuerySpec(query, project=document.project, root_id=document.root_id))
+            queries.append(QuerySpec(query, mode, project=document.project, root_id=document.root_id))
         else:
-            queries.append(QuerySpec(query, project=document.project))
+            queries.append(QuerySpec(query, mode, project=document.project))
     return queries
 
 
@@ -182,7 +223,7 @@ def _positive_milliseconds(seconds: float) -> float:
 
 def _check(value: float, target: float | None) -> dict[str, float | bool | None]:
     if target is None:
-        return {"passed": True, "headroom_multiple": None, "target_ms": None}
+        return {"passed": None, "headroom_multiple": None, "target_ms": None}
     return {
         "passed": value <= target,
         "headroom_multiple": target / value,
@@ -244,13 +285,34 @@ def run_benchmark(
         cold_search_ms = _positive_milliseconds(time.perf_counter() - started)
 
         warm_timings: list[float] = []
+        hit_counts: dict[str, list[int]] = {}
+        mode_timings: dict[str, list[float]] = {}
         for query in queries:
             started = time.perf_counter()
-            search(config, query.query, query.project, query.root_id, query.all_projects, limit=20)
-            warm_timings.append(_positive_milliseconds(time.perf_counter() - started))
+            results = search(config, query.query, query.project, query.root_id, query.all_projects, limit=20)
+            elapsed_ms = _positive_milliseconds(time.perf_counter() - started)
+            warm_timings.append(elapsed_ms)
+            hit_counts.setdefault(query.mode, []).append(len(results))
+            mode_timings.setdefault(query.mode, []).append(elapsed_ms)
         warm_p50_ms = _percentile(warm_timings, 0.50)
         warm_p95_ms = _percentile(warm_timings, 0.95)
         warm_max_ms = max(warm_timings)
+
+        query_modes = {}
+        for mode, timings in mode_timings.items():
+            counts = hit_counts[mode]
+            hit_p50 = _percentile(counts, 0.50)
+            if mode != "miss" and hit_p50 < 1:
+                raise ValueError(f"benchmark query mode {mode} has zero-hit median")
+            query_modes[mode] = {
+                "count": len(timings),
+                "warm_search_p50_ms": _percentile(timings, 0.50),
+                "warm_search_p95_ms": _percentile(timings, 0.95),
+                "hit_count_p50": hit_p50,
+                "hit_count_p95": _percentile(counts, 0.95),
+                "hit_count_min": min(counts),
+                "hit_count_max": max(counts),
+            }
 
         metrics = {
             "index_build_ms": index_build_ms,
@@ -269,7 +331,13 @@ def run_benchmark(
             "warm_search_max_ms": 750.0,
         }
         checks = {name: _check(value, targets[name]) for name, value in metrics.items()}
-        default_synthetic = synthetic and file_count == 2000 and query_count == 200
+        default_synthetic = (
+            corpus_dir is None
+            and real_dir is None
+            and file_count == 2000
+            and actual_file_count == 2000
+            and query_count == 200
+        )
         gate_passed = checks["warm_search_p95_ms"]["passed"]
         report = {
             "source": {
@@ -279,7 +347,7 @@ def run_benchmark(
                 "file_count": actual_file_count,
                 "seed": seed if synthetic else None,
             },
-            "queries": {"count": query_count},
+            "queries": {"count": query_count, "modes": query_modes},
             "metrics": metrics,
             "targets": targets,
             "checks": checks,
@@ -303,9 +371,20 @@ def format_report(report: dict) -> str:
     for name, value in report["metrics"].items():
         check = report["checks"][name]
         target = "-" if check["target_ms"] is None else f"{check['target_ms']:.1f} ms"
-        result = "pass" if check["passed"] else "fail"
+        result = "n/a" if check["passed"] is None else ("pass" if check["passed"] else "fail")
         headroom = "-" if check["headroom_multiple"] is None else f"{check['headroom_multiple']:.2f}x"
         lines.append(f"{name:29}  {value:8.2f} ms  {target:10}  {result:6}  {headroom:8}")
+    lines += [
+        "",
+        "query mode                     count   p50 ms   p95 ms   hits p50  hits p95  min  max",
+        "-----------------------------  ------  -------  -------  --------  --------  ---  ---",
+    ]
+    for mode, stats in report["queries"]["modes"].items():
+        lines.append(
+            f"{mode:29}  {stats['count']:6}  {stats['warm_search_p50_ms']:7.2f}  "
+            f"{stats['warm_search_p95_ms']:7.2f}  {stats['hit_count_p50']:8}  "
+            f"{stats['hit_count_p95']:8}  {stats['hit_count_min']:3}  {stats['hit_count_max']:3}"
+        )
     gate = report["gate"]
     status = "pass" if gate["passed"] else "fail"
     enforcement = " (enforced)" if gate["enforced"] else ""
