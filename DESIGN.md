@@ -211,7 +211,7 @@ Hold the model, task, corpus snapshot, generation settings, and total context al
 
 Include questions about prior decisions, exact ticket identifiers, paraphrased concepts, ambiguous follow-ups, changed preferences, conflicting notes, unrelated projects, deleted sources, and questions with no relevant memory. Include adversarial instructions inside notes.
 
-Each case specifies the expected answer, acceptable source evidence, forbidden stale claims, and whether retrieval should abstain. Evaluation requires human-reviewed cases; an LLM judge alone is insufficient for source correctness.
+Each case specifies the expected answer, acceptable source evidence, forbidden stale claims, and whether retrieval should abstain. Cases are versioned and mechanically locked before tuning. Deterministic fixtures and scoring provide the case gate; no manual case gate exists.
 
 Measure:
 
@@ -221,18 +221,20 @@ Measure:
 - Retrieval latency, added tokens, and explicit follow-up searches.
 - Compliance with malicious instructions embedded in retrieved material.
 
-The current case file and all current metric baselines are PROVISIONAL. The 57 cases,
-including 12 paraphrase cases and 4 held-out cases, are a DRAFT pending Henry's human
-review. After review, keep at least 40 cases spanning the categories above. Treat results
-as a pilot, not a statistical guarantee. Choose a larger evaluation size after measuring
-baseline variation.
+The current case file and all current metric baselines are PROVISIONAL. Keep the 57 cases,
+including 12 paraphrase cases and 4 held-out cases, as the initial regression corpus.
+Treat results as a pilot, not a statistical guarantee. Choose a larger evaluation size
+after measuring baseline variation.
 
-The first release requires no source-boundary violations in the test set, correct deletion handling, and bounded timeout behavior. Adopt automatic retrieval by default only if paired evaluation improves useful recall without increasing unsupported or stale claims. Record thresholds before tuning on the development set, then test on held-out cases.
+The first release requires no source-boundary violations in the test set, correct deletion
+handling, and bounded timeout behavior. Adopt automatic retrieval by default only if paired
+evaluation improves useful recall without increasing unsupported or stale claims. Record
+thresholds before tuning on the development set, then measure the held-out cases.
 
 ## Implementation sequence
 
 1. Build the corpus reader, FTS index, source-read command, and explicit search baseline.
-2. Build the reviewed evaluation cases and measure model-chosen retrieval.
+2. Build the evaluation cases and measure model-chosen retrieval.
 3. Add packet construction, bounded hook integration, diagnostics, and failure tests.
 4. Compare all four conditions. Tune budgets and acceptance rules on development cases only.
 5. Add embeddings only if paraphrase failures remain material on held-out cases.
@@ -243,7 +245,7 @@ Do not build automatic memory writing as part of these steps. Existing vault aut
 ## Semantic retrieval
 
 Arc 1 has a PROVISIONAL lexical baseline. Arc 2 adds a local semantic lane because the
-DRAFT results currently show failures on all 16 paraphrase and held-out cases. This
+Current results show failures on all 16 paraphrase and held-out cases. This
 section is a foundation design, not a commitment to ship semantic results before the
 evaluation gates pass.
 
@@ -259,9 +261,8 @@ evaluation gates pass.
 | Evaluation | Separate semantic, lexical, scope, abstention, and latency gates | One aggregate recall threshold | An aggregate can hide a semantic gain or a lexical regression |
 
 All current counts, scores, and latency figures are PROVISIONAL. The evaluation file is
-DRAFT until Henry completes human review. The development and held-out case sets must be
-reviewed and FROZEN before any ticket tunes embeddings, ranking, synonyms, budgets, or
-acceptance thresholds.
+validated by the harness, and its case-set fingerprint is mechanically frozen before any
+ticket tunes embeddings, ranking, synonyms, budgets, or acceptance thresholds.
 
 ### Embedding runtime
 
@@ -586,7 +587,8 @@ path, records fusion overhead separately, and activates the fused warm and cold 
 A cold timeout or fallback fails its active gate; the adapter still returns lexical or
 empty context before its hard deadline. If the optional backend is unavailable, report
 the semantic gates as disabled and enforce the lexical gate instead. PAUS-12 reruns the
-already active gates for final evaluation; it does not defer their activation.
+already active gates, runs the complete common LOCOMO benchmark, and reports its numbers
+beside mem0's matching published tables; it does not defer activation.
 
 | Stage | Warm p95 planning budget |
 | --- | ---: |
@@ -611,39 +613,322 @@ needed to choose a simpler fix when a gate fails.
 
 ### Evaluation extensions
 
-**Recommendation:** extend the existing harness to report fixed category metrics and
-regression gates without changing the 57 cases in this ticket. The 12 `paraphrase` and 4
-`held-out` cases are the Arc 2 target set. Keep the four held-out cases out of tuning and
-report them separately from development cases.
+**Recommendation:** maintain two runners with one result contract: an internal deterministic
+golden-case harness and a mem0-shaped common benchmark runner. Both use three stages:
 
-Record these thresholds as hypotheses before implementation tuning:
+```text
+ingest -> search -> evaluate
+```
 
-- semantic recall@4 of at least 0.75 across the 16 paraphrase and held-out cases;
-- paraphrase recall@4 of at least 0.75 and held-out recall@4 of at least 0.75;
-- standard exact/verbatim recall@4 of at least 0.98, with the Arc 1 1.0 result treated
-  as the regression reference;
-- abstention accuracy of 1.0 and zero forbidden-source violations;
-- warm hybrid p95 at or below 300 ms on the benchmark workload.
+The internal harness uses the existing 57 cases. Add a required `category` field to each
+`cases.json` entry as a mechanical migration. Keep `paraphrase` and `held-out`; map a
+positive `standard` case to `verbatim`, a `standard` abstention with a forbidden source
+outside its requested project to `wrong-project`, and every other `standard` abstention
+to `abstention`. Do not rewrite queries, sources, or rationales. The harness writes the
+canonical JSON fingerprint to `eval/cases.lock`, and refuses a run when the case file
+does not match it. A case change requires a new recorded baseline and lock before a tuning
+ticket. The run has no approval or case-status transition gate.
 
-The harness must print actual values beside each hypothesis. A failed hypothesis is a
-result to record, not a reason to edit the threshold. If the case set changes later,
-record the new baseline and rationale before tuning.
+The internal runner accepts `--predict-only`, `--evaluate-only`, and `--resume`.
+`--predict-only` runs ingest and search, then leaves search checkpoints. `--evaluate-only`
+requires complete search checkpoints and runs deterministic scoring without rebuilding
+the index. `--resume` reuses completed ingest and per-case search checkpoints. Its default
+cutoffs are `1,2,4,8`; its pass threshold is `0.5`.
 
-Add cases or fixtures for:
+Record these Arc 2 thresholds before implementation tuning:
 
-- model or tokenizer manifest drift, including a refusal to mix generations;
-- a missing model bundle and lexical fallback;
-- repeated queries with stable ordering and near-tie handling;
-- exact ticket and quoted-term cases where vector results are distractors;
-- semantic results that would cross a project or root boundary;
-- deleted and changed sources after vector indexing;
-- no-relevant-memory queries that are semantically close to common corpus terms;
-- ranking regressions on all existing verbatim cases.
+- semantic recall@4 of at least `0.75` across the 16 paraphrase and held-out cases;
+- paraphrase recall@4 of at least `0.75` and held-out recall@4 of at least `0.75`;
+- standard exact/verbatim recall@4 of at least `0.98`, with the Arc 1 `1.0` result as
+  the regression reference;
+- abstention accuracy of `1.0` and zero forbidden-source violations;
+- warm hybrid p95 at or below `300 ms` on the benchmark workload.
 
-**Runner-up:** raise the existing aggregate recall threshold. It loses because the current
-aggregate mixes lexical, semantic, and abstention behavior. Category metrics expose both
-the desired semantic gain and an exact-match regression. Keep the existing aggregate for
-continuity, but do not use it as the Arc 2 decision by itself.
+The harness prints measured values beside each threshold. A failed threshold is recorded,
+not changed to fit the result. Keep deterministic fixtures for model or tokenizer
+manifest drift with refusal to mix generations; a missing model bundle with lexical
+fallback; repeated queries with stable ordering and near-tie handling; exact ticket and
+quoted-term queries where vector results are distractors; project or root boundary
+crossings; deleted and changed sources after vector indexing; no-relevant-memory queries
+close to common corpus terms; and ranking regressions on every verbatim case. The Arc 1
+verbatim regression gate remains active when the common runner is used.
+
+The common runner starts with LOCOMO-10: ten multi-session dialogues and 1,540 questions
+from categories 1, 2, 3, and 4 of the 1,986-question dataset. The category filter is
+`category in [1, 2, 3, 4]` (multi-hop, temporal, open-domain, and single-hop); category 5
+(adversarial, 446 questions) is excluded. LongMemEval and BEAM are later adapters, not
+new result formats. The runner is `eval/benchmarks/locomo/run.py` and accepts
+`--dataset-path`, `--run-id`, `--conversations`, `--top-k`, `--top-k-cutoffs`,
+`--answerer-model`, `--judge-model`, `--provider`, `--judge-provider`, `--with-evidence`,
+`--user-profile`, `--predict-only`, `--evaluate-only`, and `--resume`. A cheap smoke run selects a conversation subset with
+`--conversations`;
+a comparable full run selects all ten conversations and all 1,540 questions. Comparable
+runs use mem0's defaults: `top-k=200` and cutoffs `10,20,50,200`.
+
+LOCOMO provenance is the Snap Research dataset at
+`https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json`, pinned
+to the source commit and recorded with its SHA-256 in run metadata. It is licensed CC
+BY-NC 4.0; the non-commercial term applies because this is a personal research project.
+The dataset is never committed to this repository. Fetch it to the gitignored
+`datasets/locomo/locomo10.json`, validate ten conversations and the category counts, and
+reuse that cache when its recorded URL, commit, and hash match. A missing or mismatched
+cache requires an explicit refetch; a run never silently uses an unverified file.
+
+Common ingest renders one file per session as UTF-8 Markdown. `conversation_index` is the
+zero-based index in the dataset array. `session_number` is the numeric suffix of the
+source `session_N` key. Sort sessions by parsed session date, then numeric session
+number. The `:02d` width is a minimum width, not a truncation. Name files
+`conversation-{conversation_index:02d}--session-{session_number:02d}.md`.
+
+Construct each file with this exact algorithm:
+
+1. Normalize every source string by replacing CRLF and CR with LF. Preserve all other
+   characters, including spaces and source newlines.
+2. Start with the conversation and session headings below. Use the literal separator
+   `\n\n` between every heading and its following field, and between turn blocks.
+3. For each turn in source order, emit one turn heading and its `turn_text`. A turn
+   with a `query` or `blip_caption` field gets one metadata line after its text:
+   `[image query: {query}; caption: {blip_caption}]`. A missing or null field is empty.
+   Add one LF before that line only when non-empty text does not already end in LF.
+   An image-only turn uses the metadata line as its text.
+4. Append one generated LF after the assembled document. Do not trim source trailing
+   spaces or newlines. Drop image pixels, URLs, and unknown multimodal fields.
+
+Render:
+
+```markdown
+# conversation {conversation_index:02d}
+
+## session {session_number:02d} | timestamp: {session_date_time}
+
+### turn {dia_id} | speaker: {speaker} | timestamp: {session_date_time}
+
+{turn_text}
+```
+
+For example, `conversation_index=0`, `session_number=1`, and two source turns produce
+these bytes (every displayed line ending is LF):
+
+```markdown
+# conversation 00
+
+## session 01 | timestamp: 1:56 pm on 8 May, 2023
+
+### turn D1:0 | speaker: Alex | timestamp: 1:56 pm on 8 May, 2023
+
+Hi there.
+
+### turn D1:1 | speaker: Sam | timestamp: 1:56 pm on 8 May, 2023
+
+[image query: a red kite; caption: park]
+```
+
+Fixed indexes, headings, separators, field order, source-text preservation, and the
+generated final LF make the same dataset produce byte-identical files.
+
+Common search sends each question to `pausanias search`, records every result through
+`top-k` in rank order, and maps evidence turn references to the rendered note path and
+line range. At cutoff `k`, select the first `k` ranked results.
+
+LOCOMO prompt construction, context ordering, evidence formatting, and answer extraction
+are ports of the vendored mem0 sources. The implementation ticket vendors the relevant
+`benchmarks/locomo/` code from source commit `4b61c5d31b9c668a12b4f5e78064248a02c82d2b`
+under `eval/vendor/mem0/benchmarks/locomo/`, with attribution, copyright notices, and
+the Apache-2.0 license text. The vendored code is normative. This prose summarizes its
+contract; when prose and code disagree, the code wins.
+
+At each cutoff, the answerer adapter calls the vendored
+`get_answer_generation_prompt` with the benchmark question, newest sorted-session raw
+`session_date_time` as `reference_date` (or null for mem0's `2023` default), and at most
+the first 200 results. Its stable `created_at` sort is normative: equal timestamps keep
+their input order, including same-session ties. The adapter also owns date conversion,
+memory formatting, empty-system behavior, and optional profile formatting. Evidence and
+the gold answer never enter the answerer prompt. The judge adapter calls vendored
+`preprocess_answer`, then `get_judge_prompt` without `--with-evidence` or
+`get_judge_prompt_with_evidence` with it. The latter owns the evidence block formatting.
+The judge uses the vendored system prompt and rubric. Answer extraction ports
+`response.rsplit("ANSWER:", 1)[-1].strip()` when `ANSWER:` occurs, and otherwise keeps
+the full response.
+
+Define `prompt_mode` as `answerer-profile` or `answerer-no-profile`, combined with
+`judge-with-evidence` or `judge-without-evidence`; `--user-profile` and `--with-evidence`
+select these values. The run fingerprint includes `prompt_mode` and the exact
+`prompt_fixture_version`, in addition to the dataset, corpus, index, case-lock, and run
+configuration fingerprints. Store it in run metadata and every checkpoint. `--resume`
+rejects a checkpoint when either prompt value differs, so incompatible checkpoints cannot
+resume.
+
+Parity is verified by byte-identical golden-prompt fixture tests. The fixture set is
+`eval/fixtures/locomo/golden-prompts-v1/`, with pinned inputs
+`answerer-basic.json`, `answerer-same-created-at.json`, `judge-without-evidence.json`,
+and `judge-with-evidence.json`, plus their expected UTF-8 prompt files. Generate each
+expected file by running the vendored mem0 functions on its pinned input. Compare the
+runner's constructed prompt bytes with those files. Increment `prompt_fixture_version`
+when the vendored source or adapter contract changes.
+
+Evidence matching uses the existing hashed `section_id` for sections. Add a separate
+`evidence_id` for each LOCOMO evidence target. Serialize it exactly as
+`<repository-relative-file-path>#<turn-start:08d>-<turn-end:08d>`, using the rendered
+source path and inclusive line numbers. Canonical encoding is UTF-8 after Unicode NFC normalization,
+case-sensitive, with POSIX `/` separators, no `.` or `..` segments, and the literal
+`#` and `-` separators. Sort equal-score retrieval results by `section_id` ascending and
+sort evidence targets by their UTF-8 `evidence_id` bytes. A retrieved section hits a
+target when it has the same path and contains the target's complete line range. Each
+target counts once. `evidence_id` is a separate namespace; it never collides with or
+replaces the section hash. The artifact keeps retrieval rank order, while only the
+prompt view uses chronological order. Record prompt version, answerer model and
+provider, judge model and provider, cutoff list, and token usage when the client
+provides it. A normal full matching run makes `1,540 * 4 * 2 = 12,320` LLM calls: one
+answerer and one judge request per cutoff and question. This reviewer-verified scale is
+an explicit cost choice; retries can add calls.
+
+The internal runner needs no API key. The common search and ingest stages also need none.
+The answerer reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` plus
+`AZURE_OPENAI_ENDPOINT`, according to its provider. The judge reads the matching key for
+its provider and may use a separate `--judge-provider`. `--predict-only` needs no LLM key.
+A complete common run and `--evaluate-only` require both configured keys before starting.
+Missing keys fail fast with no completed artifact. An optional internal judge uses the
+configured judge key but never changes deterministic gates.
+
+Each LLM call follows mem0's client policy: at most five attempts, with waits of 2, 4,
+6, and 8 seconds between attempts. After the final answerer failure, record a cutoff
+with `judgment: ERROR`, `score: 0.0`, `error: answerer_error`, and no generated answer.
+After the final judge failure or invalid judge JSON, preserve the generated answer and
+record `judgment: ERROR`, `score: 0.0`, and `error: judge_error`. Define the primary
+cutoff as the largest configured cutoff. Count at most one error per evaluation in
+top-level `metrics.errors` and primary-cutoff `by_category` errors, using only that
+cutoff's `judgment: ERROR` or non-null `error`. Count errors independently inside each
+`by_cutoff[k]` block. Do not convert an operational failure into `WRONG`; this preserves
+mem0's error accounting semantics.
+
+The common result is comparable to mem0's published tables only when the dataset version,
+prompt version, answerer, judge, provider, and cutoff list match. The comparison must name
+three caveats: pausanias retrieves Markdown excerpts while mem0 retrieves extracted facts;
+the same numeric top-k counts different retrieval units; and judge-model or prompt drift
+changes scores. PAUS-12 reports common-run numbers beside the matching mem0 LOCOMO tables,
+not as an unexplained claim of system parity.
+
+#### Unified result artifact
+
+Write the final artifact to `results/<benchmark>/<run_id>/run.json`. Keep resumable state in
+`results/<benchmark>/<run_id>/checkpoints/ingest.json` and
+`results/<benchmark>/<run_id>/checkpoints/search/<case_id>.json`. `--predict-only` writes
+checkpoints but does not claim evaluated metrics. `--evaluate-only` reads those exact
+checkpoints and writes `run.json`.
+
+Every checkpoint is JSON with `checkpoint_version`, `stage`, `run_id`, `case_id` when
+applicable, `dataset_fingerprint`, `corpus_fingerprint`, `index_generation`, `config`,
+`status`, `started_at`, `finished_at`, and stage output. Write to a temporary file and
+atomically rename it. An ingest checkpoint is complete only when every in-scope session
+file hash and index generation is present. A search checkpoint is complete only when it
+has the question, query, numeric latency, the full ranked result list through `top_k`,
+the retrieval fingerprint, and a terminal `status` of `complete` or `error` with its
+failure code. Evaluation adds all configured cutoff outcomes and the same terminal status.
+
+On `--resume`, validate the schema version, run and case IDs, dataset/corpus/index
+fingerprints, config including cutoffs, and every required output field. A corrupt,
+partial, stale, or mismatched checkpoint is ignored and recomputed. Never mix checkpoints
+from another dataset, case lock, index generation, or prompt configuration.
+
+The stdlib schema uses `dataclasses` and `json`, not pydantic. The top-level object has:
+
+- `schema_version`: the literal `pausanias.eval.v1`;
+- `metadata`: `benchmark`, `run_id`, `dataset`, `corpus_fingerprint`, `index_generation`,
+  `case_set_fingerprint`, `prompt_version`, `prompt_fixture_version`, `run_fingerprint`,
+  `answerer_prompt_hash`, `judge_prompt_hash`, `config`, `started_at`, and `finished_at`.
+  Timestamps are UTC RFC 3339 strings. `config` contains `retrieval_mode`, `prompt_mode`,
+  `top_k`, `cutoffs`,
+  `answerer_model`, `answerer_provider`, `judge_model`, and `judge_provider`. The
+  answerer provider is the `--provider` value. The judge provider is `--judge-provider`
+  or the answerer provider when omitted. Model and provider values are null for the
+  internal run. `dataset` contains the dataset name, version or source commit, and
+  dataset fingerprint;
+- `metrics`: `overall_accuracy`, `overall_avg_score`, `total`, `correct`, `errors`,
+  `by_category`, `by_cutoff`, `latency_ms`, and `deterministic_gates`;
+- `evaluations`: one object per case.
+
+Each `evaluations[]` object has `case_id`, `category`, `query`, `expected_sources`,
+`ground_truth`, `retrieval_results`, `search_latency_ms`, `cutoff_outcomes`, `score`, and
+`failure_reason`. `ground_truth` is the benchmark answer for LOCOMO and null for the
+internal source-only cases. `retrieval_results` contains every result through `top_k`, in
+rank order;
+each result has `rank`, `section_id`, `source_path`, `root_id`, `project`, `heading`,
+`line_start`, `line_end`, `excerpt`, `content_hash`, `score`, and `reason`.
+For LOCOMO, `expected_sources` contains the canonical `evidence_id` values for its
+evidence targets. `failure_reason` is null or one of `ingest_error`, `search_error`, `answerer_error`,
+`judge_error`, `checkpoint_incomplete`, `source_changed`, `index_unavailable`, and
+`timeout`.
+
+Each `cutoff_outcomes[k]` object has `retrieved_count`, `relevant_count`, `recall`,
+`precision`, `mrr`, `abstention_correct`, `forbidden_sources`, `score`, `passed`,
+`generated_answer`, `judgment`, `reason`, `model`, and `error`. It also has
+`prompt_metadata` with `answerer` and `judge` objects. Each object records the prompt
+version, template hash, slot names, provider, model, `prompt_tokens`, and
+`completion_tokens`.
+Token counts are null when the provider gives no usage data. The answer and judge fields
+are null for the internal deterministic run unless its optional judge is enabled. The
+common runner fills them for every cutoff. `score` at the top level is the outcome at
+the largest configured cutoff.
+
+For cutoff `k`, let `R_k` be the first `k` ranked results and `E` the evidence targets,
+identified by `evidence_id`. Let `M_k` contain each target in `E` matched by at least one
+result in `R_k`, and let `H_k` contain each result in `R_k` that matches at least one
+target. For non-empty `E`, matched-target **recall** is `|M_k| / |E|`. Matched-result
+**precision** is `|H_k| / |R_k|`, and is zero when `R_k` is empty. Each result in `H_k`
+counts once, even when it matches several targets. MRR is `1 / rank` for the first
+matched result or zero when none is present. The old combined definition is void. For an
+abstention case, score is `1.0` only when `R_k` is empty and no forbidden source is
+returned. Otherwise, internal score is recall, forced to `0.0` for any forbidden source.
+`passed` means score `>= 0.5`.
+Common score and judgment follow the mem0 rule above. `error` repeats the per-case failure
+code when that cutoff could not be evaluated.
+
+For LOCOMO, `metrics.by_category` and every `metrics.by_cutoff[k].by_category` map
+contain all four comparable categories: `single-hop`, `multi-hop`, `temporal`, and
+`open-domain`. They map dataset categories 4, 1, 2, and 3 respectively. Category 5
+(`adversarial`) is excluded. Each category object contains `total`, `correct`,
+`accuracy`, `avg_score`, and `errors`, including zero-valued objects for categories with
+no in-scope questions. `metrics.by_cutoff[k]` contains `cutoff`, an `overall` object
+with those fields, and the matching four-category map. The internal harness may use its
+own case categories. Accuracy and average score are percentages, as in mem0's tables:
+`100 * correct / total` and `100 * mean(score)`. Empty groups have zero totals and zero
+percentages.
+
+`metrics.deterministic_gates` is populated for the internal harness. Its `by_cutoff` map
+contains raw `recall`, `precision`, and `mrr` means over non-abstention cases,
+`abstention_accuracy` over cases with `abstain=true`, `forbidden_violations` as the count
+of returned forbidden result entries, and the recorded threshold for each value. These
+local gates, plus the semantic, lexical, scope, and latency gates already defined above,
+accept or reject local retrieval. The optional internal LLM judge may fill `judgment`,
+`score`, `reason`, and `model`, but never changes these gates or the internal pass result.
+
+`metrics.latency_ms` contains `overall` and `by_category` objects with `count`, `p50_ms`,
+and `p95_ms`. Percentiles use nearest rank: after sorting `n` values, `p_q` is the item at
+index `max(0, ceil(q*n)-1)`. Search latency starts immediately before the pausanias search
+call and ends when ranked results return; it excludes ingest, answerer, judge, and writes.
+The runner performs one unmeasured warm-up search. `pausanias bench` uses the same warm
+path, cutoff, timer boundary, and nearest-rank percentile, so its warm p50/p95 can be
+compared directly to this section's overall values. The tools remain separate.
+
+**Provenance:** the artifact and stage shape follow mem0's `UnifiedResult`, checkpoint,
+cutoff, group, and judge conventions. Mem0 uses pydantic and lets judge output define its
+published score; pausanias uses stdlib serialization and keeps the internal golden-case
+acceptance deterministic. The common LOCOMO runner still requires the mem0-compatible
+judge to produce a valid side-by-side comparison.
+
+These are the remaining intentional schema divergences from mem0's `UnifiedResult`:
+
+| mem0 shape | pausanias shape | reason |
+| --- | --- | --- |
+| Pydantic models and `schema_version: 1.0` | stdlib dataclasses/json and `pausanias.eval.v1` | Keep the base package dependency-free and version local changes explicitly |
+| `metadata.project_name` and one `timestamp` | dataset, corpus, index, case-lock, prompt fingerprints, and UTC start/finish timestamps | Make reproducibility and resume validation explicit |
+| Generic `retrieval.search_results` dictionaries | Ranked `retrieval_results` with source, line, hash, score, and reason fields | Preserve auditable Markdown evidence and deterministic ordering |
+| `EvalItem.id`, `group`, and `extras` | `case_id`, `category`, `expected_sources`, and `failure_reason` | One contract covers source-only cases and LOCOMO questions |
+| Top-level `generation` and `judgment` objects | Per-cutoff answerer and judge data under `cutoff_outcomes`, including prompt metadata and token counts | LOCOMO makes a separate generation and judgment at every cutoff |
+| `nugget_scores` support | No nugget scores | LOCOMO uses binary `CORRECT`/`WRONG`; BEAM remains a later adapter |
+| `by_group` metrics | `by_category`, `by_cutoff`, latency, and deterministic gates | Report the required category, retrieval, and internal acceptance metrics |
+| Empty-string ground truth default | `ground_truth: null` for internal source-only cases | Those cases score retrieved evidence, not a generated answer |
+| Cutoff-only error field | Cutoff `error` plus evaluation `failure_reason` and run error totals | Distinguish a failed question stage from a failed cutoff |
 
 ### Dependency policy
 
@@ -680,7 +965,7 @@ hypothesis. This remains the fallback if optional wheels are unavailable on a pl
 The lanes are ordered so that storage, versioning, evaluation, and recorded hook-path
 baselines exist before ranking polish. PAUS-8 lands before the retrieval it judges. No
 ticket may tune an embedding, ranking rule, synonym, budget, or threshold until PAUS-8
-has completed Henry's human review and frozen both the development and held-out case sets.
+has validated and mechanically frozen the case-set fingerprint.
 
 - **PAUS-5:** Define the model bundle manifest, offline fetch, hash verification, license
   record, tokenizer contract, and optional dependency extra. Depends on PAUS-4.
@@ -689,9 +974,11 @@ has completed Henry's human review and frozen both the development and held-out 
 - **PAUS-7:** Add the scope-safe BLOB store, in-memory NumPy matrix, exact cosine scan,
   bounded candidate API, lexical fallback, and changed-section vector refresh. Depends
   on PAUS-6, so refresh never precedes the storage it updates.
-- **PAUS-8:** Extend the eval runner with category reports, Arc 2 hypothesis thresholds,
-  drift fixtures, and verbatim regression gates. Depends on PAUS-7. Its exit gate is
-  human review and freeze of the development and held-out case sets.
+- **PAUS-8:** Own the stdlib unified result schema, three-stage internal golden-case
+  harness, mechanical case-set lock, and LOCOMO ingest/search/evaluate runner. Add
+  category and cutoff reports, Arc 2 hypothesis thresholds, drift fixtures, and verbatim
+  regression gates. Depends on PAUS-7. Its exit gate is automated validation and a
+  recorded case-set fingerprint.
 - **PAUS-9:** Implement the persistent worker, startup-lock recovery, and real hook path.
   Add Phase A benchmark instrumentation for worker startup, model-load, matrix-load,
   encode, scan, fallback, and total warm and cold scan-path metrics. Enforce both active
@@ -705,16 +992,17 @@ has completed Henry's human review and frozen both the development and held-out 
   variants. Depends on PAUS-10 and the frozen PAUS-8 fixtures. The active fused gates
   must pass before synonym thresholds are tuned.
 - **PAUS-12:** Rerun the active scan-path and fused hook-path gates, run the full Arc 2
-  evaluation, document measured thresholds and the corpus envelope, and decide whether
-  semantic retrieval becomes the default. It does not activate a deferred gate. Depends
-  on PAUS-9, PAUS-10, and PAUS-11.
+  internal evaluation and required LOCOMO comparison benchmark, report measured thresholds,
+  mem0-comparable numbers, and the corpus envelope, and decide whether semantic retrieval
+  becomes the default. It does not activate a deferred gate. Depends on PAUS-9, PAUS-10,
+  and PAUS-11.
 
 The verified dependency edges are `PAUS-5 -> PAUS-6 -> PAUS-7 -> PAUS-8 -> PAUS-9`,
 `PAUS-9 -> PAUS-10 -> PAUS-11 -> PAUS-12`. PAUS-9 owns the persistent worker and full
 hook path, and must pass both warm and cold scan-path gates before PAUS-10 ranking work.
 PAUS-10 measures fusion overhead only after implementing fusion and activates the fused
-gates before PAUS-11 tuning. PAUS-12 only reruns active gates and evaluates the final
-result. These edges contain no cycle.
+gates before PAUS-11 tuning. PAUS-12 reruns active gates and evaluates the final result
+with the internal and common benchmark artifacts. These edges contain no cycle.
 
 ### References
 
