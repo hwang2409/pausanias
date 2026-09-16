@@ -659,8 +659,8 @@ from categories 1, 2, 3, and 4 of the 1,986-question dataset. The category filte
 (adversarial, 446 questions) is excluded. LongMemEval and BEAM are later adapters, not
 new result formats. The runner is `eval/benchmarks/locomo/run.py` and accepts
 `--dataset-path`, `--run-id`, `--conversations`, `--top-k`, `--top-k-cutoffs`,
-`--answerer-model`, `--judge-model`, `--provider`, `--judge-provider`, `--predict-only`,
-`--evaluate-only`, and `--resume`. A cheap smoke run selects a conversation subset with
+`--answerer-model`, `--judge-model`, `--provider`, `--judge-provider`, `--with-evidence`,
+`--user-profile`, `--predict-only`, `--evaluate-only`, and `--resume`. A cheap smoke run selects a conversation subset with
 `--conversations`;
 a comparable full run selects all ten conversations and all 1,540 questions. Comparable
 runs use mem0's defaults: `top-k=200` and cutoffs `10,20,50,200`.
@@ -728,50 +728,59 @@ generated final LF make the same dataset produce byte-identical files.
 
 Common search sends each question to `pausanias search`, records every result through
 `top-k` in rank order, and maps evidence turn references to the rendered note path and
-line range. At cutoff `k`, select the first `k` ranked results. For the mem0 answerer
-prompt, map `{question}` to the benchmark question, `{reference_date}` to the newest
-sorted session's raw `session_date_time` string, and `{memories}` to the selected
-excerpts. If no reference date exists, pass null and use mem0's prompt default `2023`.
-For each cutoff, pass at most the first 200 selected results to the vendored
-`get_answer_generation_prompt` behavior. It builds the memory block in ascending
-`(session_timestamp, source_path, line_start, rank)` order, with one
-`(timestamp) excerpt` entry per result, and shows no rank or score. Use mem0's
-`_to_human_date` formatting for an available result timestamp and `(unknown date)` for a
-missing timestamp. Call the answerer with an empty system string. The answerer sees this
-memory block only; evidence turns and the gold answer never enter its prompt. An optional
-user profile, when configured, precedes the memory block using mem0's profile formatter.
+line range. At cutoff `k`, select the first `k` ranked results.
 
-For the judge, preprocess only the gold answer as `preprocess_answer` does: category 3
-uses the text before the first semicolon after stripping it, and all other categories
-remain unchanged. Map `{question}`, `{answer}`, and `{response}` to the benchmark
-question, processed gold answer, and generated answer. If evidence is enabled, add the
-vendored `## Evidence (actual conversation messages containing the answer)` block to
-the judge prompt only, with evidence turns in dataset order. Use the mem0 judge system
-prompt (`You are evaluating conversational AI memory recall. Return JSON only with the
-format requested.`) and the same prompt and rubric at every cutoff. After the answerer
-returns, extract the answer with `response.rsplit("ANSWER:", 1)[-1].strip()` when
-`ANSWER:` occurs; otherwise keep the full response unchanged. `CORRECT` maps to score
-`1.0`, every other judgment maps to `0.0`, and a score of at least `0.5` passes.
+LOCOMO prompt construction, context ordering, evidence formatting, and answer extraction
+are ports of the vendored mem0 sources. The implementation ticket vendors the relevant
+`benchmarks/locomo/` code from source commit `4b61c5d31b9c668a12b4f5e78064248a02c82d2b`
+under `eval/vendor/mem0/benchmarks/locomo/`, with attribution, copyright notices, and
+the Apache-2.0 license text. The vendored code is normative. This prose summarizes its
+contract; when prose and code disagree, the code wins.
 
-Evidence matching uses a canonical section identity. Normalize `source_path` to a
-repository-relative POSIX path. Set `heading_path` to the ordered literal headings from
-conversation through the section, and set `section_id` to
-`{source_path}#{heading_path}@{line_start}-{line_end}` with inclusive line ranges.
-Map each LOCOMO evidence turn to its rendered source path and inclusive turn line range.
-A retrieved section hits an evidence turn when it has the same source path and its
-inclusive line range contains the complete evidence-turn range; exact section-id
-equality is not required, so a containing session or section is a hit. Count each
-evidence target once. Sort equal-score results by `section_id` ascending, assign unique
-ranks in that order, and use the first ranked hit for MRR. The result artifact keeps
-retrieval rank order; only the prompt view uses chronological order.
+At each cutoff, the answerer adapter calls the vendored
+`get_answer_generation_prompt` with the benchmark question, newest sorted-session raw
+`session_date_time` as `reference_date` (or null for mem0's `2023` default), and at most
+the first 200 results. Its stable `created_at` sort is normative: equal timestamps keep
+their input order, including same-session ties. The adapter also owns date conversion,
+memory formatting, empty-system behavior, and optional profile formatting. Evidence and
+the gold answer never enter the answerer prompt. The judge adapter calls vendored
+`preprocess_answer`, then `get_judge_prompt` without `--with-evidence` or
+`get_judge_prompt_with_evidence` with it. The latter owns the evidence block formatting.
+The judge uses the vendored system prompt and rubric. Answer extraction ports
+`response.rsplit("ANSWER:", 1)[-1].strip()` when `ANSWER:` occurs, and otherwise keeps
+the full response.
 
-Vendor the LOCOMO prompts under `eval/vendor/mem0/locomo/`, with the source repository
-commit, copyright notices, Apache-2.0 license text, and any required NOTICE text. Do not
-rewrite the prompts or judge rubric. Record prompt version, answerer model and provider,
-judge model and provider, cutoff list, and token usage when the client provides it. A
-normal full matching run makes `1,540 * 4 * 2 = 12,320` LLM calls: one answerer and one
-judge request per cutoff and question. This reviewer-verified scale is an explicit cost
-choice; retries can add calls.
+Define `prompt_mode` as `answerer-profile` or `answerer-no-profile`, combined with
+`judge-with-evidence` or `judge-without-evidence`; `--user-profile` and `--with-evidence`
+select these values. The run fingerprint includes `prompt_mode` and the exact
+`prompt_fixture_version`, in addition to the dataset, corpus, index, case-lock, and run
+configuration fingerprints. Store it in run metadata and every checkpoint. `--resume`
+rejects a checkpoint when either prompt value differs, so incompatible checkpoints cannot
+resume.
+
+Parity is verified by byte-identical golden-prompt fixture tests. The fixture set is
+`eval/fixtures/locomo/golden-prompts-v1/`, with pinned inputs
+`answerer-basic.json`, `answerer-same-created-at.json`, `judge-without-evidence.json`,
+and `judge-with-evidence.json`, plus their expected UTF-8 prompt files. Generate each
+expected file by running the vendored mem0 functions on its pinned input. Compare the
+runner's constructed prompt bytes with those files. Increment `prompt_fixture_version`
+when the vendored source or adapter contract changes.
+
+Evidence matching uses the existing hashed `section_id` for sections. Add a separate
+`evidence_id` for each LOCOMO evidence target. Serialize it exactly as
+`<repository-relative-file-path>#<turn-start:08d>-<turn-end:08d>`, using the rendered
+source path and inclusive line numbers. Canonical encoding is UTF-8 after Unicode NFC normalization,
+case-sensitive, with POSIX `/` separators, no `.` or `..` segments, and the literal
+`#` and `-` separators. Sort equal-score retrieval results by `section_id` ascending and
+sort evidence targets by their UTF-8 `evidence_id` bytes. A retrieved section hits a
+target when it has the same path and contains the target's complete line range. Each
+target counts once. `evidence_id` is a separate namespace; it never collides with or
+replaces the section hash. The artifact keeps retrieval rank order, while only the
+prompt view uses chronological order. Record prompt version, answerer model and
+provider, judge model and provider, cutoff list, and token usage when the client
+provides it. A normal full matching run makes `1,540 * 4 * 2 = 12,320` LLM calls: one
+answerer and one judge request per cutoff and question. This reviewer-verified scale is
+an explicit cost choice; retries can add calls.
 
 The internal runner needs no API key. The common search and ingest stages also need none.
 The answerer reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` plus
@@ -825,9 +834,10 @@ The stdlib schema uses `dataclasses` and `json`, not pydantic. The top-level obj
 
 - `schema_version`: the literal `pausanias.eval.v1`;
 - `metadata`: `benchmark`, `run_id`, `dataset`, `corpus_fingerprint`, `index_generation`,
-  `case_set_fingerprint`, `prompt_version`, `answerer_prompt_hash`,
-  `judge_prompt_hash`, `config`, `started_at`, and `finished_at`. Timestamps are UTC RFC
- 3339 strings. `config` contains `retrieval_mode`, `top_k`, `cutoffs`,
+  `case_set_fingerprint`, `prompt_version`, `prompt_fixture_version`, `run_fingerprint`,
+  `answerer_prompt_hash`, `judge_prompt_hash`, `config`, `started_at`, and `finished_at`.
+  Timestamps are UTC RFC 3339 strings. `config` contains `retrieval_mode`, `prompt_mode`,
+  `top_k`, `cutoffs`,
   `answerer_model`, `answerer_provider`, `judge_model`, and `judge_provider`. The
   answerer provider is the `--provider` value. The judge provider is `--judge-provider`
   or the answerer provider when omitted. Model and provider values are null for the
@@ -844,7 +854,8 @@ internal source-only cases. `retrieval_results` contains every result through `t
 rank order;
 each result has `rank`, `section_id`, `source_path`, `root_id`, `project`, `heading`,
 `line_start`, `line_end`, `excerpt`, `content_hash`, `score`, and `reason`.
-`failure_reason` is null or one of `ingest_error`, `search_error`, `answerer_error`,
+For LOCOMO, `expected_sources` contains the canonical `evidence_id` values for its
+evidence targets. `failure_reason` is null or one of `ingest_error`, `search_error`, `answerer_error`,
 `judge_error`, `checkpoint_incomplete`, `source_changed`, `index_unavailable`, and
 `timeout`.
 
@@ -859,13 +870,16 @@ are null for the internal deterministic run unless its optional judge is enabled
 common runner fills them for every cutoff. `score` at the top level is the outcome at
 the largest configured cutoff.
 
-For cutoff `k`, let `R_k` be the first `k` ranked sources and `E` the expected evidence
-targets matched by the canonical identity above.
-For non-empty `E`, recall is `|R_k intersect E| / |E|`, precision is
-`|R_k intersect E| / |R_k|` and is zero when `R_k` is empty, and MRR is `1 / rank` for
-the first expected source or zero when none is present. For an abstention case, score is
-`1.0` only when `R_k` is empty and no forbidden source is returned. Otherwise, internal
-score is recall, forced to `0.0` for any forbidden source. `passed` means score `>= 0.5`.
+For cutoff `k`, let `R_k` be the first `k` ranked results and `E` the evidence targets,
+identified by `evidence_id`. Let `M_k` contain each target in `E` matched by at least one
+result in `R_k`, and let `H_k` contain each result in `R_k` that matches at least one
+target. For non-empty `E`, matched-target **recall** is `|M_k| / |E|`. Matched-result
+**precision** is `|H_k| / |R_k|`, and is zero when `R_k` is empty. Each result in `H_k`
+counts once, even when it matches several targets. MRR is `1 / rank` for the first
+matched result or zero when none is present. The old combined definition is void. For an
+abstention case, score is `1.0` only when `R_k` is empty and no forbidden source is
+returned. Otherwise, internal score is recall, forced to `0.0` for any forbidden source.
+`passed` means score `>= 0.5`.
 Common score and judgment follow the mem0 rule above. `error` repeats the per-case failure
 code when that cutoff could not be evaluated.
 
