@@ -30,7 +30,7 @@ class SplitDocument:
 
 
 HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
-FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 
 
 def content_hash(raw: bytes) -> str:
@@ -114,7 +114,8 @@ def split_markdown(path: str, content: str, max_bytes: int = 12000, raw_bytes: b
         line = lines[index].rstrip("\r\n")
         fence = FENCE.match(line)
         if fence_char is not None:
-            if fence and fence.group(1)[0] == fence_char and len(fence.group(1)) >= fence_length:
+            if (fence and fence.group(1)[0] == fence_char
+                    and len(fence.group(1)) >= fence_length and not fence.group(2).strip()):
                 fence_char = None
             continue
         if fence:

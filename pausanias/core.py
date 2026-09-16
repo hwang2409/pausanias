@@ -14,6 +14,7 @@ from .splitter import content_hash, explicit_links, split_markdown
 
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
+TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
 
 SCHEMA = """
@@ -200,12 +201,11 @@ def read_source(config: Config, raw_path: str, heading: str | None = None, max_b
 
 
 def _fts_query(query: str) -> tuple[str, list[str]]:
-    token_pattern = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
     clauses: list[str] = []
     tokens: list[str] = []
 
     def add_tokens(value: str, phrase: bool) -> bool:
-        found = token_pattern.findall(value)
+        found = TOKEN_PATTERN.findall(value)
         remaining = MAX_QUERY_TERMS - len(tokens)
         if remaining <= 0:
             return False
@@ -236,6 +236,14 @@ def _fts_query(query: str) -> tuple[str, list[str]]:
     return " AND ".join(clauses), tokens
 
 
+def _column_query(column: str, fts: str) -> str:
+    return f"{column} : ({fts})"
+
+
+def _token_set(value: str) -> set[str]:
+    return {token.lower() for token in TOKEN_PATTERN.findall(value)}
+
+
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None) -> list[Candidate]:
     if limit < 1:
@@ -249,10 +257,12 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     if root_id and not any(root.id == root_id for root in config.roots):
         return []
     global_paths = sorted(str(path) for path in config.global_notes)
-    if project and not all_projects:
-        scope_root_ids = [root.id for root in config.roots if root.project == project]
+    selected_root = next((root for root in config.roots if root.id == root_id), None)
+    effective_project = project or (selected_root.project if root_id and not all_projects else None)
+    if effective_project and not all_projects:
+        scope_root_ids = [root.id for root in config.roots if root.project == effective_project]
         scope_paths = global_paths
-    elif project is None and not all_projects:
+    elif effective_project is None and not all_projects:
         scope_root_ids = []
         scope_paths = global_paths
     else:
@@ -269,13 +279,13 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
         if root_id:
             conditions.append("s.root_id = ?")
             params.append(root_id)
-            if project and not all_projects:
+            if effective_project and not all_projects:
                 conditions.append(
                     f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
                 )
                 params.extend(scope_root_ids)
                 params.extend(scope_paths)
-            elif project is None and not all_projects:
+            elif effective_project is None and not all_projects:
                 conditions.append(f"s.canonical_path IN ({placeholders(scope_paths)})")
                 params.extend(scope_paths)
         elif scope_paths and scope_root_ids:
@@ -292,9 +302,20 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
             params.extend(scope_paths)
         else:
             conditions.append("0")
-        rows = connection.execute(
-            "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
-            + " AND ".join(conditions) + " ORDER BY fts_score LIMIT ?", (*params, min(MAX_CANDIDATES, max(limit * 5, 50)))).fetchall()
+        candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        for lane in (None, "heading", "text"):
+            lane_params = list(params)
+            lane_params[0] = fts if lane is None else _column_query(lane, fts)
+            rows_by_id.update({
+                row["section_id"]: row
+                for row in connection.execute(
+                    "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
+                    + " AND ".join(conditions) + " ORDER BY fts_score LIMIT ?",
+                    (*lane_params, candidate_limit),
+                ).fetchall()
+            })
+        rows = list(rows_by_id.values())
     finally:
         connection.close()
 
@@ -315,10 +336,10 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
             continue
         if not all_projects:
             is_global = config.is_global(source[1])
-            if project is None:
+            if effective_project is None:
                 if not is_global:
                     continue
-            elif current_root.project != project and not is_global:
+            elif current_root.project != effective_project and not is_global:
                 continue
         if canonical not in hash_cache:
             try:
@@ -335,14 +356,15 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                 refresh.add(canonical)
             continue
         heading_path = tuple(filter(None, row["heading_path"].split("\n")))
-        lower_tokens = [token.lower() for token in tokens]
-        heading_text = (row["heading"] or "").lower()
-        body_text = row["text"].lower()
-        haystack = heading_text + " " + body_text
-        identifier_boost = sum(2.0 for token in lower_tokens if re.fullmatch(r"[a-z]{2,}-\d+", token) and token in haystack)
-        heading_matches = any(token in heading_text for token in lower_tokens)
-        body_matches = any(token in body_text for token in lower_tokens)
-        heading_boost = sum(0.75 for token in lower_tokens if token in heading_text)
+        lower_tokens = {token.lower() for token in tokens}
+        heading_tokens = _token_set(row["heading"] or "")
+        body_tokens = _token_set(row["text"])
+        identifier_boost = sum(2.0 for token in lower_tokens
+                               if re.fullmatch(r"[a-z]{2,}-\d+", token)
+                               and token in heading_tokens | body_tokens)
+        heading_matches = bool(lower_tokens & heading_tokens)
+        body_matches = bool(lower_tokens & body_tokens)
+        heading_boost = sum(0.75 for token in lower_tokens if token in heading_tokens)
         score = -float(row["fts_score"]) + identifier_boost + heading_boost
         reasons: list[str] = []
         if identifier_boost:

@@ -135,6 +135,9 @@ def load_config(path: str | Path) -> Config:
         resolved = _resolve(root_candidate, strict=True)
         if not resolved.is_dir():
             raise ConfigError(f"root is not a directory: {root_path}")
+        if any(_contained(resolved, existing.path) or _contained(existing.path, resolved)
+               for existing in roots):
+            raise ConfigError(f"root overlaps another configured root: {root_path}")
         excludes = entry.get("exclude", entry.get("exclude_globs", entry.get("excludes", [])))
         if not isinstance(excludes, list) or not all(isinstance(item, str) for item in excludes):
             raise ConfigError(f"excludes for root {root_id} must be an array of globs")

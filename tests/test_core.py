@@ -69,6 +69,25 @@ def test_splitter_ignores_fenced_headings_and_preserves_trailing_hashes():
     assert [section.heading for section in document.sections] == ["Real", "C#", "Trailing"]
 
 
+def test_splitter_requires_matching_closing_fence_without_info_string():
+    document = split_markdown("/notes/a.md", """# Real
+```
+```lang
+# not a heading
+~~~
+# still not a heading
+```
+# After
+""")
+    assert [section.heading for section in document.sections] == ["Real", "After"]
+
+    unclosed = split_markdown("/notes/a.md", """# Real
+```
+# not a heading
+""")
+    assert [section.heading for section in unclosed.sections] == ["Real"]
+
+
 def test_splitter_minimum_byte_cap_keeps_codepoints_intact():
     document = split_markdown("/notes/a.md", "# A\né😀\n", max_bytes=1)
     assert "é" in "".join(section.text for section in document.sections)
@@ -192,6 +211,29 @@ def test_selection_reason_reports_body_match(tmp_path: Path):
     assert search(config, "body-only", project="p")[0].reason == "body match"
 
 
+def test_selection_reason_does_not_match_heading_prefixes(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Planet\nplan appears in the body\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    result = search(config, "plan", project="p")[0]
+    assert result.reason == "body match"
+
+
+def test_heading_matches_survive_bounded_candidate_lanes(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    sections = [f"# Body {index}\nrepeated needle body\n" for index in range(121)]
+    sections.append("# Needle\nunrelated text\n")
+    (root / "note.md").write_text("".join(sections))
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    result = search(config, "needle", project="p", limit=1)
+    assert result[0].heading_path == ("Needle",)
+    assert result[0].reason == "heading match"
+
+
 def test_symlink_escape_is_skipped_in_index_and_read(tmp_path: Path):
     root = tmp_path / "vault"
     outside = tmp_path / "outside.md"
@@ -242,6 +284,23 @@ def test_config_rejects_missing_root(tmp_path: Path):
         load_config(config_path)
 
 
+def test_config_rejects_overlapping_roots_after_resolution(tmp_path: Path):
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    parent.mkdir()
+    child.mkdir()
+    with pytest.raises(ConfigError, match="overlaps"):
+        make_config(tmp_path, [("parent", "p1", parent), ("child", "p2", child)])
+
+    alias = tmp_path / "child-alias"
+    try:
+        alias.symlink_to(child, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ConfigError, match="overlaps"):
+        make_config(tmp_path, [("parent", "p1", parent), ("alias", "p2", alias)])
+
+
 def test_config_excludes_credentials_and_private_globs(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
@@ -268,3 +327,30 @@ def test_private_parent_exclusion_applies_to_read(tmp_path: Path):
     assert config.is_excluded(note, config.roots[0])
     with pytest.raises(ValueError, match="outside allowed roots"):
         read_source(config, str(note))
+
+
+def test_cli_root_scope_defaults_to_that_project(tmp_path: Path, capsys):
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    (one / "one.md").write_text("# One\nroot-only needle\n")
+    (two / "two.md").write_text("# Two\nother needle\n")
+    config = make_config(tmp_path, [("one", "alpha", one), ("two", "beta", two)])
+    config_path = tmp_path / "config.toml"
+
+    assert main(["--config", str(config_path), "index"]) == 0
+    capsys.readouterr()
+
+    assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--json"]) == 0
+    root_results = json.loads(capsys.readouterr().out)
+    assert len(root_results) == 1
+    assert root_results[0]["heading"] == ["One"]
+
+    assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--project", "alpha", "--json"]) == 0
+    project_results = json.loads(capsys.readouterr().out)
+    assert len(project_results) == 1
+
+    assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--all-projects", "--json"]) == 0
+    all_results = json.loads(capsys.readouterr().out)
+    assert len(all_results) == 1
