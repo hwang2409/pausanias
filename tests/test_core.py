@@ -354,3 +354,44 @@ def test_cli_root_scope_defaults_to_that_project(tmp_path: Path, capsys):
     assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--all-projects", "--json"]) == 0
     all_results = json.loads(capsys.readouterr().out)
     assert len(all_results) == 1
+
+
+def test_cli_root_scope_includes_global_notes_from_any_root(tmp_path: Path, capsys):
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    (one / "local.md").write_text("# One\nroot-only needle\n")
+    inside_global = one / "inside-global.md"
+    inside_global.write_text("# Inside shared\ninside global needle\n")
+    global_note = two / "global.md"
+    global_note.write_text("# Shared\nglobal needle\n")
+    config = make_config(tmp_path, [("one", "alpha", one), ("two", "beta", two)], [inside_global, global_note])
+    config_path = tmp_path / "config.toml"
+
+    assert main(["--config", str(config_path), "index"]) == 0
+    capsys.readouterr()
+
+    assert main(["--config", str(config_path), "search", "global", "--root", "one", "--json"]) == 0
+    root_results = json.loads(capsys.readouterr().out)
+    assert {result["path"] for result in root_results} == {str(inside_global.resolve()), str(global_note.resolve())}
+    assert all(result["reason"].startswith("global-note inclusion") for result in root_results)
+
+    assert main(["--config", str(config_path), "search", "global", "--root", "one", "--all-projects", "--json"]) == 0
+    all_results = json.loads(capsys.readouterr().out)
+    assert {result["path"] for result in all_results} == {str(inside_global.resolve()), str(global_note.resolve())}
+
+    assert main(["--config", str(config_path), "search", "global", "--root", "one", "--project", "alpha", "--json"]) == 0
+    project_results = json.loads(capsys.readouterr().out)
+    assert {result["path"] for result in project_results} == {str(inside_global.resolve()), str(global_note.resolve())}
+
+
+def test_selection_reason_matches_heading_tokens_only(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Planet\nplan appears in the body\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+
+    assert search(config, "plan", project="p")[0].reason == "body match"
+    assert search(config, "Planet", project="p")[0].reason == "heading match"

@@ -277,17 +277,11 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
         if root_id:
-            conditions.append("s.root_id = ?")
+            conditions.append(
+                f"(s.root_id = ? OR s.canonical_path IN ({placeholders(scope_paths)}))"
+            )
             params.append(root_id)
-            if effective_project and not all_projects:
-                conditions.append(
-                    f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
-                )
-                params.extend(scope_root_ids)
-                params.extend(scope_paths)
-            elif effective_project is None and not all_projects:
-                conditions.append(f"s.canonical_path IN ({placeholders(scope_paths)})")
-                params.extend(scope_paths)
+            params.extend(scope_paths)
         elif scope_paths and scope_root_ids:
             conditions.append(
                 f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
@@ -332,10 +326,10 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                 refresh.add(canonical)
             continue
         current_root = source[0]
-        if root_id and current_root.id != root_id:
+        is_global = config.is_global(source[1])
+        if root_id and current_root.id != root_id and not is_global:
             continue
         if not all_projects:
-            is_global = config.is_global(source[1])
             if effective_project is None:
                 if not is_global:
                     continue
@@ -367,6 +361,8 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
         heading_boost = sum(0.75 for token in lower_tokens if token in heading_tokens)
         score = -float(row["fts_score"]) + identifier_boost + heading_boost
         reasons: list[str] = []
+        if is_global:
+            reasons.append("global-note inclusion")
         if identifier_boost:
             reasons.append("identifier match")
         if heading_matches:
