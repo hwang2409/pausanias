@@ -520,13 +520,20 @@ The worker lifecycle is bounded and recoverable:
   failure or deadline returns the lexical fallback, while the old matrix is freed only
   after its in-flight references finish. Never answer with FTS rows and vectors from
   different generations.
-- The first CLI to acquire the per-database startup lock owns worker launch. Other queries
-  wait for that worker socket and submit their own requests; they do not launch a second
-  worker or load a second model session. If the owner exits before readiness, the lock
-  release lets one waiter become the next owner. A waiter that reaches its deadline uses
-  lexical fallback.
+- The first CLI to acquire the per-database startup lock launches the worker. It passes the
+  locked descriptor to that worker, which owns the lock through startup. The lock record
+  stores the database identity, worker PID, launch nonce, start time, socket path, and
+  readiness state. The worker publishes a ready socket before releasing the startup lock;
+  a CLI timeout never releases or unlinks it. If the worker dies before readiness, the OS
+  releases the lock. A waiting CLI may replace stale lock metadata only after it acquires
+  the lock and confirms that the recorded PID is dead (`kill(pid, 0)` returns `ESRCH`) and
+  no ready socket exists. A live PID, including one still starting, is never treated as
+  stale. Other queries wait for the worker socket and submit their own requests; they do
+  not launch a second worker or load a second model session. A waiter that reaches its
+  deadline uses lexical-only fallback for that query and does not spawn.
 - Exit after a configurable idle period, with 30 minutes as the initial default. A
-  stale socket, crashed worker, or failed load is removed or replaced on the next start.
+  stale socket, crashed worker, or failed load is removed or replaced on the next start,
+  subject to the startup-lock recovery rule above.
 - A missing extra, model bundle, NumPy, or compatible manifest marks the semantic lane
   disabled. The hook uses lexical retrieval and records the reason; it does not retry
   the same failed load on every turn.
@@ -564,8 +571,9 @@ semantic lane. The gates below replace those shortcuts for semantic acceptance; 
 existing 750 ms adapter deadline remains the hard fallback bound.
 
 `pausanias bench --hook-path` must launch the actual adapter command as a child for every
-trial. It has two ordered phases. Phase A, owned by PAUS-9, runs the semantic scan path
-without RRF and records warm and cold hook-path measurements as soon as storage exists.
+trial. It has two ordered phases. Phase A, owned by PAUS-9, implements the persistent
+worker and full hook path, then runs the semantic scan path without RRF and records warm
+and cold hook-path measurements as soon as storage exists.
 The warm workload uses a running worker with its session and matrix cache loaded. The
 warm scan-path gate is total hook-path p95 at or below 300 ms, with no semantic
 fallbacks. A separate cold workload stops the worker, clears its session and matrix, and
@@ -684,10 +692,11 @@ has completed Henry's human review and frozen both the development and held-out 
 - **PAUS-8:** Extend the eval runner with category reports, Arc 2 hypothesis thresholds,
   drift fixtures, and verbatim regression gates. Depends on PAUS-7. Its exit gate is
   human review and freeze of the development and held-out case sets.
-- **PAUS-9:** Add Phase A report-only benchmark scaffolding for the persistent worker and
-  real hook path. Measure recorded warm and cold scan-path totals, worker startup,
-  model-load, matrix-load, encode, scan, and fallback metrics. Activate the scan-path
-  gates before ranking work. Depends on PAUS-5, PAUS-6, PAUS-7, and PAUS-8.
+- **PAUS-9:** Implement the persistent worker, startup-lock recovery, and real hook path.
+  Add Phase A benchmark instrumentation for worker startup, model-load, matrix-load,
+  encode, scan, fallback, and total warm and cold scan-path metrics. Enforce both active
+  hook-path scan gates before PAUS-10 starts. Depends on PAUS-5, PAUS-6, PAUS-7, and
+  PAUS-8.
 - **PAUS-10:** Implement scope-preserving RRF, exact lexical guards, deterministic
   tie-breaking, diagnostics, and bounded result packing. Then run Phase B of the hook-path
   benchmark, measure fusion overhead, and activate the fused warm and cold gates. Depends
@@ -701,10 +710,11 @@ has completed Henry's human review and frozen both the development and held-out 
   on PAUS-9, PAUS-10, and PAUS-11.
 
 The verified dependency edges are `PAUS-5 -> PAUS-6 -> PAUS-7 -> PAUS-8 -> PAUS-9`,
-`PAUS-9 -> PAUS-10 -> PAUS-11 -> PAUS-12`. PAUS-9 records warm and cold hook-path
-measurements before PAUS-10 ranking work. PAUS-10 measures fusion overhead only after
-implementing fusion and activates the fused gates before PAUS-11 tuning. PAUS-12 only
-reruns active gates and evaluates the final result. These edges contain no cycle.
+`PAUS-9 -> PAUS-10 -> PAUS-11 -> PAUS-12`. PAUS-9 owns the persistent worker and full
+hook path, and must pass both warm and cold scan-path gates before PAUS-10 ranking work.
+PAUS-10 measures fusion overhead only after implementing fusion and activates the fused
+gates before PAUS-11 tuning. PAUS-12 only reruns active gates and evaluates the final
+result. These edges contain no cycle.
 
 ### References
 
