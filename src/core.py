@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -9,12 +10,17 @@ import sqlite3
 import time
 
 from .config import Config, Root, _contained
+from .model_bundle import MODEL_BUNDLE_MANIFEST, manifest_fingerprint
 from .splitter import content_hash, explicit_links, split_markdown
 
 
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+EMBEDDING_VERSION = 1
+EMBEDDING_FORMAT_VERSION = 1
+SEMANTIC_STATE_DISABLED = "disabled"
+SEMANTIC_DISABLED_REASON = "EXTRA_MISSING"
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
 
@@ -45,10 +51,33 @@ CREATE TABLE IF NOT EXISTS sections (
 CREATE INDEX IF NOT EXISTS sections_path_idx ON sections(canonical_path);
 CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5(section_id UNINDEXED, heading, text);
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS embedding_metadata (
+    generation INTEGER PRIMARY KEY,
+    created_at REAL NOT NULL,
+    semantic_state TEXT NOT NULL CHECK (semantic_state IN ('ready', 'stale', 'disabled')),
+    semantic_reason TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_hash TEXT NOT NULL,
+    model_fingerprint TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    tokenizer_version TEXT NOT NULL,
+    tokenizer_fingerprint TEXT NOT NULL,
+    runtime_name TEXT NOT NULL,
+    runtime_version TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    dtype TEXT NOT NULL,
+    pooling TEXT NOT NULL,
+    normalization TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    embedding_version INTEGER NOT NULL,
+    embedding_format_version INTEGER NOT NULL,
+    manifest_fingerprint TEXT NOT NULL
+);
 """
 
 SCHEMA_STATEMENTS = tuple(statement.strip() for statement in SCHEMA.split(";") if statement.strip())
 DROP_SCHEMA_STATEMENTS = (
+    "DROP TABLE IF EXISTS embedding_metadata",
     "DROP TABLE IF EXISTS sections_fts",
     "DROP TABLE IF EXISTS sections",
     "DROP TABLE IF EXISTS files",
@@ -59,6 +88,86 @@ DROP_SCHEMA_STATEMENTS = (
 def _create_schema(connection: sqlite3.Connection) -> None:
     for statement in SCHEMA_STATEMENTS:
         connection.execute(statement)
+    fingerprint = manifest_fingerprint()
+    connection.execute(
+        """INSERT OR IGNORE INTO metadata(key, value) VALUES
+           ('generation', '0'),
+           ('semantic_state', ?),
+           ('semantic_reason', ?),
+           ('semantic_generation', '0'),
+           ('semantic_manifest_fingerprint', ?)""",
+        (SEMANTIC_STATE_DISABLED, SEMANTIC_DISABLED_REASON, fingerprint),
+    )
+
+
+def _tokenizer_fingerprint(manifest: dict[str, object]) -> str:
+    tokenizer = manifest["tokenizer"]
+    tokenizer_files = set(tokenizer["files"])
+    artifact_digests = {
+        file["path"]: file["sha256"]
+        for file in manifest["files"]
+        if file["path"] in tokenizer_files
+    }
+    payload = json.dumps(
+        {"artifacts": artifact_digests, "settings": tokenizer},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _embedding_metadata() -> dict[str, object]:
+    runtime = MODEL_BUNDLE_MANIFEST["runtime"]
+    model_file = next(file for file in MODEL_BUNDLE_MANIFEST["files"] if file["path"] == "onnx/model.onnx")
+    return {
+        "model_id": MODEL_BUNDLE_MANIFEST["model_id"],
+        "model_hash": model_file["sha256"],
+        "model_fingerprint": model_file["sha256"],
+        "model_version": MODEL_BUNDLE_MANIFEST["model_version"],
+        "tokenizer_version": MODEL_BUNDLE_MANIFEST["tokenizer_version"],
+        "tokenizer_fingerprint": _tokenizer_fingerprint(MODEL_BUNDLE_MANIFEST),
+        "runtime_name": runtime["name"],
+        "runtime_version": runtime["version"],
+        "dimension": MODEL_BUNDLE_MANIFEST["dimension"],
+        "dtype": MODEL_BUNDLE_MANIFEST["dtype"],
+        "pooling": MODEL_BUNDLE_MANIFEST["pooling"],
+        "normalization": MODEL_BUNDLE_MANIFEST["normalization"],
+        "metric": MODEL_BUNDLE_MANIFEST["metric"],
+        "embedding_version": EMBEDDING_VERSION,
+        "embedding_format_version": EMBEDDING_FORMAT_VERSION,
+        "manifest_fingerprint": manifest_fingerprint(),
+    }
+
+
+def _publish_generation(connection: sqlite3.Connection, generation: int) -> None:
+    metadata = _embedding_metadata()
+    connection.execute(
+        """INSERT INTO embedding_metadata
+           (generation, created_at, semantic_state, semantic_reason, model_id,
+            model_hash, model_fingerprint, model_version,
+            tokenizer_version, tokenizer_fingerprint, runtime_name, runtime_version,
+            dimension, dtype, pooling, normalization, metric, embedding_version,
+            embedding_format_version, manifest_fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (generation, time.time(), SEMANTIC_STATE_DISABLED, SEMANTIC_DISABLED_REASON,
+         *(metadata[key] for key in (
+            "model_id", "model_hash", "model_fingerprint", "model_version",
+            "tokenizer_version", "tokenizer_fingerprint", "runtime_name", "runtime_version",
+            "dimension", "dtype", "pooling", "normalization", "metric", "embedding_version",
+            "embedding_format_version", "manifest_fingerprint",
+        ))),
+    )
+    fingerprint = str(metadata["manifest_fingerprint"])
+    connection.execute(
+        """INSERT INTO metadata(key, value) VALUES
+           ('semantic_state', ?),
+           ('semantic_reason', ?),
+           ('semantic_generation', ?),
+           ('semantic_manifest_fingerprint', ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (SEMANTIC_STATE_DISABLED, SEMANTIC_DISABLED_REASON, str(generation), fingerprint),
+    )
 
 
 def _reset_schema(connection: sqlite3.Connection, generation: str | None = None) -> None:
@@ -67,7 +176,11 @@ def _reset_schema(connection: sqlite3.Connection, generation: str | None = None)
     _create_schema(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     if generation is not None:
-        connection.execute("INSERT INTO metadata(key, value) VALUES ('generation', ?)", (generation,))
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('generation', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (generation,),
+        )
 
 
 @dataclass(frozen=True)
@@ -89,12 +202,19 @@ class Candidate:
     reason: str
 
 
-def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
-    if initialize:
+def connect(database: Path, initialize: bool = True, readonly: bool = False) -> sqlite3.Connection:
+    if readonly and initialize:
+        raise ValueError("read-only connections cannot initialize the schema")
+    if initialize and not readonly:
         database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
+    if readonly:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+    else:
+        connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    if not readonly:
+        connection.execute("PRAGMA foreign_keys = ON")
     if initialize:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -108,6 +228,12 @@ def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
             connection.rollback()
             raise
     return connection
+
+
+def _require_schema_version(connection: sqlite3.Connection) -> None:
+    stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if stored_version != SCHEMA_VERSION:
+        raise ValueError(f"index schema is v{stored_version}; run `pausanias index` to rebuild")
 
 
 def _markdown(path: Path) -> bool:
@@ -186,6 +312,7 @@ def index(config: Config, rebuild: bool = False) -> int:
         for canonical in set(existing) - current:
             _remove_file(connection, canonical)
         connection.execute("INSERT INTO metadata(key, value) VALUES ('generation', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(generation),))
+        _publish_generation(connection, generation)
         connection.commit()
         return generation
     except Exception:
@@ -288,9 +415,6 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None) -> list[Candidate]:
     if limit < 1:
         raise ValueError("limit must be positive")
-    fts, tokens = _fts_query(query)
-    if not fts:
-        return []
     if not config.database.exists():
         return []
 
@@ -311,8 +435,12 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     def placeholders(values: list[str]) -> str:
         return ", ".join("?" for _ in values) or "NULL"
 
-    connection = connect(config.database, initialize=False)
+    connection = connect(config.database, initialize=False, readonly=True)
     try:
+        _require_schema_version(connection)
+        fts, tokens = _fts_query(query)
+        if not fts:
+            return []
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
         scope_conditions: list[str] = []

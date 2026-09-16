@@ -31,7 +31,7 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     return load_config(config_path)
 
 
-def create_old_index(database: Path) -> None:
+def create_v1_index(database: Path, canonical_path: str, root_id: str) -> None:
     connection = sqlite3.connect(database)
     connection.executescript("""
     CREATE TABLE files (
@@ -48,7 +48,6 @@ def create_old_index(database: Path) -> None:
         line_start INTEGER NOT NULL,
         line_end INTEGER NOT NULL,
         root_id TEXT NOT NULL,
-        project_scope TEXT NOT NULL,
         text TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         index_generation INTEGER NOT NULL,
@@ -56,13 +55,47 @@ def create_old_index(database: Path) -> None:
         note_type TEXT,
         updated_date TEXT,
         created_date TEXT,
-        links TEXT NOT NULL,
-        is_global INTEGER NOT NULL DEFAULT 0
+        links TEXT NOT NULL
     );
     CREATE INDEX sections_path_idx ON sections(canonical_path);
     CREATE VIRTUAL TABLE sections_fts USING fts5(section_id UNINDEXED, heading, text);
     CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
+    connection.execute("PRAGMA user_version = 1")
+    connection.execute(
+        "INSERT INTO files VALUES (?, ?, ?, ?)",
+        (canonical_path, root_id, 1, "old-v1-file-hash"),
+    )
+    connection.execute(
+        """INSERT INTO sections
+           (section_id, canonical_path, heading, heading_path, line_start,
+            line_end, root_id, text, content_hash, index_generation,
+            indexed_at, note_type, updated_date, created_date, links)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "old-v1-section",
+            canonical_path,
+            "Legacy",
+            "Legacy",
+            1,
+            2,
+            root_id,
+            "legacy v1 data",
+            "old-v1-content-hash",
+            4,
+            1.0,
+            None,
+            None,
+            None,
+            "[]",
+        ),
+    )
+    connection.execute(
+        "INSERT INTO sections_fts(section_id, heading, text) VALUES (?, ?, ?)",
+        ("old-v1-section", "Legacy", "legacy v1 data"),
+    )
+    connection.execute("INSERT INTO metadata VALUES ('generation', '4')")
+    connection.commit()
     connection.close()
 
 
@@ -175,14 +208,56 @@ def test_index_creates_missing_database_parent(tmp_path: Path):
     assert search(config, "database parent", project="phoebe")
 
 
+def test_schema_v2_records_disabled_embedding_generation_metadata(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Schema\nrecord generation metadata\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+
+    assert index(config) == 1
+
+    connection = connect(config.database, initialize=False)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+        assert state["generation"] == "1"
+        assert state["semantic_generation"] == "1"
+        assert state["semantic_state"] == "disabled"
+        assert state["semantic_reason"] == "EXTRA_MISSING"
+
+        metadata = connection.execute("SELECT * FROM embedding_metadata").fetchone()
+        assert metadata["generation"] == 1
+        assert metadata["semantic_state"] == "disabled"
+        assert metadata["semantic_reason"] == "EXTRA_MISSING"
+        assert metadata["model_id"] == "sentence-transformers/all-MiniLM-L6-v2"
+        assert metadata["model_hash"]
+        assert metadata["tokenizer_fingerprint"]
+        assert metadata["runtime_version"] == "1.30.0"
+        assert metadata["dimension"] == 384
+        assert metadata["embedding_version"] == 1
+        assert metadata["embedding_format_version"] == 1
+        assert "vector" not in {row[1] for row in connection.execute("PRAGMA table_info(embedding_metadata)")}
+    finally:
+        connection.close()
+
+
+def test_tokenizer_fingerprint_includes_artifact_hashes():
+    baseline = core._tokenizer_fingerprint(core.MODEL_BUNDLE_MANIFEST)
+    modified = json.loads(json.dumps(core.MODEL_BUNDLE_MANIFEST))
+    tokenizer_file = next(file for file in modified["files"] if file["path"] == "tokenizer.json")
+    tokenizer_file["sha256"] = "0" * 64
+
+    assert core._tokenizer_fingerprint(modified) != baseline
+
+
 @pytest.mark.parametrize("rebuild", [False, True])
-def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: bool):
+def test_real_v1_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: bool):
     root = tmp_path / "vault"
     root.mkdir()
     note = root / "note.md"
     note.write_text("# Decision\nUse the new schema.\n")
     config = make_config(tmp_path, [("vault", "phoebe", root)])
-    create_old_index(config.database)
+    create_v1_index(config.database, str(note.resolve()), "vault")
 
     generation = index(config, rebuild=rebuild)
 
@@ -192,8 +267,51 @@ def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: 
     assert "is_global" not in columns
     assert connection.execute("PRAGMA user_version").fetchone()[0] == core.SCHEMA_VERSION
     assert connection.execute("SELECT index_generation FROM sections").fetchone()[0] == generation
+    state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+    assert state["semantic_generation"] == str(generation)
+    assert state["semantic_state"] == "disabled"
+    assert state["semantic_reason"] == "EXTRA_MISSING"
+    assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == generation
+    assert connection.execute("SELECT count(*) FROM sections WHERE section_id = 'old-v1-section'").fetchone()[0] == 0
     connection.close()
     assert search(config, "new schema", project="phoebe")
+
+
+def test_search_rejects_v1_without_mutating_database(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Legacy\nlegacy v1 data\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    create_v1_index(config.database, str(note.resolve()), "vault")
+    before = config.database.read_bytes()
+
+    with pytest.raises(ValueError, match=r"index schema is v1; run `pausanias index` to rebuild"):
+        search(config, "legacy", project="phoebe")
+
+    assert config.database.read_bytes() == before
+
+
+def test_search_reads_committed_generation_during_write_transaction(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Committed\nvisible while refresh writes\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    index(config)
+
+    writer = sqlite3.connect(config.database, timeout=0)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.perf_counter()
+        results = search(config, "visible", project="phoebe")
+        elapsed = time.perf_counter() - started
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert elapsed < 1
+    assert [result.canonical_path for result in results] == [str(note.resolve())]
 
 
 def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, monkeypatch):
@@ -230,6 +348,7 @@ def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, 
         assert reader.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "1"
         assert reader.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
         assert reader.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+        assert reader.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == 1
     finally:
         reader.close()
 
@@ -242,6 +361,7 @@ def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, 
         assert connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "2"
         assert connection.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+        assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == 2
     finally:
         connection.close()
 
