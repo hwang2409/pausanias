@@ -39,10 +39,12 @@ pinned model bundle explicitly:
 ```bash
 python -m pip install -e '.[semantic]'
 pausanias --config ./config.toml model fetch
-pausanias model license
+pausanias --config ./config.toml model status
+pausanias --config ./config.toml model license
 ```
 
 Set the bundle location in `config.toml` with `[semantic]` and `bundle_dir`. Fetch
 downloads only the pinned files, verifies each SHA-256 hash, and publishes the bundle
 after all files pass verification. The bundle contains the tokenizer contract and
-license notices. No normal command downloads a model.
+license notices. `model status` reports the optional extra, bundle, manifest, and
+runtime states. No normal command downloads a model.

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -15,6 +17,8 @@ import uuid
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+ONNXRUNTIME_VERSION = "1.30.0"
+NUMPY_VERSION = "2.3.3"
 MODEL_LICENSE_NOTICE = """all-MiniLM-L6-v2 is distributed under the Apache License 2.0.
 Source: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
 License: https://www.apache.org/licenses/LICENSE-2.0
@@ -32,7 +36,8 @@ MODEL_BUNDLE_MANIFEST = {
     "model_revision": MODEL_REVISION,
     "tokenizer_version": MODEL_REVISION,
     "model_license": "Apache-2.0",
-    "runtime": {"name": "onnxruntime", "version": "1.30.0", "provider": "CPUExecutionProvider"},
+    "runtime": {"name": "onnxruntime", "version": ONNXRUNTIME_VERSION, "provider": "CPUExecutionProvider"},
+    "numpy_version": NUMPY_VERSION,
     "dimension": 384,
     "dtype": "float32",
     "pooling": "mean",
@@ -116,7 +121,8 @@ class BundleFile:
 
 
 def manifest_fingerprint(manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST) -> str:
-    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    body = {key: value for key, value in manifest.items() if key != "manifest_fingerprint"}
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -182,10 +188,29 @@ def _check_file(root: Path, expected: BundleFile) -> None:
         raise BundleError(f"bundle file hash mismatch: {expected.path} (expected {expected.sha256}, got {digest})")
 
 
+def _license_files(manifest: Mapping[str, object]) -> tuple[BundleFile, ...]:
+    records = manifest.get("licenses", [])
+    if not isinstance(records, list):
+        raise BundleError("manifest licenses must be an array")
+    result: list[BundleFile] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise BundleError("each manifest license must be a table")
+        path = _relative_path(record.get("file"), "license file")
+        path_text = path.as_posix()
+        if path_text in seen:
+            raise BundleError(f"duplicate manifest license: {path_text}")
+        seen.add(path_text)
+        content = _license_content(record).encode()
+        result.append(BundleFile(path_text, "", len(content), hashlib.sha256(content).hexdigest()))
+    return tuple(result)
+
+
 def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST) -> None:
     """Verify every declared bundle file and the installed manifest."""
     root = Path(bundle_dir).expanduser()
-    if root.is_symlink() or not root.is_dir():
+    if not root.is_dir():
         raise BundleError(f"model bundle is not a directory: {root}")
     manifest_path = root / "manifest.json"
     try:
@@ -194,9 +219,16 @@ def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL
         stored = json.loads(manifest_path.read_text())
     except (OSError, ValueError) as exc:
         raise BundleError(f"bundle manifest is unreadable: {manifest_path}") from exc
-    if not isinstance(stored, dict) or stored.get("manifest_fingerprint") != manifest_fingerprint(manifest):
+    if not isinstance(stored, dict):
+        raise BundleError("bundle manifest does not match the pinned manifest")
+    expected_fingerprint = manifest_fingerprint(manifest)
+    stored_body = {key: value for key, value in stored.items() if key != "manifest_fingerprint"}
+    if (stored.get("manifest_fingerprint") != expected_fingerprint
+            or manifest_fingerprint(stored_body) != expected_fingerprint):
         raise BundleError("bundle manifest does not match the pinned manifest")
     for expected in _files(manifest):
+        _check_file(root, expected)
+    for expected in _license_files(manifest):
         _check_file(root, expected)
 
 
@@ -208,21 +240,9 @@ def _license_content(record: dict) -> str:
     return f"License: {spdx_id}\n"
 
 
-def _remove_path(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
-
-
 def _write_licenses(root: Path, manifest: Mapping[str, object]) -> None:
-    records = manifest.get("licenses", [])
-    if not isinstance(records, list):
-        raise BundleError("manifest licenses must be an array")
-    for record in records:
-        if not isinstance(record, dict):
-            raise BundleError("each manifest license must be a table")
-        target = root / _relative_path(record.get("file"), "license file")
+    for expected, record in zip(_license_files(manifest), manifest.get("licenses", []), strict=True):
+        target = root / expected.path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(_license_content(record))
 
@@ -244,7 +264,7 @@ def fetch_bundle(
     """Download, verify, and atomically publish a model bundle."""
     expected_files = _files(manifest)
     destination = Path(bundle_dir).expanduser()
-    if destination.exists() and not destination.is_symlink():
+    if destination.exists() or destination.is_symlink():
         try:
             verify_bundle(destination, manifest)
         except BundleError:
@@ -252,7 +272,11 @@ def fetch_bundle(
         else:
             return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    versions = destination.parent / "bundles" / destination.name
+    versions.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=versions))
+    version_dir = versions / f"{manifest_fingerprint(manifest)}-{uuid.uuid4().hex}"
+    pointer = destination.parent / f".{destination.name}.pointer-{uuid.uuid4().hex}"
     try:
         for expected in expected_files:
             target = staging / expected.path
@@ -271,42 +295,46 @@ def fetch_bundle(
             sort_keys=True,
         ) + "\n")
         verify_bundle(staging, manifest)
-        backup: Path | None = None
-        if destination.exists() or destination.is_symlink():
-            backup = destination.parent / f".{destination.name}.old-{uuid.uuid4().hex}"
-            destination.rename(backup)
-        try:
-            staging.rename(destination)
-        except OSError:
-            if backup is not None:
-                backup.rename(destination)
-            raise
-        if backup is not None:
-            _remove_path(backup)
+        staging.rename(version_dir)
+        pointer.symlink_to(version_dir, target_is_directory=True)
+        os.replace(pointer, destination)
         return destination
     except BundleError:
         shutil.rmtree(staging, ignore_errors=True)
+        pointer.unlink(missing_ok=True)
         raise
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
+        pointer.unlink(missing_ok=True)
         raise BundleError(f"could not install model bundle: {exc}") from exc
     except Exception as exc:
         shutil.rmtree(staging, ignore_errors=True)
+        pointer.unlink(missing_ok=True)
         if isinstance(exc, BundleError):
             raise
         raise BundleError(f"could not install model bundle: {exc}") from exc
 
 
 def license_records(bundle_dir: str | Path | None = None) -> list[dict]:
-    """Return the installed license records, or the pinned records if absent."""
-    manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST
-    if bundle_dir is not None:
-        path = Path(bundle_dir).expanduser() / "manifest.json"
+    """Return the pinned license records or the verified bundle records."""
+    if bundle_dir is None:
+        manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST
+    else:
+        root = Path(bundle_dir).expanduser()
+        verify_bundle(root)
         try:
-            loaded = json.loads(path.read_text())
-        except (OSError, ValueError):
-            loaded = None
-        if isinstance(loaded, dict) and isinstance(loaded.get("licenses"), list):
-            manifest = loaded
+            loaded = json.loads((root / "manifest.json").read_text())
+        except (OSError, ValueError) as exc:
+            raise BundleError(f"bundle manifest is unreadable: {root / 'manifest.json'}") from exc
+        if not isinstance(loaded, dict):
+            raise BundleError("bundle manifest does not contain license records")
+        manifest = loaded
     records = manifest.get("licenses", [])
     return [record for record in records if isinstance(record, dict)]
+
+
+def package_version(package: str) -> str | None:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None

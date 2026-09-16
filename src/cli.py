@@ -8,7 +8,16 @@ import sys
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
 from .core import excerpt, index, read_source, search
-from .model_bundle import fetch_bundle, license_records
+from .model_bundle import (
+    BundleError,
+    MODEL_BUNDLE_MANIFEST,
+    NUMPY_VERSION,
+    ONNXRUNTIME_VERSION,
+    fetch_bundle,
+    license_records,
+    package_version,
+    verify_bundle,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -52,6 +61,10 @@ def parser() -> argparse.ArgumentParser:
     license_parser = model_commands.add_parser("license", help="show model and runtime license records")
     license_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
     license_parser.add_argument("--bundle-dir")
+    status_parser = model_commands.add_parser("status", help="show semantic model readiness")
+    status_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
+    status_parser.add_argument("--bundle-dir")
+    status_parser.add_argument("--json", action="store_true")
     return root
 
 
@@ -66,6 +79,44 @@ def _result(candidate) -> dict:
         "reason": candidate.reason,
         "content_hash": candidate.content_hash,
     }
+
+
+def _model_status(bundle_dir: str | Path) -> dict:
+    path = Path(bundle_dir).expanduser()
+    runtime_version = package_version("onnxruntime")
+    numpy_version = package_version("numpy")
+    bundle_present = path.is_dir()
+    manifest_valid = False
+    manifest_error = None
+    if bundle_present:
+        try:
+            verify_bundle(path)
+        except BundleError as exc:
+            manifest_error = str(exc)
+        else:
+            manifest_valid = True
+    runtime = MODEL_BUNDLE_MANIFEST["runtime"]
+    expected_runtime = runtime["version"] if isinstance(runtime, dict) else ONNXRUNTIME_VERSION
+    return {
+        "bundle_dir": str(path),
+        "extra_installed": runtime_version is not None and numpy_version is not None,
+        "bundle_present": bundle_present,
+        "manifest_valid": manifest_valid,
+        "manifest_error": manifest_error,
+        "versions": {
+            "onnxruntime": {"installed": runtime_version, "expected": expected_runtime},
+            "numpy": {
+                "installed": numpy_version,
+                "expected": MODEL_BUNDLE_MANIFEST.get("numpy_version", NUMPY_VERSION),
+            },
+        },
+    }
+
+
+def _configured_bundle(args) -> Path:
+    if args.bundle_dir is not None:
+        return Path(args.bundle_dir)
+    return load_config(args.config).bundle_dir
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,16 +136,35 @@ def main(argv: list[str] | None = None) -> int:
                 print(format_report(report))
             return 1 if report["gate"]["enforced"] and not report["gate"]["passed"] else 0
         if args.command == "model" and args.model_command == "license":
-            for record in license_records(args.bundle_dir):
+            bundle_dir = args.bundle_dir
+            if bundle_dir is None:
+                try:
+                    bundle_dir = _configured_bundle(args)
+                except ConfigError:
+                    if Path(args.config).expanduser().exists():
+                        raise
+                    bundle_dir = None
+            for record in license_records(bundle_dir):
                 print(f"{record.get('name', 'license')}: {record.get('spdx_id', 'unknown')}")
                 if isinstance(record.get("notice"), str):
                     print(record["notice"], end="" if record["notice"].endswith("\n") else "\n")
             return 0
-        if args.command == "model":
-            bundle_dir = args.bundle_dir
-            if bundle_dir is None:
-                config = load_config(args.config)
-                bundle_dir = config.bundle_dir
+        if args.command == "model" and args.model_command == "status":
+            status = _model_status(_configured_bundle(args))
+            if args.json:
+                print(json.dumps(status, sort_keys=True))
+            else:
+                print(f"bundle directory: {status['bundle_dir']}")
+                print(f"extra installed: {'yes' if status['extra_installed'] else 'no'}")
+                print(f"bundle present: {'yes' if status['bundle_present'] else 'no'}")
+                print(f"manifest valid: {'yes' if status['manifest_valid'] else 'no'}")
+                for name, versions in status["versions"].items():
+                    print(f"{name}: installed={versions['installed'] or 'missing'} expected={versions['expected']}")
+                if status["manifest_error"]:
+                    print(f"manifest error: {status['manifest_error']}")
+            return 0
+        if args.command == "model" and args.model_command == "fetch":
+            bundle_dir = _configured_bundle(args)
             print(f"model bundle installed at {fetch_bundle(Path(bundle_dir))}")
         elif args.command == "index":
             config = load_config(args.config)
