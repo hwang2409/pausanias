@@ -26,6 +26,11 @@ class Config:
     private_paths: tuple[str, ...]
     database: Path
     section_bytes: int = 12000
+    semantic_bundle: Path = Path("~/.cache/pausanias/models/all-MiniLM-L6-v2")
+
+    @property
+    def bundle_dir(self) -> Path:
+        return self.semantic_bundle
 
     def root_for(self, path: Path) -> Root | None:
         resolved = _resolve(path, strict=False)
@@ -175,7 +180,20 @@ def load_config(path: str | Path) -> Config:
     section_bytes = raw.get("section_bytes", 12000)
     if not isinstance(section_bytes, int) or section_bytes < 1:
         raise ConfigError("section_bytes must be a positive integer")
-    return Config(tuple(roots), frozenset(global_notes), tuple(private_paths), database, section_bytes)
+    semantic = raw.get("semantic", {})
+    if not isinstance(semantic, dict):
+        raise ConfigError("semantic must be a table")
+    bundle_raw = semantic.get(
+        "bundle_dir",
+        raw.get("semantic_bundle", raw.get("model_bundle", "~/.cache/pausanias/models/all-MiniLM-L6-v2")),
+    )
+    if not isinstance(bundle_raw, str) or not bundle_raw:
+        raise ConfigError("semantic.bundle_dir must be a non-empty path")
+    bundle_candidate = Path(bundle_raw).expanduser()
+    if not bundle_candidate.is_absolute():
+        bundle_candidate = config_path.parent / bundle_candidate
+    bundle_dir = _resolve(bundle_candidate, strict=False)
+    return Config(tuple(roots), frozenset(global_notes), tuple(private_paths), database, section_bytes, bundle_dir)
 
 
 def default_config_path() -> Path:
