@@ -1,0 +1,28 @@
+database = "./index.sqlite3"
+private_paths = ["private/**"]
+global_notes = ["corpus/shared/team-decisions.md", "corpus/shared/security-boundaries.md"]
+
+[[roots]]
+id = "phoebe"
+path = "corpus/phoebe"
+project = "phoebe"
+
+[[roots]]
+id = "pausanias"
+path = "corpus/pausanias"
+project = "pausanias"
+
+[[roots]]
+id = "atlas"
+path = "corpus/atlas"
+project = "atlas"
+
+[[roots]]
+id = "beacon"
+path = "corpus/beacon"
+project = "beacon"
+
+[[roots]]
+id = "shared"
+path = "corpus/shared"
+project = "shared"
