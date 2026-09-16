@@ -461,7 +461,7 @@ def format_report(report: dict) -> str:
     lines = [
         f"source: {report['source']['kind']} ({report['source']['file_count']} files)",
         f"queries: {report['queries']['count']}",
-        "first query: fresh SQLite connection after index refresh; shared OS and SQLite caches",
+        "first query: warm OS page cache, fresh SQLite connection with an empty page cache",
         "",
         "metric                         value       target      result  headroom",
         "-----------------------------  ----------  ----------  ------  --------",

@@ -154,7 +154,7 @@ Initial budgets are hypotheses for evaluation:
 
 - At most 4 excerpts and 1,200 estimated tokens per user turn, including labels.
 - At most 350 estimated tokens per excerpt.
-- A 750 ms target for the first query on a fresh SQLite connection after index refresh. This does not clear OS or SQLite page caches.
+- A 750 ms target for the first query after index refresh with a warm OS page cache, fresh SQLite connection with an empty page cache.
 - A 300 ms target for warm local retrieval at p95.
 - A 750 ms hard adapter deadline, after which the turn proceeds without memory.
 
