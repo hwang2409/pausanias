@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS sections (
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
     root_id TEXT NOT NULL,
-    project_scope TEXT NOT NULL,
     text TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     index_generation INTEGER NOT NULL,
@@ -40,8 +39,7 @@ CREATE TABLE IF NOT EXISTS sections (
     note_type TEXT,
     updated_date TEXT,
     created_date TEXT,
-    links TEXT NOT NULL,
-    is_global INTEGER NOT NULL DEFAULT 0
+    links TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sections_path_idx ON sections(canonical_path);
 CREATE VIRTUAL TABLE IF NOT EXISTS sections_fts USING fts5(section_id UNINDEXED, heading, text);
@@ -127,17 +125,21 @@ def index(config: Config, rebuild: bool = False) -> int:
             content = raw_bytes.decode("utf-8")
             document = split_markdown(canonical, content, config.section_bytes, raw_bytes)
             if old and old["root_id"] == root.id and old["mtime_ns"] == stat.st_mtime_ns and old["content_hash"] == document.content_hash:
-                connection.execute("UPDATE sections SET index_generation = ?, project_scope = ?, is_global = ? WHERE canonical_path = ?",
-                                   (generation, root.project, int(config.is_global(Path(canonical))), canonical))
+                connection.execute("UPDATE sections SET index_generation = ? WHERE canonical_path = ?",
+                                   (generation, canonical))
                 continue
             _remove_file(connection, canonical)
             for section in document.sections:
                 connection.execute(
-                    """INSERT INTO sections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO sections
+                       (section_id, canonical_path, heading, heading_path, line_start,
+                        line_end, root_id, text, content_hash, index_generation,
+                        indexed_at, note_type, updated_date, created_date, links)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (section.section_id, canonical, section.heading, "\n".join(section.heading_path), section.line_start,
-                     section.line_end, root.id, root.project, section.text, document.content_hash, generation, time.time(),
+                     section.line_end, root.id, section.text, document.content_hash, generation, time.time(),
                      document.frontmatter.note_type, document.frontmatter.updated, document.frontmatter.created,
-                     json.dumps(explicit_links(content)), int(config.is_global(Path(canonical)))),
+                     json.dumps(explicit_links(content))),
                 )
                 connection.execute("INSERT INTO sections_fts(section_id, heading, text) VALUES (?, ?, ?)",
                                    (section.section_id, section.heading or "", section.text))
@@ -259,15 +261,14 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     global_paths = sorted(str(path) for path in config.global_notes)
     selected_root = next((root for root in config.roots if root.id == root_id), None)
     effective_project = project or (selected_root.project if root_id and not all_projects else None)
-    if effective_project and not all_projects:
-        scope_root_ids = [root.id for root in config.roots if root.project == effective_project]
-        scope_paths = global_paths
-    elif effective_project is None and not all_projects:
-        scope_root_ids = []
-        scope_paths = global_paths
-    else:
+    if all_projects:
         scope_root_ids = [root.id for root in config.roots]
-        scope_paths = global_paths
+    elif effective_project is None:
+        scope_root_ids = []
+    else:
+        scope_root_ids = [root.id for root in config.roots if root.project == effective_project]
+    if root_id:
+        scope_root_ids = [candidate_id for candidate_id in scope_root_ids if candidate_id == root_id]
 
     def placeholders(values: list[str]) -> str:
         return ", ".join("?" for _ in values) or "NULL"
@@ -276,43 +277,14 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     try:
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
-        global_condition = f"s.canonical_path IN ({placeholders(scope_paths)})"
-        if root_id:
-            if effective_project and not all_projects:
-                conditions.append(f"((s.root_id = ? AND s.project_scope = ?) OR {global_condition})")
-                params.extend((root_id, effective_project))
-            else:
-                conditions.append(f"(s.root_id = ? OR {global_condition})")
-                params.append(root_id)
-            params.extend(scope_paths)
-        elif effective_project and not all_projects:
-            if scope_root_ids:
-                conditions.append(
-                    f"((s.root_id IN ({placeholders(scope_root_ids)}) AND s.project_scope = ?)"
-                    f" OR {global_condition})"
-                )
-                params.extend(scope_root_ids)
-                params.append(effective_project)
-                params.extend(scope_paths)
-            elif scope_paths:
-                conditions.append(global_condition)
-                params.extend(scope_paths)
-            else:
-                conditions.append("0")
-        elif scope_paths and scope_root_ids:
-            conditions.append(
-                f"(s.root_id IN ({placeholders(scope_root_ids)}) OR {global_condition})"
-            )
+        scope_conditions: list[str] = []
+        if scope_root_ids:
+            scope_conditions.append(f"s.root_id IN ({placeholders(scope_root_ids)})")
             params.extend(scope_root_ids)
-            params.extend(scope_paths)
-        elif scope_root_ids:
-            conditions.append(f"s.root_id IN ({placeholders(scope_root_ids)})")
-            params.extend(scope_root_ids)
-        elif scope_paths:
-            conditions.append(global_condition)
-            params.extend(scope_paths)
-        else:
-            conditions.append("0")
+        if global_paths:
+            scope_conditions.append(f"s.canonical_path IN ({placeholders(global_paths)})")
+            params.extend(global_paths)
+        conditions.append("(" + " OR ".join(scope_conditions) + ")" if scope_conditions else "0")
         candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
         rows_by_id: dict[str, sqlite3.Row] = {}
         for lane in (None, "heading", "text"):
@@ -322,7 +294,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                 row["section_id"]: row
                 for row in connection.execute(
                     "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
-                    + " AND ".join(conditions) + " ORDER BY fts_score LIMIT ?",
+                    + " AND ".join(conditions) + " ORDER BY fts_score, s.section_id LIMIT ?",
                     (*lane_params, candidate_limit),
                 ).fetchall()
             })
@@ -333,6 +305,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     results: list[Candidate] = []
     source_cache: dict[str, tuple[Root, Path] | None] = {}
     hash_cache: dict[str, str | None] = {}
+    lower_tokens = {token.lower() for token in tokens}
     for row in rows:
         canonical = row["canonical_path"]
         if canonical not in source_cache:
@@ -367,7 +340,6 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                 refresh.add(canonical)
             continue
         heading_path = tuple(filter(None, row["heading_path"].split("\n")))
-        lower_tokens = {token.lower() for token in tokens}
         heading_tokens = _token_set(row["heading"] or "")
         body_tokens = _token_set(row["text"])
         identifier_boost = sum(2.0 for token in lower_tokens
@@ -390,7 +362,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
                                  row["line_start"], row["line_end"], current_root.id, current_root.project,
                                  row["text"], row["content_hash"], row["note_type"], row["updated_date"],
                                  row["created_date"], score, ", ".join(reasons) or "text match"))
-    results.sort(key=lambda item: item.score, reverse=True)
+    results.sort(key=lambda item: (-item.score, item.section_id))
     return results[:limit]
 
 

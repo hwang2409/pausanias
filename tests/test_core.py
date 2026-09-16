@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+import pausanias.core as core
 from pausanias.cli import main
 from pausanias.config import ConfigError, load_config
 from pausanias.core import connect, index, read_source, search
@@ -165,6 +166,28 @@ def test_scope_change_takes_effect_without_reindex(tmp_path: Path):
     ]))
     current_config = load_config(config_path)
     assert search(current_config, "scope change", project="beta") == []
+
+
+def test_root_project_change_takes_effect_without_reindex(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Scope\nroot project change\n")
+    config = make_config(tmp_path, [("root", "alpha", root)])
+    index(config)
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("\n".join([
+        f'database = "{config.database}"',
+        "",
+        "[[roots]]",
+        'id = "root"',
+        'project = "beta"',
+        f'path = "{root}"',
+    ]))
+    current_config = load_config(config_path)
+    assert search(current_config, "project change", project="alpha") == []
+    assert search(current_config, "project change", project="beta")
 
 
 def test_crlf_hash_is_verified_from_raw_bytes(tmp_path: Path):
@@ -402,6 +425,26 @@ def test_root_project_scope_filters_before_candidate_limit(tmp_path: Path):
 
     assert [result.canonical_path for result in results] == [str(global_note.resolve())]
     assert search(config, "alpha", project="beta", root_id="a") == []
+
+
+def test_tied_results_have_stable_order_across_rebuilds(tmp_path: Path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    for name in ("one.md", "two.md"):
+        (root / name).write_text("# Same\nshared tie text\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    found = core._files(config)
+
+    monkeypatch.setattr(core, "_files", lambda _: found)
+    index(config, rebuild=True)
+    first = [result.section_id for result in search(config, "shared tie")]
+
+    reversed_found = dict(reversed(list(found.items())))
+    monkeypatch.setattr(core, "_files", lambda _: reversed_found)
+    index(config, rebuild=True)
+    second = [result.section_id for result in search(config, "shared tie")]
+
+    assert first == second
 
 
 def test_selection_reason_matches_heading_tokens_only(tmp_path: Path):
