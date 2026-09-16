@@ -100,18 +100,33 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _tokenizer_fingerprint(manifest: dict[str, object]) -> str:
+    tokenizer = manifest["tokenizer"]
+    tokenizer_files = set(tokenizer["files"])
+    artifact_digests = {
+        file["path"]: file["sha256"]
+        for file in manifest["files"]
+        if file["path"] in tokenizer_files
+    }
+    payload = json.dumps(
+        {"artifacts": artifact_digests, "settings": tokenizer},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _embedding_metadata() -> dict[str, object]:
     runtime = MODEL_BUNDLE_MANIFEST["runtime"]
-    tokenizer = MODEL_BUNDLE_MANIFEST["tokenizer"]
     model_file = next(file for file in MODEL_BUNDLE_MANIFEST["files"] if file["path"] == "onnx/model.onnx")
-    tokenizer_payload = json.dumps(tokenizer, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return {
         "model_id": MODEL_BUNDLE_MANIFEST["model_id"],
         "model_hash": model_file["sha256"],
         "model_fingerprint": model_file["sha256"],
         "model_version": MODEL_BUNDLE_MANIFEST["model_version"],
         "tokenizer_version": MODEL_BUNDLE_MANIFEST["tokenizer_version"],
-        "tokenizer_fingerprint": hashlib.sha256(tokenizer_payload).hexdigest(),
+        "tokenizer_fingerprint": _tokenizer_fingerprint(MODEL_BUNDLE_MANIFEST),
         "runtime_name": runtime["name"],
         "runtime_version": runtime["version"],
         "dimension": MODEL_BUNDLE_MANIFEST["dimension"],
@@ -187,12 +202,19 @@ class Candidate:
     reason: str
 
 
-def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
-    if initialize:
+def connect(database: Path, initialize: bool = True, readonly: bool = False) -> sqlite3.Connection:
+    if readonly and initialize:
+        raise ValueError("read-only connections cannot initialize the schema")
+    if initialize and not readonly:
         database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
+    if readonly:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+    else:
+        connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    if not readonly:
+        connection.execute("PRAGMA foreign_keys = ON")
     if initialize:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -206,6 +228,12 @@ def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
             connection.rollback()
             raise
     return connection
+
+
+def _require_schema_version(connection: sqlite3.Connection) -> None:
+    stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if stored_version != SCHEMA_VERSION:
+        raise ValueError(f"index schema is v{stored_version}; run `pausanias index` to rebuild")
 
 
 def _markdown(path: Path) -> bool:
@@ -387,9 +415,6 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None) -> list[Candidate]:
     if limit < 1:
         raise ValueError("limit must be positive")
-    fts, tokens = _fts_query(query)
-    if not fts:
-        return []
     if not config.database.exists():
         return []
 
@@ -410,8 +435,12 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     def placeholders(values: list[str]) -> str:
         return ", ".join("?" for _ in values) or "NULL"
 
-    connection = connect(config.database)
+    connection = connect(config.database, initialize=False, readonly=True)
     try:
+        _require_schema_version(connection)
+        fts, tokens = _fts_query(query)
+        if not fts:
+            return []
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
         scope_conditions: list[str] = []
