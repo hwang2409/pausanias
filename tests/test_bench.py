@@ -33,6 +33,8 @@ def test_benchmark_report_has_positive_metrics():
     assert report["gate"]["enforced"] is False
     assert all(isinstance(value, (int, float)) and value > 0 for value in report["metrics"].values())
     assert set(report["metrics"]) == set(report["checks"])
+    assert report["metrics"]["first_query_ms"] > 0
+    assert "cold_search_ms" not in report["metrics"]
 
 
 def test_benchmark_query_modes_have_hits():
@@ -44,6 +46,15 @@ def test_benchmark_query_modes_have_hits():
         assert modes[mode]["hit_count_p50"] > 0
         assert modes[mode]["warm_search_p95_ms"] > 0
     assert modes["miss"]["hit_count_max"] == 0
+
+
+def test_default_workload_has_representative_hit_count_mix():
+    report = run_benchmark()
+
+    mix = report["queries"]["hit_count_mix"]
+    assert mix["shares"]["three_or_more"] >= 0.60
+    assert mix["shares"]["zero"] <= 0.10
+    assert mix["shares"]["one"] <= 0.10
 
 
 def test_benchmark_gate_is_only_enforced_for_built_in_corpus(tmp_path: Path):
