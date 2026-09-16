@@ -14,6 +14,7 @@ from .splitter import content_hash, explicit_links, split_markdown
 
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
+SCHEMA_VERSION = 1
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
 
@@ -47,6 +48,20 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
+def _reset_schema(connection: sqlite3.Connection, generation: str | None = None) -> None:
+    connection.executescript("""
+    DROP TABLE IF EXISTS sections_fts;
+    DROP TABLE IF EXISTS sections;
+    DROP TABLE IF EXISTS files;
+    DROP TABLE IF EXISTS metadata;
+    """)
+    connection.executescript(SCHEMA)
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    if generation is not None:
+        connection.execute("INSERT INTO metadata(key, value) VALUES ('generation', ?)", (generation,))
+    connection.commit()
+
+
 @dataclass(frozen=True)
 class Candidate:
     section_id: str
@@ -73,7 +88,11 @@ def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     if initialize:
-        connection.executescript(SCHEMA)
+        stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if stored_version != SCHEMA_VERSION:
+            _reset_schema(connection)
+        else:
+            connection.executescript(SCHEMA)
     return connection
 
 
@@ -109,11 +128,10 @@ def index(config: Config, rebuild: bool = False) -> int:
     found = _files(config)
     connection = connect(config.database)
     try:
-        connection.execute("BEGIN IMMEDIATE")
         if rebuild:
-            connection.execute("DELETE FROM sections_fts")
-            connection.execute("DELETE FROM sections")
-            connection.execute("DELETE FROM files")
+            generation_row = connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()
+            _reset_schema(connection, generation_row["value"] if generation_row else None)
+        connection.execute("BEGIN IMMEDIATE")
         generation_row = connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()
         old_generation = int(generation_row["value"]) if generation_row else 0
         generation = old_generation + 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import time
 
 import pytest
@@ -27,6 +28,41 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     config_path = tmp_path / "config.toml"
     config_path.write_text("\n".join(lines))
     return load_config(config_path)
+
+
+def create_old_index(database: Path) -> None:
+    connection = sqlite3.connect(database)
+    connection.executescript("""
+    CREATE TABLE files (
+        canonical_path TEXT PRIMARY KEY,
+        root_id TEXT NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    CREATE TABLE sections (
+        section_id TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        heading TEXT,
+        heading_path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        root_id TEXT NOT NULL,
+        project_scope TEXT NOT NULL,
+        text TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        index_generation INTEGER NOT NULL,
+        indexed_at REAL NOT NULL,
+        note_type TEXT,
+        updated_date TEXT,
+        created_date TEXT,
+        links TEXT NOT NULL,
+        is_global INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX sections_path_idx ON sections(canonical_path);
+    CREATE VIRTUAL TABLE sections_fts USING fts5(section_id UNINDEXED, heading, text);
+    CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    """)
+    connection.close()
 
 
 def test_splitter_preserves_ancestry_and_frontmatter():
@@ -122,6 +158,27 @@ def test_links_and_index_lifecycle(tmp_path: Path):
     note.unlink()
     index(config)
     assert not search(config, "new plan", project="phoebe")
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: bool):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Decision\nUse the new schema.\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    create_old_index(config.database)
+
+    generation = index(config, rebuild=rebuild)
+
+    connection = connect(config.database, initialize=False)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(sections)")}
+    assert "project_scope" not in columns
+    assert "is_global" not in columns
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == core.SCHEMA_VERSION
+    assert connection.execute("SELECT index_generation FROM sections").fetchone()[0] == generation
+    connection.close()
+    assert search(config, "new schema", project="phoebe")
 
 
 def test_rebuild_and_scope_with_global_notes(tmp_path: Path):
