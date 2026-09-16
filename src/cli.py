@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
 from .core import excerpt, index, read_source, search
+from .model_bundle import fetch_bundle, license_records
 
 
 def parser() -> argparse.ArgumentParser:
@@ -42,6 +44,14 @@ def parser() -> argparse.ArgumentParser:
         help="benchmark an existing Markdown directory read-only; results reflect local cost only",
     )
     bench_parser.add_argument("--json", action="store_true", help="write the report as JSON")
+    model_parser = commands.add_parser("model", help="manage the optional semantic model")
+    model_commands = model_parser.add_subparsers(dest="model_command", required=True)
+    fetch_parser = model_commands.add_parser("fetch", help="download and verify the semantic model")
+    fetch_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
+    fetch_parser.add_argument("--bundle-dir")
+    license_parser = model_commands.add_parser("license", help="show model and runtime license records")
+    license_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
+    license_parser.add_argument("--bundle-dir")
     return root
 
 
@@ -74,12 +84,26 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(format_report(report))
             return 1 if report["gate"]["enforced"] and not report["gate"]["passed"] else 0
-        config = load_config(args.config)
-        if args.command == "index":
+        if args.command == "model" and args.model_command == "license":
+            for record in license_records(args.bundle_dir):
+                print(f"{record.get('name', 'license')}: {record.get('spdx_id', 'unknown')}")
+                if isinstance(record.get("notice"), str):
+                    print(record["notice"], end="" if record["notice"].endswith("\n") else "\n")
+            return 0
+        if args.command == "model":
+            bundle_dir = args.bundle_dir
+            if bundle_dir is None:
+                config = load_config(args.config)
+                bundle_dir = config.bundle_dir
+            print(f"model bundle installed at {fetch_bundle(Path(bundle_dir))}")
+        elif args.command == "index":
+            config = load_config(args.config)
             print(f"index generation {index(config, args.rebuild)}")
         elif args.command == "read":
+            config = load_config(args.config)
             print(read_source(config, args.path, args.heading, args.max_bytes))
         else:
+            config = load_config(args.config)
             results = [_result(item) for item in search(config, args.query, args.project, args.root, args.all_projects, args.limit)]
             if args.json:
                 print(json.dumps(results, ensure_ascii=False))
