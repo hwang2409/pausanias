@@ -140,6 +140,7 @@ def _remove_file(connection: sqlite3.Connection, canonical: str) -> None:
 
 def index(config: Config, rebuild: bool = False) -> int:
     found = _files(config)
+    config.database.parent.mkdir(parents=True, exist_ok=True)
     connection = connect(config.database, initialize=False)
     try:
         connection.execute("BEGIN IMMEDIATE")

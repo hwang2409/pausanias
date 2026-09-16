@@ -10,7 +10,7 @@ import pytest
 
 import pausanias.core as core
 from pausanias.cli import main
-from pausanias.config import ConfigError, load_config
+from pausanias.config import Config, ConfigError, load_config
 from pausanias.core import connect, index, read_source, search
 from pausanias.splitter import explicit_links, split_markdown
 
@@ -159,6 +159,20 @@ def test_links_and_index_lifecycle(tmp_path: Path):
     note.unlink()
     index(config)
     assert not search(config, "new plan", project="phoebe")
+
+
+def test_index_creates_missing_database_parent(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# First run\nCreate the database parent.\n")
+    database = tmp_path / "missing" / "nested" / "index.sqlite3"
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    config = Config(config.roots, config.global_notes, config.private_paths, database, config.section_bytes)
+
+    assert index(config) == 1
+    assert database.exists()
+    assert search(config, "database parent", project="phoebe")
 
 
 @pytest.mark.parametrize("rebuild", [False, True])
