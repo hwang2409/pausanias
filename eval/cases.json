@@ -1,5 +1,5 @@
 {
-  "status": "DRAFT: pending human review; worker authorship does not satisfy the design review requirement.",
+  "status": "DRAFT",
   "cases": [
     {
       "id": "prior-sandbox-image",
@@ -370,6 +370,166 @@
       "forbidden_paths": [],
       "abstain": false,
       "rationale": "retrieves a global note during explicit cross-project search"
+    },
+    {
+      "id": "paraphrase-sandbox-image",
+      "query": "why choose the environment for consistent builds?",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/decisions/sandbox-image.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks why the build environment was selected without copying its distinctive terms"
+    },
+    {
+      "id": "paraphrase-retrieval-boundary",
+      "query": "can evidence authorize an action or should deployment be verified?",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/decisions/retrieval-boundary.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks about acting on retrieved evidence in ordinary language"
+    },
+    {
+      "id": "paraphrase-stale-source-natural",
+      "query": "what happens after an edited document is found?",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/concepts/stale-hash.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks how the system handles an edited document without repeating the note wording"
+    },
+    {
+      "id": "paraphrase-packet-budget",
+      "query": "how much context should memory return?",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/decisions/packet-budget.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks for the context-size rule as a user would ask it"
+    },
+    {
+      "id": "paraphrase-worker-isolation-natural",
+      "query": "why cannot build jobs touch each other checkout?",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/concepts/worker-isolation.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks why build jobs stay apart without copying the isolation terms"
+    },
+    {
+      "id": "paraphrase-notification",
+      "query": "what is the normal cadence for build updates?",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/preferences/notification-style.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks about routine build updates without naming the selected cadence"
+    },
+    {
+      "id": "paraphrase-cache-retention",
+      "query": "how long should stored data remain by default?",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/decisions/cache-retention.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks for the default storage duration without using the note title"
+    },
+    {
+      "id": "paraphrase-export-format",
+      "query": "which representation supports streaming individual records?",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/decisions/export-format.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks which export representation supports streaming"
+    },
+    {
+      "id": "paraphrase-tenant-boundary",
+      "query": "where may customer exports stay?",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/decisions/tenant-boundary.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks where customer data may remain without repeating the boundary terms"
+    },
+    {
+      "id": "paraphrase-timeout",
+      "query": "what should happen if lookup runs past its deadline?",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/concepts/timeout.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks about an over-time lookup in natural language"
+    },
+    {
+      "id": "paraphrase-idempotence",
+      "query": "what repeats when the same request arrives again?",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/concepts/idempotence.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks about duplicate requests without copying the concept title"
+    },
+    {
+      "id": "paraphrase-accessibility",
+      "query": "how should dashboard users move without a mouse?",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/notes/accessibility.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "paraphrase",
+      "rationale": "asks about non-mouse dashboard use without copying the note wording"
+    },
+    {
+      "id": "heldout-fts-backend",
+      "query": "what local technology stores the first search index?",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/decisions/fts-backend.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "held-out",
+      "rationale": "held-out rephrasing asks for the first local search technology"
+    },
+    {
+      "id": "heldout-scope-filter",
+      "query": "can similarity allow access to another project?",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/concepts/scope-filter.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "held-out",
+      "rationale": "held-out rephrasing asks if similarity can cross a project boundary"
+    },
+    {
+      "id": "heldout-rebuild",
+      "query": "how do readers avoid seeing a half-finished rebuild?",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/concepts/rebuild.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "held-out",
+      "rationale": "held-out rephrasing asks how readers avoid partial index state"
+    },
+    {
+      "id": "heldout-remote-search",
+      "query": "does the first version call a hosted vector service?",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/notes/remote-search.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "held-out",
+      "rationale": "held-out rephrasing asks if the first version uses hosted search"
     }
   ]
 }

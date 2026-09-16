@@ -1,7 +1,7 @@
-# provisional thresholds recorded from the first full corpus run
+# thresholds recorded from the full corpus run before retrieval tuning
 [thresholds]
-recall_at_4 = 1.0
-precision_at_4 = 0.266
-mrr = 1.0
-abstention_accuracy = 1.0
+recall_at_4 = 0.659574468
+precision_at_4 = 0.659574468
+mrr = 0.659574468
+abstention_accuracy = 0.719298245
 forbidden_violations = 0

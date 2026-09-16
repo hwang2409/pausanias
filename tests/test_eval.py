@@ -1,36 +1,46 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
-from eval.run import Case, run_cases, score_case
+import pytest
+
+from eval import run as eval_run
+from eval.run import Case, load_cases, run_cases, score_case
 
 
-def test_score_case_computes_recall_precision_and_mrr(tmp_path: Path):
+def _threshold_file(path: Path, *, recall: float = 0.0) -> Path:
+    path.write_text(
+        "[thresholds]\n"
+        f"recall_at_4 = {recall}\n"
+        "precision_at_4 = 0.0\n"
+        "mrr = 0.0\n"
+        "abstention_accuracy = 0.0\n"
+        "forbidden_violations = 999\n"
+    )
+    return path
+
+
+def test_score_case_precision_changes_when_noise_is_added(tmp_path: Path):
     runtime_corpus = tmp_path / "corpus"
     runtime_corpus.mkdir()
-    results = [
-        SimpleNamespace(canonical_path=str(runtime_corpus / "a.md")),
-        SimpleNamespace(canonical_path=str(runtime_corpus / "noise.md")),
-        SimpleNamespace(canonical_path=str(runtime_corpus / "b.md")),
-    ]
-    case = Case(
-        "math",
-        "query",
-        {},
-        ("a.md", "b.md"),
-        ("noise.md",),
-        False,
-        "checks scoring",
-    )
 
-    score = score_case(case, results, runtime_corpus, 1.5, k=3)
+    def result(name: str) -> SimpleNamespace:
+        return SimpleNamespace(canonical_path=str(runtime_corpus / name))
 
-    assert score.recall_at_k == 1.0
-    assert score.precision_at_k == 2 / 3
-    assert score.reciprocal_rank == 1.0
-    assert score.forbidden_paths == ("noise.md",)
-    assert score.abstention_correct is True
+    case = Case("math", "query", {}, ("a.md",), ("noise.md",), False, "checks scoring")
+
+    clean = score_case(case, [result("a.md")], runtime_corpus, 1.5, k=4)
+    noisy = score_case(case, [result("a.md"), result("noise.md")], runtime_corpus, 1.5, k=4)
+
+    assert clean.precision_at_k == 1.0
+    assert noisy.precision_at_k == 0.5
+    assert noisy.reciprocal_rank == clean.reciprocal_rank == 1.0
+    assert noisy.forbidden_paths == ("noise.md",)
+    assert noisy.abstention_correct is True
 
 
 def test_runner_executes_three_case_mini_slice(tmp_path: Path):
@@ -57,7 +67,79 @@ def test_runner_executes_three_case_mini_slice(tmp_path: Path):
 
     assert len(scores) == 3
     assert aggregate["recall_at_4"] == 1.0
-    assert aggregate["precision_at_4"] == 0.25
+    assert aggregate["precision_at_4"] == 1.0
     assert aggregate["mrr"] == 1.0
     assert aggregate["abstention_accuracy"] == 1.0
     assert aggregate["forbidden_violations"] == 0
+
+
+def test_load_cases_accepts_reviewed_and_rejects_unknown_status(tmp_path: Path):
+    payload = json.loads(Path(eval_run.CASES_PATH).read_text())
+    cases_path = tmp_path / "cases.json"
+
+    payload["status"] = "REVIEWED"
+    cases_path.write_text(json.dumps(payload))
+    assert len(load_cases(cases_path)) >= 40
+
+    payload["status"] = "PENDING"
+    cases_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="exactly DRAFT or REVIEWED"):
+        load_cases(cases_path)
+
+
+def test_full_harness_reports_all_metrics(capsys):
+    assert eval_run.main(["--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["case_set_status"] == "DRAFT"
+    assert len(payload["cases"]) >= 40
+    assert {
+        "recall_at_4",
+        "precision_at_4",
+        "mrr",
+        "abstention_accuracy",
+        "forbidden_violations",
+    } <= payload["aggregate"].keys()
+    assert {"paraphrase", "held-out"} <= payload["category_aggregates"].keys()
+
+
+def test_gate_fails_when_threshold_exceeds_measured_performance(tmp_path: Path, capsys):
+    thresholds = _threshold_file(tmp_path / "thresholds.toml", recall=2.0)
+
+    assert eval_run.main(["--json", "--thresholds", str(thresholds)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert any(failure.startswith("recall_at_4=") for failure in payload["threshold_failures"])
+
+
+def test_harness_enforces_privacy_and_project_scope():
+    scores, _ = run_cases(load_cases())
+    by_id = {score.case.id: score for score in scores}
+
+    for case_id in ("wrong-project-sandbox", "wrong-project-email", "private-path-abstention", "deleted-email-provider"):
+        score = by_id[case_id]
+        assert score.result_paths == ()
+        assert score.abstention_correct is True
+        assert score.forbidden_paths == ()
+
+
+def test_runner_reports_malformed_case_and_exits_nonzero(tmp_path: Path):
+    cases_path = tmp_path / "cases.json"
+    cases_path.write_text(json.dumps({"status": "DRAFT", "cases": [{"id": "broken"}]}))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "eval.run", "--cases", str(cases_path)],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).parents[1],
+    )
+
+    assert result.returncode == 2
+    assert "eval: error: case broken is missing fields:" in result.stderr
+
+
+def test_single_case_validates_its_expectations_without_thresholds(tmp_path: Path, capsys):
+    thresholds = _threshold_file(tmp_path / "thresholds.toml", recall=2.0)
+
+    assert eval_run.main(["--case", "exact-pho-123", "--thresholds", str(thresholds)]) == 0
+    assert "full-run thresholds not applied" in capsys.readouterr().out
