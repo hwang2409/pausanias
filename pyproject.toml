@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pausanias"
+version = "0.1.0"
+description = "A local markdown memory index and search tool"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pausanias = "pausanias.cli:main"
+
+[tool.setuptools]
+packages = ["pausanias"]
+package-dir = {"pausanias" = "src"}
