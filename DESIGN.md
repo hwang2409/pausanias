@@ -211,7 +211,7 @@ Hold the model, task, corpus snapshot, generation settings, and total context al
 
 Include questions about prior decisions, exact ticket identifiers, paraphrased concepts, ambiguous follow-ups, changed preferences, conflicting notes, unrelated projects, deleted sources, and questions with no relevant memory. Include adversarial instructions inside notes.
 
-Each case specifies the expected answer, acceptable source evidence, forbidden stale claims, and whether retrieval should abstain. Evaluation requires human-reviewed cases; an LLM judge alone is insufficient for source correctness.
+Each case specifies the expected answer, acceptable source evidence, forbidden stale claims, and whether retrieval should abstain. Cases are versioned and mechanically locked before tuning. Deterministic fixtures and scoring provide the case gate; no manual case gate exists.
 
 Measure:
 
@@ -627,7 +627,7 @@ outside its requested project to `wrong-project`, and every other `standard` abs
 to `abstention`. Do not rewrite queries, sources, or rationales. The harness writes the
 canonical JSON fingerprint to `eval/cases.lock`, and refuses a run when the case file
 does not match it. A case change requires a new recorded baseline and lock before a tuning
-ticket. No human approval or case-status transition gates a run.
+ticket. The run has no approval or case-status transition gate.
 
 The internal runner accepts `--predict-only`, `--evaluate-only`, and `--resume`.
 `--predict-only` runs ingest and search, then leaves search checkpoints. `--evaluate-only`
@@ -635,29 +635,105 @@ requires complete search checkpoints and runs deterministic scoring without rebu
 the index. `--resume` reuses completed ingest and per-case search checkpoints. Its default
 cutoffs are `1,2,4,8`; its pass threshold is `0.5`.
 
-The common runner starts with LOCOMO-10: ten multi-session dialogues and about 300
-questions. LongMemEval and BEAM are later adapters, not new result formats. The runner is
-`eval/benchmarks/locomo/run.py` and accepts `--dataset-path`, `--run-id`, `--top-k`,
-`--top-k-cutoffs`, `--answerer-model`, `--judge-model`, `--provider`, `--predict-only`,
-`--evaluate-only`, and `--resume`. Comparable runs use mem0's defaults: `top-k=200` and
-cutoffs `10,20,50,200`. `--predict-only` may run without API keys. A complete common run
-requires an explicitly configured answerer and judge API key; `--evaluate-only` requires
-the same keys and complete search checkpoints.
+Record these Arc 2 thresholds before implementation tuning:
 
-Common ingest renders each source dialogue session as a Markdown note, preserving session
-order, date, speakers, and turn text. It builds one pausanias index from those notes.
-Common search sends each benchmark question to `pausanias search`, records the full ranked
-result list and warm search latency, and maps evidence turn references to rendered note
-paths. Common evaluate uses the vendored mem0 answerer prompt and judge convention at
-every cutoff. The answerer sees only the retrieved excerpts for that cutoff; the judge
-scores the generated answer against the benchmark ground truth. `CORRECT` maps to score
-`1.0`, every other judgment maps to `0.0`, and a score of at least `0.5` passes.
+- semantic recall@4 of at least `0.75` across the 16 paraphrase and held-out cases;
+- paraphrase recall@4 of at least `0.75` and held-out recall@4 of at least `0.75`;
+- standard exact/verbatim recall@4 of at least `0.98`, with the Arc 1 `1.0` result as
+  the regression reference;
+- abstention accuracy of `1.0` and zero forbidden-source violations;
+- warm hybrid p95 at or below `300 ms` on the benchmark workload.
+
+The harness prints measured values beside each threshold. A failed threshold is recorded,
+not changed to fit the result. Keep deterministic fixtures for model or tokenizer
+manifest drift with refusal to mix generations; a missing model bundle with lexical
+fallback; repeated queries with stable ordering and near-tie handling; exact ticket and
+quoted-term queries where vector results are distractors; project or root boundary
+crossings; deleted and changed sources after vector indexing; no-relevant-memory queries
+close to common corpus terms; and ranking regressions on every verbatim case. The Arc 1
+verbatim regression gate remains active when the common runner is used.
+
+The common runner starts with LOCOMO-10: ten multi-session dialogues and 1,540 questions
+from categories 1, 2, 3, and 4 of the 1,986-question dataset. The category filter is
+`category in [1, 2, 3, 4]` (multi-hop, temporal, open-domain, and single-hop); category 5
+(adversarial, 446 questions) is excluded. LongMemEval and BEAM are later adapters, not
+new result formats. The runner is `eval/benchmarks/locomo/run.py` and accepts
+`--dataset-path`, `--run-id`, `--conversations`, `--top-k`, `--top-k-cutoffs`,
+`--answerer-model`, `--judge-model`, `--provider`, `--judge-provider`, `--predict-only`,
+`--evaluate-only`, and `--resume`. A cheap smoke run selects a conversation subset with
+`--conversations`;
+a comparable full run selects all ten conversations and all 1,540 questions. Comparable
+runs use mem0's defaults: `top-k=200` and cutoffs `10,20,50,200`.
+
+LOCOMO provenance is the Snap Research dataset at
+`https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json`, pinned
+to the source commit and recorded with its SHA-256 in run metadata. It is licensed CC
+BY-NC 4.0; the non-commercial term applies because this is a personal research project.
+The dataset is never committed to this repository. Fetch it to the gitignored
+`datasets/locomo/locomo10.json`, validate ten conversations and the category counts, and
+reuse that cache when its recorded URL, commit, and hash match. A missing or mismatched
+cache requires an explicit refetch; a run never silently uses an unverified file.
+
+Common ingest renders one file per session as UTF-8 Markdown with LF line endings and one
+final newline. Sort sessions by parsed session date, then numeric session number. Name
+files `conversation-{conversation_index:02d}--session-{session_number:02d}.md`. Render:
+
+```markdown
+# conversation {conversation_index:02d}
+
+## session {session_number:02d} | timestamp: {session_date_time}
+
+### turn {dia_id} | speaker: {speaker} | timestamp: {session_date_time}
+
+{turn_text}
+```
+
+Use source strings exactly after converting CRLF and CR to LF. Do not trim internal
+spaces. For a turn with `query` or `blip_caption`, append one metadata line after the
+text: `[image query: {query}; caption: {blip_caption}]`, using an empty value for a
+missing field. For an image-only turn, use that line as the turn text. Drop image pixels,
+URLs, and unknown multimodal fields. Include turns in source order, including image-only
+turns. Fixed headings, separators, field order, and the final newline make the same
+dataset produce byte-identical files.
+
+Common search sends each question to `pausanias search`, records every result through
+`top-k` in rank order, and maps evidence turn references to the rendered note path and
+line range. At cutoff `k`, select the first `k` ranked results. For the mem0 answerer
+prompt, map `{question}` to the benchmark question, `{reference_date}` to the newest
+session timestamp in the conversation, and `{memories}` to those excerpts. Present the
+selected excerpts in ascending `(session_timestamp, source_path, line_start, rank)` order,
+with one `(timestamp) excerpt` entry per result. The result artifact keeps retrieval
+rank order; only the prompt view uses this stable chronological order. The judge slots
+map `{question}`, `{answer}`, and `{response}` to the benchmark question, ground truth,
+and generated answer. Evidence slots use listed evidence turns in dataset order.
+Common evaluate uses the vendored mem0 prompt and judge convention at every cutoff.
+`CORRECT` maps to score `1.0`, every other judgment maps to `0.0`, and a score of at
+least `0.5` passes.
 
 Vendor the LOCOMO prompts under `eval/vendor/mem0/locomo/`, with the source repository
 commit, copyright notices, Apache-2.0 license text, and any required NOTICE text. Do not
 rewrite the prompts or judge rubric. Record prompt version, answerer model, judge model,
-provider, cutoff list, and token usage when the client provides it. A normal run makes one
-answerer and one judge request per cutoff and case; document API cost before running it.
+provider, cutoff list, and token usage when the client provides it. A normal full matching
+run makes `1,540 * 4 * 2 = 12,320` LLM calls: one answerer and one judge request per
+cutoff and question. This reviewer-verified scale is an explicit cost choice; retries can
+add calls.
+
+The internal runner needs no API key. The common search and ingest stages also need none.
+The answerer reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` plus
+`AZURE_OPENAI_ENDPOINT`, according to its provider. The judge reads the matching key for
+its provider and may use a separate `--judge-provider`. `--predict-only` needs no LLM key.
+A complete common run and `--evaluate-only` require both configured keys before starting.
+Missing keys fail fast with no completed artifact. An optional internal judge uses the
+configured judge key but never changes deterministic gates.
+
+Each LLM call follows mem0's client policy: at most five attempts, with waits of 2, 4,
+6, and 8 seconds between attempts. After the final answerer failure, record a cutoff
+with `judgment: ERROR`, `score: 0.0`, `error: answerer_error`, and no generated answer.
+After the final judge failure or invalid judge JSON, preserve the generated answer and
+record `judgment: ERROR`, `score: 0.0`, and `error: judge_error`. Count every cutoff with
+`judgment: ERROR` or a non-null `error` in `metrics.errors` and the matching cutoff and
+category error counts. Do not convert an operational failure into `WRONG`; this preserves
+mem0's error accounting semantics.
 
 The common result is comparable to mem0's published tables only when the dataset version,
 prompt version, answerer, judge, provider, and cutoff list match. The comparison must name
@@ -674,12 +750,27 @@ Write the final artifact to `results/<benchmark>/<run_id>/run.json`. Keep resuma
 checkpoints but does not claim evaluated metrics. `--evaluate-only` reads those exact
 checkpoints and writes `run.json`.
 
+Every checkpoint is JSON with `checkpoint_version`, `stage`, `run_id`, `case_id` when
+applicable, `dataset_fingerprint`, `corpus_fingerprint`, `index_generation`, `config`,
+`status`, `started_at`, `finished_at`, and stage output. Write to a temporary file and
+atomically rename it. An ingest checkpoint is complete only when every in-scope session
+file hash and index generation is present. A search checkpoint is complete only when it
+has the question, query, numeric latency, the full ranked result list through `top_k`,
+the retrieval fingerprint, and a terminal `status` of `complete` or `error` with its
+failure code. Evaluation adds all configured cutoff outcomes and the same terminal status.
+
+On `--resume`, validate the schema version, run and case IDs, dataset/corpus/index
+fingerprints, config including cutoffs, and every required output field. A corrupt,
+partial, stale, or mismatched checkpoint is ignored and recomputed. Never mix checkpoints
+from another dataset, case lock, index generation, or prompt configuration.
+
 The stdlib schema uses `dataclasses` and `json`, not pydantic. The top-level object has:
 
 - `schema_version`: the literal `pausanias.eval.v1`;
 - `metadata`: `benchmark`, `run_id`, `dataset`, `corpus_fingerprint`, `index_generation`,
-  `case_set_fingerprint`, `config`, `started_at`, and `finished_at`. Timestamps are UTC
-  RFC 3339 strings. `config` contains `retrieval_mode`, `top_k`, `cutoffs`,
+  `case_set_fingerprint`, `prompt_version`, `answerer_prompt_hash`,
+  `judge_prompt_hash`, `config`, `started_at`, and `finished_at`. Timestamps are UTC RFC
+  3339 strings. `config` contains `retrieval_mode`, `top_k`, `cutoffs`,
   `answerer_model`, `judge_model`, and `provider`, with null model/provider values for
   the internal run. `dataset` contains the dataset name, version or source commit, and
   dataset fingerprint;
@@ -700,9 +791,12 @@ each result has `rank`, `section_id`, `source_path`, `root_id`, `project`, `head
 
 Each `cutoff_outcomes[k]` object has `retrieved_count`, `relevant_count`, `recall`,
 `precision`, `mrr`, `abstention_correct`, `forbidden_sources`, `score`, `passed`,
-`generated_answer`, `judgment`, `reason`, `model`, and `error`. The answer and judge
-fields are null for the internal deterministic run unless its optional judge is enabled.
-The common runner fills them for every cutoff. `score` at the top level is the outcome at
+`generated_answer`, `judgment`, `reason`, `model`, and `error`. It also has
+`prompt_metadata` with `answerer` and `judge` objects. Each object records the prompt
+version, template hash, slot names, model, `prompt_tokens`, and `completion_tokens`.
+Token counts are null when the provider gives no usage data. The answer and judge fields
+are null for the internal deterministic run unless its optional judge is enabled. The
+common runner fills them for every cutoff. `score` at the top level is the outcome at
 the largest configured cutoff.
 
 For cutoff `k`, let `R_k` be the first `k` ranked sources and `E` the expected sources.
@@ -742,6 +836,20 @@ cutoff, group, and judge conventions. Mem0 uses pydantic and lets judge output d
 published score; pausanias uses stdlib serialization and keeps the internal golden-case
 acceptance deterministic. The common LOCOMO runner still requires the mem0-compatible
 judge to produce a valid side-by-side comparison.
+
+These are the remaining intentional schema divergences from mem0's `UnifiedResult`:
+
+| mem0 shape | pausanias shape | reason |
+| --- | --- | --- |
+| Pydantic models and `schema_version: 1.0` | stdlib dataclasses/json and `pausanias.eval.v1` | Keep the base package dependency-free and version local changes explicitly |
+| `metadata.project_name` and one `timestamp` | dataset, corpus, index, case-lock, prompt fingerprints, and UTC start/finish timestamps | Make reproducibility and resume validation explicit |
+| Generic `retrieval.search_results` dictionaries | Ranked `retrieval_results` with source, line, hash, score, and reason fields | Preserve auditable Markdown evidence and deterministic ordering |
+| `EvalItem.id`, `group`, and `extras` | `case_id`, `category`, `expected_sources`, and `failure_reason` | One contract covers source-only cases and LOCOMO questions |
+| Top-level `generation` and `judgment` objects | Per-cutoff answerer and judge data under `cutoff_outcomes`, including prompt metadata and token counts | LOCOMO makes a separate generation and judgment at every cutoff |
+| `nugget_scores` support | No nugget scores | LOCOMO uses binary `CORRECT`/`WRONG`; BEAM remains a later adapter |
+| `by_group` metrics | `by_category`, `by_cutoff`, latency, and deterministic gates | Report the required category, retrieval, and internal acceptance metrics |
+| Empty-string ground truth default | `ground_truth: null` for internal source-only cases | Those cases score retrieved evidence, not a generated answer |
+| Cutoff-only error field | Cutoff `error` plus evaluation `failure_reason` and run error totals | Distinguish a failed question stage from a failed cutoff |
 
 ### Dependency policy
 
