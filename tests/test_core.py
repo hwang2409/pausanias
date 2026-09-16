@@ -175,6 +175,39 @@ def test_index_creates_missing_database_parent(tmp_path: Path):
     assert search(config, "database parent", project="phoebe")
 
 
+def test_schema_v2_records_disabled_embedding_generation_metadata(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Schema\nrecord generation metadata\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+
+    assert index(config) == 1
+
+    connection = connect(config.database, initialize=False)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+        assert state["generation"] == "1"
+        assert state["semantic_generation"] == "1"
+        assert state["semantic_state"] == "disabled"
+        assert state["semantic_reason"] == "EXTRA_MISSING"
+
+        metadata = connection.execute("SELECT * FROM embedding_metadata").fetchone()
+        assert metadata["generation"] == 1
+        assert metadata["semantic_state"] == "disabled"
+        assert metadata["semantic_reason"] == "EXTRA_MISSING"
+        assert metadata["model_id"] == "sentence-transformers/all-MiniLM-L6-v2"
+        assert metadata["model_hash"]
+        assert metadata["tokenizer_fingerprint"]
+        assert metadata["runtime_version"] == "1.30.0"
+        assert metadata["dimension"] == 384
+        assert metadata["embedding_version"] == 1
+        assert metadata["embedding_format_version"] == 1
+        assert "vector" not in {row[1] for row in connection.execute("PRAGMA table_info(embedding_metadata)")}
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("rebuild", [False, True])
 def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: bool):
     root = tmp_path / "vault"
@@ -192,6 +225,11 @@ def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: 
     assert "is_global" not in columns
     assert connection.execute("PRAGMA user_version").fetchone()[0] == core.SCHEMA_VERSION
     assert connection.execute("SELECT index_generation FROM sections").fetchone()[0] == generation
+    state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+    assert state["semantic_generation"] == str(generation)
+    assert state["semantic_state"] == "disabled"
+    assert state["semantic_reason"] == "EXTRA_MISSING"
+    assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == generation
     connection.close()
     assert search(config, "new schema", project="phoebe")
 
@@ -230,6 +268,7 @@ def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, 
         assert reader.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "1"
         assert reader.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
         assert reader.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+        assert reader.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == 1
     finally:
         reader.close()
 
@@ -242,6 +281,7 @@ def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, 
         assert connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "2"
         assert connection.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+        assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == 2
     finally:
         connection.close()
 
