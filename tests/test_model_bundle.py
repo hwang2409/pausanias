@@ -134,17 +134,24 @@ def test_interrupted_pointer_swap_keeps_active_bundle(tmp_path: Path, monkeypatc
     assert sorted(path.name for path in versions.iterdir()) == old_versions
 
 
-def test_nested_relative_destination_uses_a_valid_pointer(tmp_path: Path):
+def test_nested_relative_destination_uses_a_valid_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     source = tmp_path / "source"
     source.mkdir()
     (source / "model.bin").write_bytes(b"nested model bytes")
     manifest = fixture_manifest(source)
-    destination = tmp_path / "nested" / "config" / "bundle"
+    monkeypatch.chdir(tmp_path)
+    destination = Path("nested/config/bundle")
 
     fetch_bundle(destination, manifest)
 
-    verify_bundle(destination, manifest)
-    active = model_bundle._resolve_active_bundle(destination)
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    published = tmp_path / destination
+    verify_bundle(published, manifest)
+    active = model_bundle._resolve_active_bundle(published)
     assert (active / "model.bin").read_bytes() == b"nested model bytes"
 
 
@@ -162,6 +169,44 @@ def test_legacy_directory_is_migrated_to_a_pointer(tmp_path: Path):
     verify_bundle(destination, manifest)
     assert destination.is_file()
     assert not list(tmp_path.glob(f".{destination.name}.legacy-*"))
+
+
+@pytest.mark.parametrize("kill_at", [1, 2])
+def test_interrupted_legacy_migration_keeps_a_complete_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kill_at: int
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    legacy_payload = b"legacy model bytes"
+    (source / "model.bin").write_bytes(legacy_payload)
+    legacy_manifest = fixture_manifest(source)
+    destination = tmp_path / "bundle"
+    write_legacy_bundle(destination, legacy_manifest, legacy_payload)
+
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    new_payload = b"new model bytes"
+    (changed / "model.bin").write_bytes(new_payload)
+    new_manifest = fixture_manifest(changed)
+    real_replace = model_bundle.os.replace
+    replace_count = 0
+
+    def interrupt(source_path: str | Path, destination_path: str | Path) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == kill_at:
+            raise OSError("interrupted legacy migration")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(model_bundle.os, "replace", interrupt)
+    with pytest.raises(BundleError, match="interrupted legacy migration"):
+        fetch_bundle(destination, new_manifest)
+
+    active = model_bundle._resolve_active_bundle(destination)
+    if (active / "model.bin").read_bytes() == legacy_payload:
+        model_bundle._verify_bundle_root(active, legacy_manifest)
+    else:
+        model_bundle._verify_bundle_root(active, new_manifest)
 
 
 def test_failed_publication_removes_version_and_keeps_old_bundle(

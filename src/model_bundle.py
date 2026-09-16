@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,9 @@ import tempfile
 from typing import Callable, Mapping
 from urllib.request import urlopen
 import uuid
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -235,11 +239,13 @@ def _versions_dir(pointer: Path) -> Path:
     return pointer.parent / "bundles" / pointer.name
 
 
-def _resolve_active_bundle(pointer: Path) -> Path:
+def _migration_pointer(destination: Path) -> Path:
+    return destination.parent / f".{destination.name}.migration-pointer"
+
+
+def _resolve_pointer(pointer: Path, versions: Path) -> Path:
     if pointer.is_symlink():
         raise BundleError(f"active model bundle pointer is a symlink: {pointer}")
-    if not pointer.is_file():
-        raise BundleError(f"active model bundle pointer is missing or not a file: {pointer}")
     try:
         stored = json.loads(pointer.read_text())
     except (OSError, ValueError) as exc:
@@ -252,10 +258,40 @@ def _resolve_active_bundle(pointer: Path) -> Path:
     version_path = _relative_path(version, "active bundle version")
     if version_path.parent != Path("."):
         raise BundleError(f"active model bundle pointer has an invalid version: {pointer}")
-    root = _versions_dir(pointer) / version_path
+    root = versions / version_path
     if root.is_symlink() or not root.is_dir():
         raise BundleError(f"active model bundle is missing: {root}")
     return root
+
+
+def _resolve_active_bundle(pointer: Path) -> Path:
+    pointer = Path(pointer)
+    if pointer.is_symlink():
+        raise BundleError(f"active model bundle pointer is a symlink: {pointer}")
+    versions = _versions_dir(pointer)
+    migration_pointer = _migration_pointer(pointer)
+    if migration_pointer.is_symlink():
+        raise BundleError(f"active model bundle pointer is a symlink: {migration_pointer}")
+    errors: list[BundleError] = []
+    for candidate in (pointer, migration_pointer):
+        if candidate.is_file():
+            try:
+                return _resolve_pointer(candidate, versions)
+            except BundleError as exc:
+                errors.append(exc)
+    if pointer.is_dir():
+        return pointer
+    if errors:
+        raise errors[0]
+    raise BundleError(f"active model bundle pointer is missing or not a file: {pointer}")
+
+
+def _remove_legacy_bundle(destination: Path) -> bool:
+    try:
+        shutil.rmtree(destination)
+    except OSError as exc:
+        LOGGER.warning("could not remove legacy model bundle %s: %s", destination, exc)
+    return not destination.exists()
 
 
 def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST) -> None:
@@ -303,14 +339,21 @@ def fetch_bundle(
         except BundleError:
             pass
         else:
-            return destination
+            if not (destination.is_dir() and active == destination):
+                migration_pointer = _migration_pointer(destination)
+                if destination.is_dir() and migration_pointer.is_file():
+                    if _remove_legacy_bundle(destination):
+                        try:
+                            os.replace(migration_pointer, destination)
+                        except OSError as exc:
+                            LOGGER.warning("could not finalize model bundle migration %s: %s", destination, exc)
+                return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     versions = _versions_dir(destination)
     versions.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=versions))
     version_dir = versions / f"{manifest_fingerprint(manifest)}-{uuid.uuid4().hex}"
     pointer = destination.parent / f".{destination.name}.pointer-{uuid.uuid4().hex}"
-    legacy_backup: Path | None = None
     published = False
     try:
         for expected in expected_files:
@@ -331,14 +374,15 @@ def fetch_bundle(
         ) + "\n")
         _verify_bundle_root(staging, manifest)
         staging.rename(version_dir)
-        if destination.is_dir() and not destination.is_symlink():
-            legacy_backup = destination.parent / f".{destination.name}.legacy-{uuid.uuid4().hex}"
-            destination.rename(legacy_backup)
+        legacy = destination.is_dir() and not destination.is_symlink()
+        active_pointer = _migration_pointer(destination) if legacy else destination
         pointer.write_text(json.dumps({"format_version": 1, "version": version_dir.name}) + "\n")
-        os.replace(pointer, destination)
+        os.replace(pointer, active_pointer)
         published = True
-        if legacy_backup is not None:
-            shutil.rmtree(legacy_backup, ignore_errors=True)
+        if legacy:
+            if not _remove_legacy_bundle(destination):
+                return destination
+            os.replace(active_pointer, destination)
         return destination
     except OSError as exc:
         raise BundleError(f"could not install model bundle: {exc}") from exc
@@ -351,8 +395,6 @@ def fetch_bundle(
         pointer.unlink(missing_ok=True)
         if not published:
             shutil.rmtree(version_dir, ignore_errors=True)
-            if legacy_backup is not None and not destination.exists():
-                legacy_backup.rename(destination)
 
 
 def license_records(bundle_dir: str | Path | None = None) -> list[dict]:
