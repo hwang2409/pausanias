@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -179,6 +180,56 @@ def test_old_index_schema_is_recreated_before_indexing(tmp_path: Path, rebuild: 
     assert connection.execute("SELECT index_generation FROM sections").fetchone()[0] == generation
     connection.close()
     assert search(config, "new schema", project="phoebe")
+
+
+def test_rebuild_keeps_previous_generation_visible_until_commit(tmp_path: Path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Decision\nKeep the old generation visible.\n")
+    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    assert index(config) == 1
+
+    reset_finished = threading.Event()
+    allow_reset = threading.Event()
+    original_reset = core._reset_schema
+
+    def paused_reset(connection, generation=None):
+        original_reset(connection, generation)
+        reset_finished.set()
+        assert allow_reset.wait(timeout=5)
+
+    monkeypatch.setattr(core, "_reset_schema", paused_reset)
+    worker_errors: list[BaseException] = []
+
+    def rebuild() -> None:
+        try:
+            assert index(config, rebuild=True) == 2
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=rebuild)
+    worker.start()
+    assert reset_finished.wait(timeout=5)
+
+    reader = sqlite3.connect(config.database)
+    try:
+        assert reader.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "1"
+        assert reader.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
+        assert reader.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+    finally:
+        reader.close()
+
+    allow_reset.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert worker_errors == []
+    connection = connect(config.database, initialize=False)
+    try:
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "2"
+        assert connection.execute("SELECT count(*) FROM sections").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM sections_fts").fetchone()[0] == 1
+    finally:
+        connection.close()
 
 
 def test_rebuild_and_scope_with_global_notes(tmp_path: Path):
