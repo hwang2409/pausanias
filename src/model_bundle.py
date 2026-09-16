@@ -207,9 +207,8 @@ def _license_files(manifest: Mapping[str, object]) -> tuple[BundleFile, ...]:
     return tuple(result)
 
 
-def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST) -> None:
+def _verify_bundle_root(root: Path, manifest: Mapping[str, object]) -> None:
     """Verify every declared bundle file and the installed manifest."""
-    root = Path(bundle_dir).expanduser()
     if not root.is_dir():
         raise BundleError(f"model bundle is not a directory: {root}")
     manifest_path = root / "manifest.json"
@@ -230,6 +229,39 @@ def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL
         _check_file(root, expected)
     for expected in _license_files(manifest):
         _check_file(root, expected)
+
+
+def _versions_dir(pointer: Path) -> Path:
+    return pointer.parent / "bundles" / pointer.name
+
+
+def _resolve_active_bundle(pointer: Path) -> Path:
+    if pointer.is_symlink():
+        raise BundleError(f"active model bundle pointer is a symlink: {pointer}")
+    if not pointer.is_file():
+        raise BundleError(f"active model bundle pointer is missing or not a file: {pointer}")
+    try:
+        stored = json.loads(pointer.read_text())
+    except (OSError, ValueError) as exc:
+        raise BundleError(f"active model bundle pointer is unreadable: {pointer}") from exc
+    if not isinstance(stored, dict) or stored.get("format_version") != 1:
+        raise BundleError(f"active model bundle pointer is invalid: {pointer}")
+    version = stored.get("version")
+    if not isinstance(version, str):
+        raise BundleError(f"active model bundle pointer has no version: {pointer}")
+    version_path = _relative_path(version, "active bundle version")
+    if version_path.parent != Path("."):
+        raise BundleError(f"active model bundle pointer has an invalid version: {pointer}")
+    root = _versions_dir(pointer) / version_path
+    if root.is_symlink() or not root.is_dir():
+        raise BundleError(f"active model bundle is missing: {root}")
+    return root
+
+
+def verify_bundle(bundle_dir: str | Path, manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST) -> None:
+    """Resolve the active pointer and verify every declared bundle file."""
+    root = _resolve_active_bundle(Path(bundle_dir).expanduser())
+    _verify_bundle_root(root, manifest)
 
 
 def _license_content(record: dict) -> str:
@@ -266,17 +298,20 @@ def fetch_bundle(
     destination = Path(bundle_dir).expanduser()
     if destination.exists() or destination.is_symlink():
         try:
-            verify_bundle(destination, manifest)
+            active = _resolve_active_bundle(destination)
+            _verify_bundle_root(active, manifest)
         except BundleError:
             pass
         else:
             return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    versions = destination.parent / "bundles" / destination.name
+    versions = _versions_dir(destination)
     versions.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=versions))
     version_dir = versions / f"{manifest_fingerprint(manifest)}-{uuid.uuid4().hex}"
     pointer = destination.parent / f".{destination.name}.pointer-{uuid.uuid4().hex}"
+    legacy_backup: Path | None = None
+    published = False
     try:
         for expected in expected_files:
             target = staging / expected.path
@@ -294,25 +329,30 @@ def fetch_bundle(
             indent=2,
             sort_keys=True,
         ) + "\n")
-        verify_bundle(staging, manifest)
+        _verify_bundle_root(staging, manifest)
         staging.rename(version_dir)
-        pointer.symlink_to(version_dir, target_is_directory=True)
+        if destination.is_dir() and not destination.is_symlink():
+            legacy_backup = destination.parent / f".{destination.name}.legacy-{uuid.uuid4().hex}"
+            destination.rename(legacy_backup)
+        pointer.write_text(json.dumps({"format_version": 1, "version": version_dir.name}) + "\n")
         os.replace(pointer, destination)
+        published = True
+        if legacy_backup is not None:
+            shutil.rmtree(legacy_backup, ignore_errors=True)
         return destination
-    except BundleError:
-        shutil.rmtree(staging, ignore_errors=True)
-        pointer.unlink(missing_ok=True)
-        raise
     except OSError as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        pointer.unlink(missing_ok=True)
         raise BundleError(f"could not install model bundle: {exc}") from exc
     except Exception as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        pointer.unlink(missing_ok=True)
         if isinstance(exc, BundleError):
             raise
         raise BundleError(f"could not install model bundle: {exc}") from exc
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        pointer.unlink(missing_ok=True)
+        if not published:
+            shutil.rmtree(version_dir, ignore_errors=True)
+            if legacy_backup is not None and not destination.exists():
+                legacy_backup.rename(destination)
 
 
 def license_records(bundle_dir: str | Path | None = None) -> list[dict]:
@@ -320,8 +360,8 @@ def license_records(bundle_dir: str | Path | None = None) -> list[dict]:
     if bundle_dir is None:
         manifest: Mapping[str, object] = MODEL_BUNDLE_MANIFEST
     else:
-        root = Path(bundle_dir).expanduser()
-        verify_bundle(root)
+        root = _resolve_active_bundle(Path(bundle_dir).expanduser())
+        _verify_bundle_root(root, MODEL_BUNDLE_MANIFEST)
         try:
             loaded = json.loads((root / "manifest.json").read_text())
         except (OSError, ValueError) as exc:

@@ -33,6 +33,18 @@ def fixture_manifest(source: Path) -> dict:
     }
 
 
+def write_legacy_bundle(root: Path, manifest: dict, payload: bytes) -> None:
+    root.mkdir()
+    (root / "model.bin").write_bytes(payload)
+    (root / "LICENSES").mkdir()
+    (root / "LICENSES/model.txt").write_text(manifest["licenses"][0]["notice"])
+    (root / "manifest.json").write_text(json.dumps(
+        {**manifest, "manifest_fingerprint": manifest_fingerprint(manifest)},
+        indent=2,
+        sort_keys=True,
+    ) + "\n")
+
+
 def test_fixture_bundle_is_verified_and_idempotent(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -47,8 +59,10 @@ def test_fixture_bundle_is_verified_and_idempotent(tmp_path: Path):
 
     assert fetch_bundle(destination, manifest, downloader) == destination
     verify_bundle(destination, manifest)
-    assert (destination / "LICENSES/model.txt").read_text() == "fixture license\n"
-    assert (destination / "manifest.json").read_text()
+    active = model_bundle._resolve_active_bundle(destination)
+    assert (active / "LICENSES/model.txt").read_text() == "fixture license\n"
+    assert (active / "manifest.json").read_text()
+    assert destination.is_file()
     assert fetch_bundle(destination, manifest, downloader) == destination
     assert len(downloads) == 1
 
@@ -85,7 +99,8 @@ def test_failed_replacement_keeps_previous_complete_bundle(tmp_path: Path):
     with pytest.raises(BundleError, match="model.bin"):
         fetch_bundle(destination, changed_manifest, fail_download)
     verify_bundle(destination, manifest)
-    assert (destination / "model.bin").read_bytes() == b"old bytes"
+    active = model_bundle._resolve_active_bundle(destination)
+    assert (active / "model.bin").read_bytes() == b"old bytes"
 
 
 def test_interrupted_pointer_swap_keeps_active_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -101,6 +116,8 @@ def test_interrupted_pointer_swap_keeps_active_bundle(tmp_path: Path, monkeypatc
     (changed / "model.bin").write_bytes(b"new bytes")
     changed_manifest = fixture_manifest(changed)
     real_replace = model_bundle.os.replace
+    versions = destination.parent / "bundles" / destination.name
+    old_versions = sorted(path.name for path in versions.iterdir())
 
     def interrupt(source_path: str | Path, destination_path: str | Path) -> None:
         if Path(destination_path) == destination:
@@ -112,7 +129,72 @@ def test_interrupted_pointer_swap_keeps_active_bundle(tmp_path: Path, monkeypatc
         fetch_bundle(destination, changed_manifest)
 
     verify_bundle(destination, manifest)
-    assert (destination / "model.bin").read_bytes() == b"old bytes"
+    active = model_bundle._resolve_active_bundle(destination)
+    assert (active / "model.bin").read_bytes() == b"old bytes"
+    assert sorted(path.name for path in versions.iterdir()) == old_versions
+
+
+def test_nested_relative_destination_uses_a_valid_pointer(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "model.bin").write_bytes(b"nested model bytes")
+    manifest = fixture_manifest(source)
+    destination = tmp_path / "nested" / "config" / "bundle"
+
+    fetch_bundle(destination, manifest)
+
+    verify_bundle(destination, manifest)
+    active = model_bundle._resolve_active_bundle(destination)
+    assert (active / "model.bin").read_bytes() == b"nested model bytes"
+
+
+def test_legacy_directory_is_migrated_to_a_pointer(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = b"legacy model bytes"
+    (source / "model.bin").write_bytes(payload)
+    manifest = fixture_manifest(source)
+    destination = tmp_path / "bundle"
+    write_legacy_bundle(destination, manifest, payload)
+
+    fetch_bundle(destination, manifest)
+
+    verify_bundle(destination, manifest)
+    assert destination.is_file()
+    assert not list(tmp_path.glob(f".{destination.name}.legacy-*"))
+
+
+def test_failed_publication_removes_version_and_keeps_old_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "model.bin").write_bytes(b"old bytes")
+    manifest = fixture_manifest(source)
+    destination = tmp_path / "bundle"
+    fetch_bundle(destination, manifest)
+    versions = destination.parent / "bundles" / destination.name
+    old_versions = sorted(path.name for path in versions.iterdir())
+
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    (changed / "model.bin").write_bytes(b"new bytes")
+    changed_manifest = fixture_manifest(changed)
+    real_replace = model_bundle.os.replace
+
+    def fail_publication(source_path: str | Path, destination_path: str | Path) -> None:
+        if Path(destination_path) == destination:
+            raise OSError("publication interrupted")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(model_bundle.os, "replace", fail_publication)
+    with pytest.raises(BundleError, match="publication interrupted"):
+        fetch_bundle(destination, changed_manifest)
+
+    verify_bundle(destination, manifest)
+    active = model_bundle._resolve_active_bundle(destination)
+    assert (active / "model.bin").read_bytes() == b"old bytes"
+    assert sorted(path.name for path in versions.iterdir()) == old_versions
 
 
 def test_tampered_manifest_body_is_rejected(tmp_path: Path):
@@ -123,9 +205,10 @@ def test_tampered_manifest_body_is_rejected(tmp_path: Path):
     destination = tmp_path / "bundle"
     fetch_bundle(destination, manifest)
 
-    stored = json.loads((destination / "manifest.json").read_text())
+    active = model_bundle._resolve_active_bundle(destination)
+    stored = json.loads((active / "manifest.json").read_text())
     stored["model_id"] = "fixture/tampered"
-    (destination / "manifest.json").write_text(json.dumps(stored))
+    (active / "manifest.json").write_text(json.dumps(stored))
 
     with pytest.raises(BundleError, match="manifest"):
         verify_bundle(destination, manifest)
@@ -138,7 +221,8 @@ def test_tampered_license_is_rejected(tmp_path: Path):
     manifest = fixture_manifest(source)
     destination = tmp_path / "bundle"
     fetch_bundle(destination, manifest)
-    (destination / "LICENSES/model.txt").write_text("tampered license\n")
+    active = model_bundle._resolve_active_bundle(destination)
+    (active / "LICENSES/model.txt").write_text("tampered license\n")
 
     with pytest.raises(BundleError, match="LICENSES/model.txt"):
         verify_bundle(destination, manifest)
@@ -177,7 +261,7 @@ def test_license_command_uses_configured_bundle(tmp_path: Path, capsys):
     )
 
     assert main(["--config", str(config), "model", "license"]) == 2
-    assert "not a directory" in capsys.readouterr().err
+    assert "active model bundle pointer" in capsys.readouterr().err
 
 
 def test_status_reports_missing_optional_model(tmp_path: Path, capsys):

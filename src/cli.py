@@ -85,7 +85,7 @@ def _model_status(bundle_dir: str | Path) -> dict:
     path = Path(bundle_dir).expanduser()
     runtime_version = package_version("onnxruntime")
     numpy_version = package_version("numpy")
-    bundle_present = path.is_dir()
+    bundle_present = path.is_file() and not path.is_symlink()
     manifest_valid = False
     manifest_error = None
     if bundle_present:
