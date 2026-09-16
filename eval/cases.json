@@ -1,0 +1,375 @@
+{
+  "status": "DRAFT: pending human review; worker authorship does not satisfy the design review requirement.",
+  "cases": [
+    {
+      "id": "prior-sandbox-image",
+      "query": "ubuntu-24.04 supported build runners",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/decisions/sandbox-image.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the prior decision and its build reproducibility rationale"
+    },
+    {
+      "id": "prior-retrieval-boundary",
+      "query": "retrieved text permission act",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/decisions/retrieval-boundary.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "finds the evidence boundary decision"
+    },
+    {
+      "id": "exact-pho-123",
+      "query": "PHO-123",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/tickets/PHO-123.md"],
+      "forbidden_paths": ["phoebe/tickets/PHO-124.md"],
+      "abstain": false,
+      "rationale": "preserves an exact ticket identifier"
+    },
+    {
+      "id": "exact-paus-2",
+      "query": "PAUS-2",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/tickets/PAUS-2.md"],
+      "forbidden_paths": ["pausanias/tickets/PAUS-3.md"],
+      "abstain": false,
+      "rationale": "distinguishes the accuracy ticket from its benchmark neighbor"
+    },
+    {
+      "id": "exact-paus-3",
+      "query": "PAUS-3",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/tickets/PAUS-3.md"],
+      "forbidden_paths": ["pausanias/tickets/PAUS-2.md"],
+      "abstain": false,
+      "rationale": "retrieves the performance ticket by identifier"
+    },
+    {
+      "id": "exact-atl-88",
+      "query": "ATL-88",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/tickets/ATL-88.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves an exact ticket from atlas"
+    },
+    {
+      "id": "exact-bcn-7",
+      "query": "BCN-7",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/tickets/BCN-7.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves an exact ticket from beacon"
+    },
+    {
+      "id": "paraphrase-worker-isolation",
+      "query": "separate worktrees status files",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/concepts/worker-isolation.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "matches a paraphrased concept using its supporting terms"
+    },
+    {
+      "id": "paraphrase-stale-source",
+      "query": "indexed content hash current source hash",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/concepts/stale-hash.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "finds the stale-source verification concept"
+    },
+    {
+      "id": "packet-budget-project",
+      "query": "retrieval packet excerpts budget",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/decisions/packet-budget.md"],
+      "forbidden_paths": ["atlas/near-miss/packet-budget.md"],
+      "abstain": false,
+      "rationale": "selects the project decision over a same-term note"
+    },
+    {
+      "id": "packet-budget-root",
+      "query": "packet budget excerpts",
+      "scope": {"root": "pausanias"},
+      "expected_source_paths": ["pausanias/decisions/packet-budget.md"],
+      "forbidden_paths": ["atlas/near-miss/packet-budget.md"],
+      "abstain": false,
+      "rationale": "tests root scope filtering"
+    },
+    {
+      "id": "global-deployment-phoebe",
+      "query": "staged deployment checklist",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["shared/team-decisions.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "allows an explicit global note in a project query"
+    },
+    {
+      "id": "global-security-atlas",
+      "query": "secrets shell actions policy bypasses",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["shared/security-boundaries.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves a global security boundary"
+    },
+    {
+      "id": "changed-notification-preference",
+      "query": "weekly digest routine build notifications",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": ["phoebe/preferences/notification-style.md"],
+      "forbidden_paths": ["phoebe/preferences/old-notification-style.md"],
+      "abstain": false,
+      "rationale": "returns the current preference and rejects its superseded pair"
+    },
+    {
+      "id": "conflicting-cache-retention",
+      "query": "cache retention",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/decisions/cache-retention.md", "atlas/notes/retention-exception.md", "atlas/tickets/ATL-88.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "preserves the default, exception, and alert claims together"
+    },
+    {
+      "id": "wrong-project-sandbox",
+      "query": "ubuntu-24.04 supported build runners",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": [],
+      "forbidden_paths": ["phoebe/decisions/sandbox-image.md"],
+      "abstain": true,
+      "rationale": "does not cross a project boundary for an unrelated decision"
+    },
+    {
+      "id": "wrong-project-email",
+      "query": "Postmark email provider",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": [],
+      "forbidden_paths": ["beacon/decisions/email-provider.md"],
+      "abstain": true,
+      "rationale": "rejects a beacon source during an atlas query"
+    },
+    {
+      "id": "deleted-email-provider",
+      "query": "Postmark email provider migration",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": [],
+      "forbidden_paths": ["beacon/decisions/email-provider.md"],
+      "abstain": true,
+      "rationale": "skips an indexed source after the authoritative file is deleted",
+      "delete_sources": ["beacon/decisions/email-provider.md"]
+    },
+    {
+      "id": "ambiguous-follow-up",
+      "query": "what about that",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "search-only evaluation lacks the history needed to resolve the reference"
+    },
+    {
+      "id": "ambiguous-history-follow-up",
+      "query": "what about that decision",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "marks an unresolved short follow-up as out of scope for search-only evaluation"
+    },
+    {
+      "id": "private-path-abstention",
+      "query": "private token credential",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": [],
+      "forbidden_paths": ["pausanias/private/credentials.md"],
+      "abstain": true,
+      "rationale": "never returns a configured private path"
+    },
+    {
+      "id": "no-relevant-memory",
+      "query": "quantum orchard",
+      "scope": {"all_projects": true},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "returns no packet when the corpus has no relevant evidence"
+    },
+    {
+      "id": "no-relevant-ticket",
+      "query": "FOO-123",
+      "scope": {"all_projects": true},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "does not invent evidence for an unknown ticket"
+    },
+    {
+      "id": "decision-fts-backend",
+      "query": "SQLite FTS5 local rebuildable",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/decisions/fts-backend.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the backend decision and its rationale"
+    },
+    {
+      "id": "decision-export-format",
+      "query": "newline-delimited JSON streaming",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/decisions/export-format.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the export format decision"
+    },
+    {
+      "id": "decision-tenant-boundary",
+      "query": "tenant configured project root",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/decisions/tenant-boundary.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the tenant scope decision"
+    },
+    {
+      "id": "concept-scope-filter",
+      "query": "project scope global similarity",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/concepts/scope-filter.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the configured scope rule"
+    },
+    {
+      "id": "concept-index-rebuild",
+      "query": "transaction complete generation readers",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/concepts/rebuild.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the transactional rebuild concept"
+    },
+    {
+      "id": "concept-turn-idempotence",
+      "query": "same turn id packet",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/concepts/idempotence.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves duplicate-turn behavior"
+    },
+    {
+      "id": "concept-timeout",
+      "query": "deadline user turn memory packet",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/concepts/timeout.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves bounded timeout behavior"
+    },
+    {
+      "id": "concept-query-latency",
+      "query": "warm local query latency index refresh",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": ["atlas/concepts/latency.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the separate retrieval latency concept"
+    },
+    {
+      "id": "local-search-boundary",
+      "query": "local full-text remote embedding",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/notes/remote-search.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves the local-only search note"
+    },
+    {
+      "id": "accessibility-note",
+      "query": "keyboard focus navigation",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["beacon/notes/accessibility.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves a relevant operational note"
+    },
+    {
+      "id": "global-deployment-beacon",
+      "query": "staged deployment checklist",
+      "scope": {"project": "beacon"},
+      "expected_source_paths": ["shared/team-decisions.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "confirms global notes work across another project"
+    },
+    {
+      "id": "global-security-root",
+      "query": "retrieved note secrets shell actions",
+      "scope": {"root": "atlas"},
+      "expected_source_paths": ["shared/security-boundaries.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "allows a global note during root-scoped retrieval"
+    },
+    {
+      "id": "adversarial-note-boundary",
+      "query": "evidence outdated instruction secrets",
+      "scope": {"all_projects": true},
+      "expected_source_paths": ["shared/security-boundaries.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves adversarial note text as evidence without granting authority"
+    },
+    {
+      "id": "cross-project-ticket-search",
+      "query": "ATL-88",
+      "scope": {"all_projects": true},
+      "expected_source_paths": ["atlas/tickets/ATL-88.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "allows explicit all-project retrieval for an exact identifier"
+    },
+    {
+      "id": "old-plan-abstention",
+      "query": "customer contract archaeology",
+      "scope": {"project": "phoebe"},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "abstains when no project note supports the topic"
+    },
+    {
+      "id": "history-out-of-scope",
+      "query": "and then",
+      "scope": {"project": "atlas"},
+      "expected_source_paths": [],
+      "forbidden_paths": [],
+      "abstain": true,
+      "rationale": "does not infer prior-turn context from a search-only prompt"
+    },
+    {
+      "id": "source-version-refresh",
+      "query": "skips changed notes index refresh",
+      "scope": {"project": "pausanias"},
+      "expected_source_paths": ["pausanias/concepts/stale-hash.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "finds the rule for changed source versions"
+    },
+    {
+      "id": "global-note-explicit-all-projects",
+      "query": "global note support project query",
+      "scope": {"all_projects": true},
+      "expected_source_paths": ["shared/team-decisions.md"],
+      "forbidden_paths": [],
+      "abstain": false,
+      "rationale": "retrieves a global note during explicit cross-project search"
+    }
+  ]
+}
