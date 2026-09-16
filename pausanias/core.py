@@ -276,15 +276,32 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     try:
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
+        global_condition = f"s.canonical_path IN ({placeholders(scope_paths)})"
         if root_id:
-            conditions.append(
-                f"(s.root_id = ? OR s.canonical_path IN ({placeholders(scope_paths)}))"
-            )
-            params.append(root_id)
+            if effective_project and not all_projects:
+                conditions.append(f"((s.root_id = ? AND s.project_scope = ?) OR {global_condition})")
+                params.extend((root_id, effective_project))
+            else:
+                conditions.append(f"(s.root_id = ? OR {global_condition})")
+                params.append(root_id)
             params.extend(scope_paths)
+        elif effective_project and not all_projects:
+            if scope_root_ids:
+                conditions.append(
+                    f"((s.root_id IN ({placeholders(scope_root_ids)}) AND s.project_scope = ?)"
+                    f" OR {global_condition})"
+                )
+                params.extend(scope_root_ids)
+                params.append(effective_project)
+                params.extend(scope_paths)
+            elif scope_paths:
+                conditions.append(global_condition)
+                params.extend(scope_paths)
+            else:
+                conditions.append("0")
         elif scope_paths and scope_root_ids:
             conditions.append(
-                f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
+                f"(s.root_id IN ({placeholders(scope_root_ids)}) OR {global_condition})"
             )
             params.extend(scope_root_ids)
             params.extend(scope_paths)
@@ -292,7 +309,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
             conditions.append(f"s.root_id IN ({placeholders(scope_root_ids)})")
             params.extend(scope_root_ids)
         elif scope_paths:
-            conditions.append(f"s.canonical_path IN ({placeholders(scope_paths)})")
+            conditions.append(global_condition)
             params.extend(scope_paths)
         else:
             conditions.append("0")

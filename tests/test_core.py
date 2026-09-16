@@ -386,6 +386,24 @@ def test_cli_root_scope_includes_global_notes_from_any_root(tmp_path: Path, caps
     assert {result["path"] for result in project_results} == {str(inside_global.resolve()), str(global_note.resolve())}
 
 
+def test_root_project_scope_filters_before_candidate_limit(tmp_path: Path):
+    alpha = tmp_path / "alpha"
+    beta = tmp_path / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    for number in range(150):
+        (alpha / f"alpha-{number}.md").write_text(f"# Alpha {number}\nneedle alpha match\n")
+    global_note = beta / "global.md"
+    global_note.write_text("# Shared\nneedle global match\n")
+    config = make_config(tmp_path, [("a", "alpha", alpha), ("b", "beta", beta)], [global_note])
+    index(config)
+
+    results = search(config, "needle", project="beta", root_id="a", limit=1)
+
+    assert [result.canonical_path for result in results] == [str(global_note.resolve())]
+    assert search(config, "alpha", project="beta", root_id="a") == []
+
+
 def test_selection_reason_matches_heading_tokens_only(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
