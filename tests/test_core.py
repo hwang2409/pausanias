@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 
 import pytest
 
@@ -54,6 +55,27 @@ def test_splitter_keeps_missing_dates_unknown_and_caps_long_sections():
     assert all(section.heading_path == ("A",) for section in document.sections)
 
 
+def test_splitter_ignores_fenced_headings_and_preserves_trailing_hashes():
+    document = split_markdown("/notes/a.md", """# Real
+```
+# not a heading
+```
+~~~
+# also not a heading
+~~~
+# C#
+# Trailing ###
+""")
+    assert [section.heading for section in document.sections] == ["Real", "C#", "Trailing"]
+
+
+def test_splitter_minimum_byte_cap_keeps_codepoints_intact():
+    document = split_markdown("/notes/a.md", "# A\né😀\n", max_bytes=1)
+    assert "é" in "".join(section.text for section in document.sections)
+    assert "😀" in "".join(section.text for section in document.sections)
+    assert all(len(section.text.encode()) <= 4 for section in document.sections)
+
+
 def test_links_and_index_lifecycle(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
@@ -97,6 +119,45 @@ def test_rebuild_and_scope_with_global_notes(tmp_path: Path):
     assert index(config, rebuild=True) == 2
 
 
+def test_scope_change_takes_effect_without_reindex(tmp_path: Path):
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    note = one / "global.md"
+    note.write_text("# Shared\nshared scope change\n")
+    config = make_config(tmp_path, [("one", "alpha", one), ("two", "beta", two)], [note])
+    index(config)
+    assert search(config, "scope change", project="beta")
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("\n".join([
+        f'database = "{config.database}"',
+        "",
+        "[[roots]]",
+        f'id = "one"',
+        'project = "alpha"',
+        f'path = "{one}"',
+        "",
+        "[[roots]]",
+        f'id = "two"',
+        'project = "beta"',
+        f'path = "{two}"',
+    ]))
+    current_config = load_config(config_path)
+    assert search(current_config, "scope change", project="beta") == []
+
+
+def test_crlf_hash_is_verified_from_raw_bytes(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_bytes(b"# Terms\r\nold plan\r\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    assert search(config, "old plan", project="p")
+
+
 def test_adversarial_fts_queries_are_safe(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
@@ -106,6 +167,29 @@ def test_adversarial_fts_queries_are_safe(tmp_path: Path):
     for query in ['"', "*", "NEAR", "(", ")", 'one" OR *']:
         search(config, query, project="p")
     assert search(config, "NEAR", project="p")[0].heading == "Terms"
+
+
+def test_quoted_query_preserves_phrase_meaning_and_caps_terms(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Terms\nold unrelated plan\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    assert search(config, '"old plan"', project="p") == []
+    started = time.perf_counter()
+    results = search(config, "term " * 100_000, project="p")
+    elapsed = time.perf_counter() - started
+    assert len(results) <= 20
+    assert elapsed < 1
+
+
+def test_selection_reason_reports_body_match(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Decision\nbody-only phrase\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    assert search(config, "body-only", project="p")[0].reason == "body match"
 
 
 def test_symlink_escape_is_skipped_in_index_and_read(tmp_path: Path):
@@ -170,3 +254,17 @@ def test_config_excludes_credentials_and_private_globs(tmp_path: Path):
     assert search(config, "secret", project="p") == []
     assert search(config, "private", project="p") == []
     assert search(config, "public", project="p")
+
+
+def test_private_parent_exclusion_applies_to_read(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    private = root / "private"
+    private.mkdir()
+    note = private / "secret.md"
+    note.write_text("secret")
+    config = make_config(tmp_path, [("vault", "p", root)], private=["private"])
+    assert config.is_excluded(private, config.roots[0])
+    assert config.is_excluded(note, config.roots[0])
+    with pytest.raises(ValueError, match="outside allowed roots"):
+        read_source(config, str(note))

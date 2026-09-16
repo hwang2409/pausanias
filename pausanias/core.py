@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import hashlib
 import json
 import os
 import re
@@ -10,7 +9,11 @@ import sqlite3
 import time
 
 from .config import Config, Root, _contained
-from .splitter import explicit_links, split_markdown
+from .splitter import content_hash, explicit_links, split_markdown
+
+
+MAX_QUERY_TERMS = 64
+MAX_CANDIDATES = 200
 
 
 SCHEMA = """
@@ -61,14 +64,17 @@ class Candidate:
     updated_date: str | None
     created_date: str | None
     score: float
+    reason: str
 
 
-def connect(database: Path) -> sqlite3.Connection:
-    database.parent.mkdir(parents=True, exist_ok=True)
+def connect(database: Path, initialize: bool = True) -> sqlite3.Connection:
+    if initialize:
+        database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    connection.executescript(SCHEMA)
+    if initialize:
+        connection.executescript(SCHEMA)
     return connection
 
 
@@ -116,8 +122,9 @@ def index(config: Config, rebuild: bool = False) -> int:
         for canonical, (root, path) in found.items():
             stat = path.stat()
             old = existing.get(canonical)
-            content = path.read_text(encoding="utf-8")
-            document = split_markdown(canonical, content, config.section_bytes)
+            raw_bytes = path.read_bytes()
+            content = raw_bytes.decode("utf-8")
+            document = split_markdown(canonical, content, config.section_bytes, raw_bytes)
             if old and old["root_id"] == root.id and old["mtime_ns"] == stat.st_mtime_ns and old["content_hash"] == document.content_hash:
                 connection.execute("UPDATE sections SET index_generation = ?, project_scope = ?, is_global = ? WHERE canonical_path = ?",
                                    (generation, root.project, int(config.is_global(Path(canonical))), canonical))
@@ -172,7 +179,8 @@ def read_source(config: Config, raw_path: str, heading: str | None = None, max_b
     if source is None:
         raise ValueError(f"path is outside allowed roots or does not exist: {raw_path}")
     _, path = source
-    content = path.read_text(encoding="utf-8")
+    raw_bytes = path.read_bytes()
+    content = raw_bytes.decode("utf-8")
     if heading is not None:
         document = split_markdown(str(path), content, max(max_bytes, 256))
         matches = [section for section in document.sections if section.heading == heading or " > ".join(section.heading_path) == heading]
@@ -192,9 +200,40 @@ def read_source(config: Config, raw_path: str, heading: str | None = None, max_b
 
 
 def _fts_query(query: str) -> tuple[str, list[str]]:
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", query, flags=re.UNICODE)
-    tokens = [token for token in tokens if token]
-    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens), tokens
+    token_pattern = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
+    clauses: list[str] = []
+    tokens: list[str] = []
+
+    def add_tokens(value: str, phrase: bool) -> bool:
+        found = token_pattern.findall(value)
+        remaining = MAX_QUERY_TERMS - len(tokens)
+        if remaining <= 0:
+            return False
+        found = found[:remaining]
+        if found:
+            if phrase:
+                clauses.append('"' + " ".join(found).replace('"', '""') + '"')
+            else:
+                clauses.extend('"' + token.replace('"', '""') + '"' for token in found)
+            tokens.extend(found)
+        return len(tokens) < MAX_QUERY_TERMS
+
+    position = 0
+    while position < len(query) and len(tokens) < MAX_QUERY_TERMS:
+        quote = query.find('"', position)
+        if quote < 0:
+            add_tokens(query[position:], False)
+            break
+        if not add_tokens(query[position:quote], False):
+            break
+        closing = query.find('"', quote + 1)
+        if closing < 0:
+            add_tokens(query[quote + 1:], False)
+            break
+        if not add_tokens(query[quote + 1:closing], True):
+            break
+        position = closing + 1
+    return " AND ".join(clauses), tokens
 
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
@@ -204,51 +243,118 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     fts, tokens = _fts_query(query)
     if not fts:
         return []
-    connection = connect(config.database)
+    if not config.database.exists():
+        return []
+
+    if root_id and not any(root.id == root_id for root in config.roots):
+        return []
+    global_paths = sorted(str(path) for path in config.global_notes)
+    if project and not all_projects:
+        scope_root_ids = [root.id for root in config.roots if root.project == project]
+        scope_paths = global_paths
+    elif project is None and not all_projects:
+        scope_root_ids = []
+        scope_paths = global_paths
+    else:
+        scope_root_ids = [root.id for root in config.roots]
+        scope_paths = global_paths
+
+    def placeholders(values: list[str]) -> str:
+        return ", ".join("?" for _ in values) or "NULL"
+
+    connection = connect(config.database, initialize=False)
     try:
         conditions = ["sections_fts MATCH ?"]
         params: list[object] = [fts]
         if root_id:
             conditions.append("s.root_id = ?")
             params.append(root_id)
-        if project and not all_projects:
-            conditions.append("(s.project_scope = ? OR s.is_global = 1)")
-            params.append(project)
-        elif project is None and not all_projects:
-            conditions.append("s.is_global = 1")
+            if project and not all_projects:
+                conditions.append(
+                    f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
+                )
+                params.extend(scope_root_ids)
+                params.extend(scope_paths)
+            elif project is None and not all_projects:
+                conditions.append(f"s.canonical_path IN ({placeholders(scope_paths)})")
+                params.extend(scope_paths)
+        elif scope_paths and scope_root_ids:
+            conditions.append(
+                f"(s.root_id IN ({placeholders(scope_root_ids)}) OR s.canonical_path IN ({placeholders(scope_paths)}))"
+            )
+            params.extend(scope_root_ids)
+            params.extend(scope_paths)
+        elif scope_root_ids:
+            conditions.append(f"s.root_id IN ({placeholders(scope_root_ids)})")
+            params.extend(scope_root_ids)
+        elif scope_paths:
+            conditions.append(f"s.canonical_path IN ({placeholders(scope_paths)})")
+            params.extend(scope_paths)
+        else:
+            conditions.append("0")
         rows = connection.execute(
             "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
-            + " AND ".join(conditions) + " ORDER BY fts_score LIMIT ?", (*params, max(limit * 20, 100))).fetchall()
+            + " AND ".join(conditions) + " ORDER BY fts_score LIMIT ?", (*params, min(MAX_CANDIDATES, max(limit * 5, 50)))).fetchall()
     finally:
         connection.close()
 
     results: list[Candidate] = []
+    source_cache: dict[str, tuple[Root, Path] | None] = {}
+    hash_cache: dict[str, str | None] = {}
     for row in rows:
-        source = _safe_source(config, row["canonical_path"])
+        canonical = row["canonical_path"]
+        if canonical not in source_cache:
+            source_cache[canonical] = _safe_source(config, canonical)
+        source = source_cache[canonical]
         if source is None:
             if refresh is not None:
-                refresh.add(row["canonical_path"])
+                refresh.add(canonical)
             continue
-        try:
-            current_hash = hashlib.sha256(source[1].read_bytes()).hexdigest()
-        except OSError:
+        current_root = source[0]
+        if root_id and current_root.id != root_id:
+            continue
+        if not all_projects:
+            is_global = config.is_global(source[1])
+            if project is None:
+                if not is_global:
+                    continue
+            elif current_root.project != project and not is_global:
+                continue
+        if canonical not in hash_cache:
+            try:
+                hash_cache[canonical] = content_hash(source[1].read_bytes())
+            except OSError:
+                hash_cache[canonical] = None
+        current_hash = hash_cache[canonical]
+        if current_hash is None:
             if refresh is not None:
-                refresh.add(row["canonical_path"])
+                refresh.add(canonical)
             continue
         if current_hash != row["content_hash"]:
             if refresh is not None:
-                refresh.add(row["canonical_path"])
+                refresh.add(canonical)
             continue
         heading_path = tuple(filter(None, row["heading_path"].split("\n")))
         lower_tokens = [token.lower() for token in tokens]
-        haystack = (row["heading"] or "").lower() + " " + row["text"].lower()
+        heading_text = (row["heading"] or "").lower()
+        body_text = row["text"].lower()
+        haystack = heading_text + " " + body_text
         identifier_boost = sum(2.0 for token in lower_tokens if re.fullmatch(r"[a-z]{2,}-\d+", token) and token in haystack)
-        heading_boost = sum(0.75 for token in lower_tokens if token in (row["heading"] or "").lower())
+        heading_matches = any(token in heading_text for token in lower_tokens)
+        body_matches = any(token in body_text for token in lower_tokens)
+        heading_boost = sum(0.75 for token in lower_tokens if token in heading_text)
         score = -float(row["fts_score"]) + identifier_boost + heading_boost
-        results.append(Candidate(row["section_id"], row["canonical_path"], row["heading"], heading_path,
-                                 row["line_start"], row["line_end"], row["root_id"], row["project_scope"],
+        reasons: list[str] = []
+        if identifier_boost:
+            reasons.append("identifier match")
+        if heading_matches:
+            reasons.append("heading match")
+        if body_matches:
+            reasons.append("body match")
+        results.append(Candidate(row["section_id"], canonical, row["heading"], heading_path,
+                                 row["line_start"], row["line_end"], current_root.id, current_root.project,
                                  row["text"], row["content_hash"], row["note_type"], row["updated_date"],
-                                 row["created_date"], score))
+                                 row["created_date"], score, ", ".join(reasons) or "text match"))
     results.sort(key=lambda item: item.score, reverse=True)
     return results[:limit]
 

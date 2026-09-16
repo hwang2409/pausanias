@@ -29,7 +29,12 @@ class SplitDocument:
     content_hash: str
 
 
-HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
+FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+def content_hash(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 LINK = re.compile(r"!?(?:\[[^\]]*\]\(([^)\s]+)[^)]*\)|\[\[([^|\]#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\])")
 
 
@@ -50,6 +55,7 @@ def parse_frontmatter(lines: list[str]) -> tuple[Frontmatter, int]:
 
 
 def _split_body(lines: list[str], start: int, end: int, max_bytes: int) -> list[tuple[int, int, str]]:
+    max_bytes = max(max_bytes, 4)
     body = lines[start:end]
     full = "".join(body).strip()
     if len(full.encode("utf-8")) <= max_bytes:
@@ -98,14 +104,28 @@ def _split_body(lines: list[str], start: int, end: int, max_bytes: int) -> list[
     return chunks
 
 
-def split_markdown(path: str, content: str, max_bytes: int = 12000) -> SplitDocument:
+def split_markdown(path: str, content: str, max_bytes: int = 12000, raw_bytes: bytes | None = None) -> SplitDocument:
     lines = content.splitlines(keepends=True)
     frontmatter, content_start = parse_frontmatter(lines)
     headings: list[tuple[int, int, str]] = []
+    fence_char: str | None = None
+    fence_length = 0
     for index in range(content_start, len(lines)):
-        match = HEADING.match(lines[index].rstrip("\r\n"))
+        line = lines[index].rstrip("\r\n")
+        fence = FENCE.match(line)
+        if fence_char is not None:
+            if fence and fence.group(1)[0] == fence_char and len(fence.group(1)) >= fence_length:
+                fence_char = None
+            continue
+        if fence:
+            fence_char = fence.group(1)[0]
+            fence_length = len(fence.group(1))
+            continue
+        match = HEADING.match(line)
         if match:
-            headings.append((index, len(match.group(1)), match.group(2).strip()))
+            heading = match.group(2).strip()
+            heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading).rstrip()
+            headings.append((index, len(match.group(1)), heading))
 
     boundaries: list[tuple[int, int, tuple[str, ...], str | None, int]] = []
     stack: list[tuple[int, str]] = []
@@ -140,7 +160,7 @@ def split_markdown(path: str, content: str, max_bytes: int = 12000) -> SplitDocu
             section_id = hashlib.sha256(f"{canonical}\0{identity}{suffix}".encode()).hexdigest()
             line_start = display_start + 1 if part_index == 0 else part_start + 1
             sections.append(Section(section_id, heading, ancestry, line_start, part_end, text))
-    return SplitDocument(frontmatter, tuple(sections), hashlib.sha256(content.encode("utf-8")).hexdigest())
+    return SplitDocument(frontmatter, tuple(sections), content_hash(raw_bytes if raw_bytes is not None else content.encode("utf-8")))
 
 
 def explicit_links(content: str) -> list[str]:

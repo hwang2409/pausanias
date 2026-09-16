@@ -41,19 +41,24 @@ class Config:
         resolved = _resolve(path, strict=False)
         if not _contained(resolved, root.path):
             return True
-        if _credential_name(resolved.name):
-            return True
-        for private in self.private_paths:
-            private_path = Path(private).expanduser()
-            if private_path.is_absolute() and _resolve(private_path, strict=False) == resolved:
+        relative_parts = resolved.relative_to(root.path).parts
+        for end in range(1, len(relative_parts) + 1):
+            ancestor = root.path.joinpath(*relative_parts[:end])
+            relative = ancestor.relative_to(root.path).as_posix()
+            if _credential_name(ancestor.name):
                 return True
-            relative = resolved.relative_to(root.path).as_posix()
-            if (fnmatch.fnmatch(str(resolved), private) or fnmatch.fnmatch(relative, private)
-                    or fnmatch.fnmatch(resolved.name, private)):
+            for private in self.private_paths:
+                private_path = Path(private).expanduser()
+                if private_path.is_absolute() and _resolve(private_path, strict=False) == ancestor:
+                    return True
+                if (fnmatch.fnmatch(str(ancestor), private)
+                        or fnmatch.fnmatch(relative, private)
+                        or fnmatch.fnmatch(ancestor.name, private)):
+                    return True
+            if any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(ancestor.name, pattern)
+                   for pattern in root.excludes):
                 return True
-        relative = resolved.relative_to(root.path).as_posix()
-        return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(resolved.name, pattern)
-                   for pattern in root.excludes)
+        return False
 
 
 def _resolve(path: Path, *, strict: bool) -> Path:

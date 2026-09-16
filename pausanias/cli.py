@@ -39,7 +39,7 @@ def _result(candidate) -> dict:
         "line_range": [candidate.line_start, candidate.line_end],
         "dates": {"updated": candidate.updated_date, "created": candidate.created_date},
         "score": candidate.score,
-        "reason": "matched indexed text and heading" if candidate.heading else "matched indexed text",
+        "reason": candidate.reason,
         "content_hash": candidate.content_hash,
     }
 
