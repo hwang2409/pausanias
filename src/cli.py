@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import excerpt, fusion_diagnostics, index, read_source, search, semantic_index_state
+from .core import excerpt, fusion_diagnostics, index, read_source
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -162,18 +162,13 @@ def _configured_bundle(args) -> Path:
     return load_config(args.config).bundle_dir
 
 
-def _search_diagnostics(config: Config, requested_mode: str) -> dict[str, object]:
-    semantic_state, semantic_reason = semantic_index_state(config)
-    backend_available = semantic_backend_reason(config) is None
-    effective_mode = "lexical"
-    if requested_mode == "fused" and backend_available and semantic_state == "ready":
-        effective_mode = "fused"
+def _search_diagnostics(requested_mode: str, metrics) -> dict[str, object]:
     return {
         "requested_mode": requested_mode,
-        "retrieval_mode": effective_mode,
-        "semantic_state": semantic_state,
-        "semantic_reason": semantic_reason,
-        "fallback": effective_mode != requested_mode,
+        "retrieval_mode": metrics.retrieval_mode,
+        "semantic_state": metrics.semantic_state,
+        "semantic_reason": metrics.failure_reason or metrics.disabled_reason,
+        "fallback": metrics.fallback,
     }
 
 
@@ -267,27 +262,31 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = load_config(args.config)
             selected_mode = args.retrieval_mode or "fused"
+            response = run_hook(
+                config,
+                args.config,
+                args.query,
+                args.project,
+                args.root,
+                args.all_projects,
+                args.limit,
+                retrieval_mode=selected_mode,
+            )
             results = [
                 _result(
                     item,
                     diagnostics=args.diagnostics,
                     config=config,
-                    retrieval_mode=(
-                        "lexical" if selected_mode == "lexical"
-                        else "fused" if item.fused_score is not None else "lexical"
-                    ),
+                    retrieval_mode=response.metrics.retrieval_mode,
                 )
-                for item in search(
-                    config, args.query, args.project, args.root, args.all_projects, args.limit,
-                    semantic=selected_mode == "fused",
-                )
+                for item in response.candidates
             ]
             if args.json:
                 payload: object = results
                 if _include_search_diagnostics(config, selected_mode, args.diagnostics):
                     payload = {
                         "items": results,
-                        "diagnostics": _search_diagnostics(config, selected_mode),
+                        "diagnostics": _search_diagnostics(selected_mode, response.metrics),
                     }
                 print(json.dumps(payload, ensure_ascii=False))
             else:

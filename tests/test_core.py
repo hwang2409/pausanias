@@ -10,10 +10,13 @@ import time
 import pytest
 
 import pausanias.core as core
+import pausanias.hook as hook
 from pausanias.cli import main
 from pausanias.config import Config, ConfigError, load_config
 from pausanias.core import connect, index, read_source, search
+from pausanias.hook import HookResponse
 from pausanias.splitter import explicit_links, split_markdown
+from pausanias.worker import HookMetrics, PersistentWorker, socket_ready, worker_paths
 
 
 def make_config(
@@ -666,13 +669,21 @@ def test_cli_diagnostics_report_ready_state(tmp_path: Path, capsys, monkeypatch:
 
     core.index(config, encoder=Encoder())
     monkeypatch.setattr("pausanias.cli.semantic_backend_reason", lambda config: None)
+    monkeypatch.setattr(
+        "pausanias.cli.run_hook",
+        lambda *args, **kwargs: HookResponse(
+            [], HookMetrics(retrieval_mode="fused", semantic_state="ready"),
+        ),
+    )
     main([
-        "--config", str(config_path), "search", "sqlite", "--project", "p", "--json",
+        "--config", str(config_path), "search", "sqlite", "--project", "p",
+        "--diagnostics", "--json",
     ])
 
     payload = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert payload["diagnostics"]["semantic_state"] == "ready"
     assert payload["diagnostics"]["retrieval_mode"] == "fused"
+    assert payload["diagnostics"]["fallback"] is False
 
 
 def test_cli_diagnostics_report_stale_reason(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
@@ -695,14 +706,69 @@ def test_cli_diagnostics_report_stale_reason(tmp_path: Path, capsys, monkeypatch
     note.write_text("# Choice\nnew sqlite.\n")
     core.index(config, encoder=FailingEncoder())
     monkeypatch.setattr("pausanias.cli.semantic_backend_reason", lambda config: None)
+    monkeypatch.setattr(
+        "pausanias.cli.run_hook",
+        lambda *args, **kwargs: HookResponse(
+            [], HookMetrics(
+                fallback=True,
+                failure_reason="REFRESH_FAILED",
+                semantic_state="stale",
+                retrieval_mode="lexical",
+            ),
+        ),
+    )
     main([
-        "--config", str(config_path), "search", "sqlite", "--project", "p", "--json",
+        "--config", str(config_path), "search", "sqlite", "--project", "p",
+        "--diagnostics", "--json",
     ])
 
     payload = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert payload["diagnostics"]["semantic_state"] == "stale"
     assert payload["diagnostics"]["semantic_reason"] == "REFRESH_FAILED"
     assert payload["diagnostics"]["retrieval_mode"] == "lexical"
+
+
+def test_cli_diagnostics_report_encoder_failure_fallback(tmp_path: Path, capsys,
+                                                        monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+
+    class Encoder:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+    class FailingEncoder:
+        def encode(self, texts: list[str]):
+            raise RuntimeError("query encoder failed")
+
+    core.index(config, encoder=Encoder())
+    paths = worker_paths(config.database)
+    worker = PersistentWorker(config, paths, encoder=FailingEncoder(), idle_seconds=2)
+    thread = threading.Thread(target=worker.serve)
+    thread.start()
+    monkeypatch.setattr(hook, "ensure_worker", lambda *args: (paths, 0.1))
+    try:
+        deadline = time.monotonic() + 2
+        while not socket_ready(paths.socket) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert socket_ready(paths.socket)
+
+        main([
+            "--config", str(config_path), "search", "missing", "--project", "p",
+            "--diagnostics", "--json",
+        ])
+
+        payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert payload["items"] == []
+        assert payload["diagnostics"]["retrieval_mode"] == "lexical"
+        assert payload["diagnostics"]["fallback"] is True
+        assert payload["diagnostics"]["semantic_reason"]
+    finally:
+        worker._stopping.set()
+        thread.join(timeout=2)
 
 
 def test_synonym_variants_are_conservative_and_versioned(tmp_path: Path):
