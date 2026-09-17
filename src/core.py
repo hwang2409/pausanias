@@ -55,6 +55,10 @@ TICKET_ID_CROSS_REFERENCE_FILTER = True
 TICKET_ID_CROSS_REFERENCE_FILTER_RATIONALE = (
     "avoid cross-reference noise when an exact ticket query retrieves a candidate about another ticket"
 )
+BALANCED_ADMISSION = True
+BALANCED_ADMISSION_RATIONALE = (
+    "interleave unguarded lexical and semantic lanes before the union cap to preserve top candidates from both lanes"
+)
 RRF_RANK_CONSTANT = 60
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
@@ -73,6 +77,10 @@ SELECTION_POLICIES = {
         "enabled": TICKET_ID_CROSS_REFERENCE_FILTER,
         "rationale": TICKET_ID_CROSS_REFERENCE_FILTER_RATIONALE,
     },
+    "balanced_admission": {
+        "enabled": BALANCED_ADMISSION,
+        "rationale": BALANCED_ADMISSION_RATIONALE,
+    },
 }
 
 FUSION_DIAGNOSTICS = {
@@ -88,6 +96,7 @@ FUSION_DIAGNOSTICS = {
     "semantic_score_floor": SELECTION_POLICIES["semantic_score_floor"],
     "relative_semantic_score_floor": SELECTION_POLICIES["relative_semantic_score_floor"],
     "ticket_id_cross_reference_filter": SELECTION_POLICIES["ticket_id_cross_reference_filter"],
+    "balanced_admission": SELECTION_POLICIES["balanced_admission"],
 }
 
 
@@ -740,6 +749,7 @@ def _fuse_candidates(
     limit: int,
     timings: dict[str, float] | None = None,
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+    balanced_admission: bool = BALANCED_ADMISSION,
 ) -> list[Candidate]:
     started = time.perf_counter()
     candidate_limit = min(MAX_CANDIDATES, max(limit * CANDIDATE_OVERSAMPLE, MIN_CANDIDATES))
@@ -749,7 +759,7 @@ def _fuse_candidates(
         if semantic_score_floor is None or (item.vector_score or 0.0) >= semantic_score_floor
     ]
     admission: list[Candidate] = []
-    if guarded:
+    if guarded or not balanced_admission:
         admission.extend(lexical)
         admission.extend(semantic_candidates)
     else:
@@ -835,7 +845,8 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                     timings: dict[str, float] | None = None,
                     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
                     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
-                    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER) -> list[Candidate]:
+                    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
+                    balanced_admission: bool = BALANCED_ADMISSION) -> list[Candidate]:
     """Fuse bounded lexical and semantic lanes, with lexical fallback on failure."""
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -863,8 +874,11 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
         semantic = [
             candidate for candidate in semantic
             if not any(
-                identifier.casefold() not in guard_identifiers
-                for identifier in re.findall(r"[A-Za-z][A-Za-z0-9]*-\d+", candidate.text)
+                identifier not in guard_identifiers
+                for identifier in re.findall(
+                    r"[a-z][a-z0-9]*-\d+",
+                    _normalize_guard_text("\n".join((*candidate.heading_path, candidate.text))),
+                )
             )
         ]
     lexical_ids = {item.section_id for item in lexical}
@@ -886,6 +900,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
             ]
     return _fuse_candidates(
         lexical, semantic, primary_rank, atom_matches, guarded, limit, timings, semantic_score_floor,
+        balanced_admission,
     )
 
 

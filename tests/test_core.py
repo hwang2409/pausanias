@@ -604,6 +604,7 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "semantic_score_floor",
         "relative_semantic_score_floor",
         "ticket_id_cross_reference_filter",
+        "balanced_admission",
     }
 
 

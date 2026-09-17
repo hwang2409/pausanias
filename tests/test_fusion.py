@@ -142,7 +142,8 @@ def test_guard_matching_casefolds_indexed_text(tmp_path: Path):
 def test_ticket_cross_reference_filter_is_named_and_optional(monkeypatch):
     candidate = replace(
         _candidate("cross-reference", vector_rank=1),
-        text="PAUS-4 references PHO-123",
+        heading_path=("PHO-123",),
+        text="PAUS-4 result",
         vector_score=0.9,
         lane="semantic",
     )
@@ -184,3 +185,21 @@ def test_relative_semantic_floor_is_independently_named(monkeypatch):
 
     assert {item.section_id for item in result} == {"strong", "lexical"}
     assert core.FUSION_DIAGNOSTICS["relative_semantic_score_floor"]["value"] == 0.70
+
+
+def test_balanced_admission_is_named_and_optional():
+    lexical = [_candidate(f"lexical-{number}", lexical_rank=number) for number in range(1, 51)]
+    semantic = [_candidate("semantic", vector_rank=1)]
+    kwargs = {
+        "primary_rank": {item.section_id: item.lexical_rank for item in lexical},
+        "atom_matches": {},
+        "guarded": False,
+        "limit": 4,
+    }
+
+    balanced = core._fuse_candidates(lexical, semantic, balanced_admission=True, **kwargs)
+    lexical_first = core._fuse_candidates(lexical, semantic, balanced_admission=False, **kwargs)
+
+    assert "semantic" in {item.section_id for item in balanced}
+    assert "semantic" not in {item.section_id for item in lexical_first}
+    assert core.FUSION_DIAGNOSTICS["selection_policies"]["balanced_admission"]["enabled"] is True

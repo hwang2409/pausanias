@@ -14,6 +14,7 @@ from typing import Any
 
 from pausanias.config import Config, Root, load_config
 from pausanias.core import (
+    BALANCED_ADMISSION,
     FUSION_DIAGNOSTICS,
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
@@ -67,6 +68,10 @@ ABLATION_SPECS = {
     "ticket_id_cross_reference_filter_disabled": {
         "ticket_id_cross_reference_filter": False,
         "policy": "ticket_id_cross_reference_filter",
+    },
+    "balanced_admission_disabled": {
+        "balanced_admission": False,
+        "policy": "balanced_admission",
     },
 }
 
@@ -565,6 +570,7 @@ def _run_search(
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
+    balanced_admission: bool = BALANCED_ADMISSION,
 ) -> list[Candidate]:
     if config_path is not None and retrieval_mode == "fused":
         return run_hook(
@@ -578,6 +584,7 @@ def _run_search(
             semantic_score_floor=semantic_score_floor,
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
+            balanced_admission=balanced_admission,
         ).candidates
     if retrieval_mode == "fused":
         return semantic_search(
@@ -591,6 +598,7 @@ def _run_search(
             semantic_score_floor=semantic_score_floor,
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
+            balanced_admission=balanced_admission,
         )
     return search(
         config,
@@ -614,6 +622,7 @@ def _search_case(
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
+    balanced_admission: bool = BALANCED_ADMISSION,
 ) -> dict[str, Any]:
     with _temporarily_deleted(runtime_corpus, case.delete_sources):
         refresh: set[str] = set()
@@ -628,6 +637,7 @@ def _search_case(
             semantic_score_floor=semantic_score_floor,
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
+            balanced_admission=balanced_admission,
         )
         elapsed = (time.perf_counter() - started) * 1000
     return {

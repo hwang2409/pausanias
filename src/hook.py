@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .config import Config
 from .core import (
+    BALANCED_ADMISSION,
     Candidate,
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
@@ -120,6 +121,7 @@ def run_hook(
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
+    balanced_admission: bool = BALANCED_ADMISSION,
 ) -> HookResponse:
     """Run one semantic request through a persistent worker or lexical fallback."""
     if deadline_ms <= 0:
@@ -141,6 +143,7 @@ def run_hook(
             "semantic_score_floor": semantic_score_floor,
             "relative_semantic_score_floor": relative_semantic_score_floor,
             "ticket_id_cross_reference_filter": ticket_id_cross_reference_filter,
+            "balanced_admission": balanced_admission,
         }, deadline)
         items = response.get("items")
         raw_metrics = response.get("metrics")

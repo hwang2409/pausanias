@@ -20,6 +20,7 @@ import uuid
 
 from .config import Config, load_config
 from .core import (
+    BALANCED_ADMISSION,
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
@@ -284,6 +285,7 @@ class PersistentWorker:
         ticket_id_cross_reference_filter = request.get(
             "ticket_id_cross_reference_filter", TICKET_ID_CROSS_REFERENCE_FILTER,
         )
+        balanced_admission = request.get("balanced_admission", BALANCED_ADMISSION)
         if project is not None and not isinstance(project, str):
             raise WorkerError("worker project must be a string or null")
         if root_id is not None and not isinstance(root_id, str):
@@ -302,6 +304,8 @@ class PersistentWorker:
             raise WorkerError("worker relative semantic score floor is invalid")
         if not isinstance(ticket_id_cross_reference_filter, bool):
             raise WorkerError("worker ticket ID filter is invalid")
+        if not isinstance(balanced_admission, bool):
+            raise WorkerError("worker balanced admission policy is invalid")
         self._check_cancelled(cancelled)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
@@ -322,6 +326,7 @@ class PersistentWorker:
                         relative_semantic_score_floor=(float(relative_semantic_score_floor)
                                                       if relative_semantic_score_floor is not None else None),
                         ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
+                        balanced_admission=balanced_admission,
                     )
                     self._check_cancelled(cancelled)
                     if not timings.get("semantic_available"):
