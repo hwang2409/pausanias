@@ -135,6 +135,7 @@ class Metrics:
     latency_ms: dict[str, Any]
     deterministic_gates: dict[str, Any] = field(default_factory=dict)
     baselines: dict[str, Any] = field(default_factory=dict)
+    abstention: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,10 @@ class UnifiedResult:
     schema_version: str = SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_value(asdict(self))
+        value = _json_value(asdict(self))
+        if value["metrics"].get("abstention") is None:
+            del value["metrics"]["abstention"]
+        return value
 
     def write(self, path: Path) -> None:
         atomic_write_json(path, self.to_dict())

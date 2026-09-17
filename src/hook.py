@@ -71,7 +71,7 @@ def _lexical_search_until(config: Config, query: str, project: str | None, root_
                           all_projects: bool, limit: int, deadline: float | None,
                           synonym_expansion: bool) -> list[Candidate]:
     if deadline is not None and time.perf_counter() >= deadline:
-        return []
+        raise TimeoutError("deadline_exceeded")
     start_method = "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
     context = multiprocessing.get_context(start_method)
     parent, child = context.Pipe(False)
@@ -87,9 +87,11 @@ def _lexical_search_until(config: Config, query: str, project: str | None, root_
         if remaining == 0.0 or not parent.poll(remaining):
             process.kill()
             process.join(timeout=0)
-            return []
+            raise TimeoutError("deadline_exceeded")
         value = parent.recv()
-        return value if isinstance(value, list) and all(isinstance(item, Candidate) for item in value) else []
+        if isinstance(value, list) and all(isinstance(item, Candidate) for item in value):
+            return value
+        raise WorkerError("lexical_search_failed")
     finally:
         parent.close()
         if process.is_alive():
@@ -108,9 +110,18 @@ def _fallback(config: Config, query: str, project: str | None, root_id: str | No
               status: str = "semantic_failure",
               failure_reason: str | None = None) -> HookResponse:
     fallback_started = time.perf_counter()
-    candidates = _lexical_search_until(
-        config, query, project, root_id, all_projects, limit, deadline, synonym_expansion,
-    )
+    try:
+        candidates = _lexical_search_until(
+            config, query, project, root_id, all_projects, limit, deadline, synonym_expansion,
+        )
+    except TimeoutError:
+        candidates = []
+        status = "timeout"
+        failure_reason = "deadline_exceeded"
+    except (EOFError, OSError, WorkerError):
+        candidates = []
+        status = "error"
+        failure_reason = "lexical_search_failed"
     fallback_ms = max((time.perf_counter() - fallback_started) * 1000.0, 0.000001)
     return HookResponse(candidates, HookMetrics(
         worker_startup_ms=worker_startup_ms,

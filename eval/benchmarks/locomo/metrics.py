@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from eval.schema import CutoffOutcome, Evaluation, Metrics, RetrievalResult, latency_summary
+from eval.schema import CutoffOutcome, Evaluation, Metrics, RetrievalResult, latency_summary, nearest_rank
 
 COMPARABLE_CATEGORIES = ("single-hop", "multi-hop", "temporal", "open-domain")
+ABSTENTION_CATEGORY = "adversarial"
 REQUIRED_RETRIEVAL_DIAGNOSTIC_FIELDS = frozenset(
     {"fallback", "failure_reason", "retrieval_mode", "semantic_state"}
 )
@@ -116,6 +117,122 @@ def _predict_metrics(
         by_cutoff=by_cutoff,
         latency_ms={"overall": _predict_latency_summary(latencies), "by_category": by_category_latency},
         baselines={"retrieval_diagnostics": _retrieval_diagnostics(diagnostics)},
+    )
+
+
+def _distribution(values: list[int]) -> dict[str, int]:
+    counts: defaultdict[str, int] = defaultdict(int)
+    for value in values:
+        counts[str(value)] += 1
+    return dict(sorted(counts.items(), key=lambda item: int(item[0])))
+
+
+def _score_summary(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {"count": 0, "min": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0}
+    ordered = sorted(values)
+    return {
+        "count": len(values),
+        "min": ordered[0],
+        "p50": ordered[(len(ordered) - 1) // 2],
+        "p95": nearest_rank(ordered, 0.95),
+        "max": ordered[-1],
+        "mean": sum(values) / len(values),
+    }
+
+
+def selection_failure_reason(diagnostics: object) -> str | None:
+    if not isinstance(diagnostics, dict):
+        return "missing_diagnostics"
+    if diagnostics.get("status") != "ok":
+        return str(diagnostics.get("failure_reason") or diagnostics.get("status") or "selection_failed")
+    if diagnostics.get("fallback") is not False:
+        return str(diagnostics.get("failure_reason") or "fallback")
+    failure_reason = diagnostics.get("failure_reason")
+    return str(failure_reason) if failure_reason else None
+
+
+def abstention_outcome(
+    results: tuple[RetrievalResult, ...],
+    cutoff: int,
+    diagnostics: object,
+) -> CutoffOutcome:
+    selected = results[:cutoff]
+    failure_reason = selection_failure_reason(diagnostics)
+    if failure_reason is not None:
+        return CutoffOutcome(
+            retrieved_count=len(selected),
+            relevant_count=0,
+            recall=None,
+            precision=None,
+            mrr=None,
+            abstention_correct=None,
+            forbidden_sources=0,
+            score=0.0,
+            passed=False,
+            judgment="ERROR",
+            reason=failure_reason,
+            error="retrieval_error",
+        )
+    injected = len(selected)
+    return CutoffOutcome(
+        retrieved_count=injected,
+        relevant_count=0,
+        recall=None,
+        precision=None,
+        mrr=None,
+        abstention_correct=injected == 0,
+        forbidden_sources=0,
+        score=1.0 if injected == 0 else 0.0,
+        passed=injected == 0,
+    )
+
+
+def _abstention_group(records: list[dict[str, object]]) -> dict[str, object]:
+    successful = [
+        record for record in records
+        if selection_failure_reason(record.get("retrieval_diagnostics")) is None
+    ]
+    injected_counts = [len(record["retrieval_results"]) for record in successful]
+    injected_scores = [
+        float(item["score"])
+        for record in successful
+        for item in record["retrieval_results"]
+    ]
+    false_injections = sum(count > 0 for count in injected_counts)
+    return {
+        "total": len(records),
+        "abstained": len(successful) - false_injections,
+        "false_injections": false_injections,
+        "errors": len(records) - len(successful),
+        "false_injection_rate": false_injections / len(records) if records else 0.0,
+        "injected_count_distribution": _distribution(injected_counts),
+        "injected_score_summary": _score_summary(injected_scores),
+    }
+
+
+def _abstention_metrics(evaluations: list[Evaluation], records: list[dict[str, object]]) -> Metrics:
+    by_conversation: dict[str, dict[str, object]] = {}
+    grouped: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
+    for record in records:
+        grouped[str(record["conversation_index"])].append(record)
+    for conversation_index, group in sorted(grouped.items(), key=lambda item: int(item[0])):
+        by_conversation[conversation_index] = _abstention_group(group)
+    summary = _abstention_group(records)
+    abstained = int(summary["abstained"])
+    errors = int(summary["errors"])
+    total = len(evaluations)
+    rate = 100 * abstained / total if total else 0.0
+    return Metrics(
+        overall_accuracy=rate,
+        overall_avg_score=rate,
+        total=total,
+        correct=abstained,
+        errors=errors,
+        by_category={ABSTENTION_CATEGORY: summary},
+        by_cutoff={},
+        latency_ms={"overall": latency_summary([item.search_latency_ms for item in evaluations])},
+        abstention={**summary, "by_conversation": by_conversation},
     )
 
 

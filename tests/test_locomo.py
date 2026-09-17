@@ -15,7 +15,10 @@ from eval.benchmarks.locomo.run import (
     render_session,
     run_locomo,
 )
+from eval.benchmarks.locomo.metrics import _score_summary
+from eval.benchmarks.locomo.report import render as render_report
 from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
+from pausanias.hook import HookMetrics, HookResponse
 from pausanias.vectors import Candidate
 
 FIXTURES = Path(__file__).parent.parent / "eval/fixtures/locomo/golden-prompts-v1"
@@ -457,6 +460,316 @@ def test_locomo_fused_and_lexical_smoke_modes(tmp_path: Path, monkeypatch):
     )
     assert lexical_checkpoint["config"]["retrieval_mode"] == "lexical"
     assert lexical_checkpoint["config"]["retrieval_config"]["retrieval_mode"] == "lexical"
+
+
+@pytest.mark.parametrize("retrieval_mode", ("lexical", "fused"))
+def test_abstention_mode_filters_category_five_and_scores_injection(tmp_path: Path, monkeypatch, retrieval_mode: str):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+    hook_calls = []
+
+    def fake_run_hook(config, config_path, query, **kwargs):
+        hook_calls.append((query, kwargs["retrieval_mode"]))
+        if "planet" in query:
+            candidates = []
+        else:
+            path = config.roots[0].path / "conversation-00--session-01.md"
+            candidates = [Candidate(
+                "false-positive",
+                str(path),
+                None,
+                (),
+                1,
+                5,
+                config.roots[0].id,
+                config.roots[0].project,
+                "unrelated result",
+                "hash",
+                None,
+                None,
+                None,
+                0.42,
+                "fixture",
+            )]
+        return HookResponse(candidates, HookMetrics(retrieval_mode=retrieval_mode))
+
+    monkeypatch.setattr(locomo_runner, "run_hook", fake_run_hook)
+    result = run_locomo(
+        run_id=f"abstention-{retrieval_mode}",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode=retrieval_mode,
+        abstention=True,
+    )
+
+    assert result is not None
+    assert len(result.evaluations) == 2
+    assert all(item.category == "adversarial" for item in result.evaluations)
+    assert all(item.expected_sources == () and item.ground_truth is None for item in result.evaluations)
+    assert result.evaluations[0].cutoff_outcomes["2"].abstention_correct is True
+    assert result.evaluations[1].cutoff_outcomes["2"].abstention_correct is False
+    assert result.evaluations[0].cutoff_outcomes["2"].recall is None
+    assert result.evaluations[1].cutoff_outcomes["2"].precision is None
+    assert hook_calls == [
+        ("What is Alex's favorite planet?", retrieval_mode),
+        ("What is Alex's favorite planet?", retrieval_mode),
+        ("What is Sam's favorite instrument?", retrieval_mode),
+    ]
+
+    artifact = json.loads((tmp_path / f"locomo/abstention-{retrieval_mode}/run.json").read_text())
+    assert artifact["metadata"]["config"]["evaluation_mode"] == "abstention"
+    assert artifact["metrics"]["abstention"] == {
+        "total": 2,
+        "abstained": 1,
+        "false_injections": 1,
+        "errors": 0,
+        "false_injection_rate": 0.5,
+        "injected_count_distribution": {"0": 1, "1": 1},
+        "injected_score_summary": {
+            "count": 1,
+            "min": 0.42,
+            "p50": 0.42,
+            "p95": 0.42,
+            "max": 0.42,
+            "mean": 0.42,
+        },
+        "by_conversation": {
+            "0": {
+                "total": 2,
+                "abstained": 1,
+                "false_injections": 1,
+                "errors": 0,
+                "false_injection_rate": 0.5,
+                "injected_count_distribution": {"0": 1, "1": 1},
+                "injected_score_summary": {
+                    "count": 1,
+                    "min": 0.42,
+                    "p50": 0.42,
+                    "p95": 0.42,
+                    "max": 0.42,
+                    "mean": 0.42,
+                },
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "hook_metrics",
+    (
+        HookMetrics(status="error", failure_reason="worker_failed"),
+        HookMetrics(status="timeout", failure_reason="deadline_exceeded"),
+        HookMetrics(
+            status="semantic_failure",
+            fallback=True,
+            failure_reason="semantic_backend_unavailable",
+        ),
+    ),
+)
+def test_abstention_hook_failures_are_errors(tmp_path: Path, monkeypatch, hook_metrics: HookMetrics):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+
+    def failed_run_hook(*args, **kwargs):
+        return HookResponse([], hook_metrics)
+
+    monkeypatch.setattr(locomo_runner, "run_hook", failed_run_hook)
+    result = run_locomo(
+        run_id=f"abstention-{hook_metrics.status}",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode="fused",
+        abstention=True,
+    )
+
+    assert result is not None
+    assert result.metrics.errors == 2
+    assert result.metrics.correct == 0
+    outcome = result.evaluations[0].cutoff_outcomes["2"]
+    assert outcome.judgment == "ERROR"
+    assert outcome.error == "retrieval_error"
+    assert outcome.abstention_correct is None
+    assert result.metrics.abstention["errors"] == 2
+    assert result.metrics.abstention["abstained"] == 0
+    assert result.metrics.abstention["false_injections"] == 0
+
+
+def test_abstention_hook_exception_is_an_error(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+
+    def failed_run_hook(*args, **kwargs):
+        raise TimeoutError("hook timed out")
+
+    monkeypatch.setattr(locomo_runner, "run_hook", failed_run_hook)
+    result = run_locomo(
+        run_id="abstention-exception",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode="fused",
+        abstention=True,
+    )
+
+    assert result is not None
+    assert result.metrics.errors == 2
+    assert result.evaluations[0].cutoff_outcomes["2"].error == "retrieval_error"
+
+
+def test_expired_real_hook_is_an_eval_error(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+    real_run_hook = locomo_runner.run_hook
+
+    def expired_run_hook(*args, **kwargs):
+        kwargs["deadline_ms"] = 0.000001
+        return real_run_hook(*args, **kwargs)
+
+    monkeypatch.setattr(locomo_runner, "run_hook", expired_run_hook)
+    result = run_locomo(
+        run_id="abstention-real-timeout",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode="lexical",
+        abstention=True,
+    )
+
+    assert result is not None
+    assert result.metrics.errors == 2
+    for evaluation in result.evaluations:
+        outcome = evaluation.cutoff_outcomes["2"]
+        assert outcome.judgment == "ERROR"
+        assert outcome.error == "retrieval_error"
+    diagnostics = json.loads(
+        (tmp_path / "locomo/abstention-real-timeout/checkpoints/search/conv0_q1.json").read_text()
+    )["output"]["retrieval_diagnostics"]
+    assert diagnostics["status"] == "timeout"
+    assert diagnostics["failure_reason"] == "deadline_exceeded"
+    assert diagnostics["fallback"] is False
+
+
+def test_score_summary_uses_nearest_rank_p95():
+    assert _score_summary([1.0, 2.0, 3.0])["p95"] == 3.0
+
+
+def test_report_matches_committed_fixture(tmp_path: Path):
+    dataset = {
+        "name": "fixture",
+        "version": "v1",
+        "sha256": "dataset-sha",
+        "fingerprint": "dataset-fingerprint",
+    }
+    lexical = {
+        "metadata": {"dataset": dataset},
+        "metrics": {"abstention": {
+            "total": 2,
+            "abstained": 1,
+            "errors": 1,
+            "false_injections": 0,
+            "false_injection_rate": 0.0,
+            "injected_count_distribution": {"0": 1},
+            "injected_score_summary": {"count": 0, "min": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0},
+            "by_conversation": {"0": {
+                "total": 2,
+                "abstained": 1,
+                "errors": 1,
+                "false_injections": 0,
+                "false_injection_rate": 0.0,
+            }},
+        }},
+        "evaluations": [
+            {"failure_reason": None, "retrieval_results": []},
+            {"failure_reason": "retrieval_error", "retrieval_results": []},
+        ],
+    }
+    fused = {
+        "metadata": {"dataset": dataset},
+        "metrics": {"abstention": {
+            "total": 2,
+            "abstained": 0,
+            "errors": 0,
+            "false_injections": 2,
+            "false_injection_rate": 1.0,
+            "injected_count_distribution": {"1": 1, "2": 1},
+            "injected_score_summary": {"count": 3, "min": 0.1, "p50": 0.2, "p95": 0.3, "max": 0.3, "mean": 0.2},
+            "by_conversation": {"0": {
+                "total": 2,
+                "abstained": 0,
+                "errors": 0,
+                "false_injections": 2,
+                "false_injection_rate": 1.0,
+            }},
+        }},
+        "evaluations": [
+            {"failure_reason": None, "retrieval_results": [{"score": 0.1}]},
+            {"failure_reason": None, "retrieval_results": [{"score": 0.2}, {"score": 0.3}]},
+        ],
+    }
+    lexical_path = tmp_path / "lexical.json"
+    fused_path = tmp_path / "fused.json"
+    lexical_path.write_text(json.dumps(lexical))
+    fused_path.write_text(json.dumps(fused))
+
+    actual = render_report(lexical_path, fused_path)
+    expected = (Path(__file__).parent / "fixtures/locomo/report.md").read_text()
+
+    assert actual == expected
+
+
+def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("category 1-4 lexical mode must keep its existing search path")
+
+    monkeypatch.setattr(locomo_runner, "run_hook", fail_if_called)
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(
+        run_id="regular-lexical-path",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 2, 4, 8),
+        predict_only=True,
+    )
+
+    actual = json.loads((tmp_path / "locomo/regular-lexical-path/run.json").read_text())
+    expected = json.loads(
+        (Path(__file__).parent / "fixtures/locomo/pre-pr-cats-1-4.json").read_text()
+    )
+    # SQLite builds can vary in floating-point FTS scores; CI observed 2e-12 drift.
+    # Keep non-score fields exact while retaining sensitivity to meaningful score changes.
+    def stable(value):
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in value.items()
+                if key not in {"search_latency_ms", "retrieval_fingerprint", "section_id"}
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        return value
+
+    def assert_stable_equal(actual, expected, path=()):
+        if isinstance(actual, dict) and isinstance(expected, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                assert_stable_equal(actual[key], expected[key], (*path, key))
+            return
+        if isinstance(actual, list) and isinstance(expected, list):
+            assert len(actual) == len(expected)
+            for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+                assert_stable_equal(actual_item, expected_item, (*path, index))
+            return
+        if path[-1:] == ("score",) and "retrieval_results" in path:
+            assert actual == pytest.approx(expected, rel=0, abs=5e-12)
+            return
+        assert type(actual) is type(expected)
+        assert actual == expected
+
+    actual_outputs = stable(actual["evaluations"])
+    assert_stable_equal(actual_outputs, stable(expected["evaluations"]))
 
 
 def test_locomo_corrupt_score_checkpoint_is_recomputed(tmp_path: Path):

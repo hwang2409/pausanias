@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 from pausanias.config import Config, Root
 from pausanias.core import Candidate, index, search
-from pausanias.hook import run_hook
+from pausanias.hook import HookMetrics, run_hook
 from pausanias.worker import stop_worker
 
 from eval.schema import (
@@ -40,7 +40,10 @@ from eval.schema import (
     utc_now,
 )
 from eval.benchmarks.locomo.metrics import (
+    ABSTENTION_CATEGORY,
     COMPARABLE_CATEGORIES,
+    _abstention_metrics,
+    abstention_outcome,
     _predict_metrics,
     has_complete_retrieval_diagnostics,
     retrieval_outcome,
@@ -423,13 +426,20 @@ def _judge_with_retries(
     raise last_error
 
 
-def _question_records(entries: list[dict[str, object]], rendered: dict[tuple[int, str], RenderedSession]) -> list[dict[str, object]]:
+def _question_records(
+    entries: list[dict[str, object]],
+    rendered: dict[tuple[int, str], RenderedSession],
+    *,
+    abstention: bool = False,
+) -> list[dict[str, object]]:
     records = []
+    expected_category = {5} if abstention else set(CATEGORIES_TO_EVALUATE)
     for fallback_index, entry in enumerate(entries):
         conversation_index = int(entry.get("_conversation_index", fallback_index))
-        targets = _evidence_targets(entry, conversation_index, rendered)
+        targets = {} if abstention else _evidence_targets(entry, conversation_index, rendered)
         for question_index, question in enumerate(entry.get("qa", [])):
-            if not isinstance(question, dict) or question.get("category") not in CATEGORIES_TO_EVALUATE:
+            category = question.get("category") if isinstance(question, dict) else None
+            if category not in expected_category:
                 continue
             records.append({
                 "case_id": f"conv{conversation_index}_q{question_index}",
@@ -438,7 +448,7 @@ def _question_records(entries: list[dict[str, object]], rendered: dict[tuple[int
                 "question": _normalize(question.get("question")),
                 "category": CATEGORY_NAMES[int(question["category"])],
                 "category_number": int(question["category"]),
-                "ground_truth": _normalize(question.get("answer")),
+                "ground_truth": None if abstention else _normalize(question.get("answer")),
                 "targets": targets.get(_normalize(question.get("question")), []),
                 "evidence": question.get("evidence", []),
                 "sessions": sorted_sessions(entry["conversation"]),
@@ -538,18 +548,28 @@ def _search_candidates(
     top_k: int,
     retrieval_mode: str,
     worker_config_path: Path | None,
+    hook_equivalent: bool = False,
 ) -> tuple[list[Candidate], dict[str, object] | None]:
-    if retrieval_mode == "fused":
+    if retrieval_mode == "fused" or hook_equivalent:
         if worker_config_path is None:
             raise LocomoError("fused retrieval requires a worker config")
-        response = run_hook(
-            config,
-            worker_config_path,
-            query,
-            project=config.roots[0].project,
-            limit=top_k,
-            retrieval_mode="fused",
-        )
+        try:
+            response = run_hook(
+                config,
+                worker_config_path,
+                query,
+                project=config.roots[0].project,
+                limit=top_k,
+                retrieval_mode=retrieval_mode,
+            )
+        except Exception as exc:
+            if not hook_equivalent:
+                raise
+            return [], asdict(HookMetrics(
+                failure_reason=f"{type(exc).__name__}: {exc}",
+                status="error",
+                retrieval_mode=retrieval_mode,
+            ))
         return response.candidates, asdict(response.metrics)
     return search(config, query, project=config.roots[0].project, limit=top_k, semantic=False), None
 
@@ -561,6 +581,7 @@ def _search_record(
     top_k: int,
     retrieval_mode: str = "lexical",
     worker_config_path: Path | None = None,
+    hook_equivalent: bool = False,
 ) -> dict[str, object]:
     source_dates = {
         f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": _prompt_created_at(date)
@@ -572,13 +593,15 @@ def _search_record(
         excerpt = "\n".join(lines[int(target["line_start"]) - 1:int(target["line_end"])])
         evidence_lines.append(f"[{target['evidence_id']}] {excerpt}")
     start = time.perf_counter()
-    candidates, diagnostics = _search_candidates(
-        config,
-        str(record["question"]),
-        top_k,
-        retrieval_mode,
-        worker_config_path,
-    )
+    if hook_equivalent:
+        candidates, diagnostics = _search_candidates(
+            config, str(record["question"]), top_k, retrieval_mode,
+            worker_config_path, hook_equivalent=True,
+        )
+    else:
+        candidates, diagnostics = _search_candidates(
+            config, str(record["question"]), top_k, retrieval_mode, worker_config_path,
+        )
     elapsed = (time.perf_counter() - start) * 1000
     return {
         **record,
@@ -689,15 +712,18 @@ def run_locomo(
     resume: bool = False,
     transport: object | None = None,
     retrieval_mode: str = "lexical",
+    abstention: bool = False,
 ) -> UnifiedResult | None:
     if predict_only and evaluate_only:
         raise ValueError("--predict-only and --evaluate-only cannot be combined")
+    if abstention and (predict_only or evaluate_only):
+        raise ValueError("--abstention runs retrieval-only and cannot use stage flags")
     if top_k < max(cutoffs) or not cutoffs:
         raise ValueError("top-k must include all cutoffs")
     if retrieval_mode not in {"lexical", "fused"}:
         raise ValueError("retrieval mode must be lexical or fused")
     selected_judge_provider = judge_provider or provider
-    if not predict_only and transport is None and (not _required_key(provider) or not _required_key(selected_judge_provider)):
+    if not predict_only and not abstention and transport is None and (not _required_key(provider) or not _required_key(selected_judge_provider)):
         raise LocomoError("answerer and judge API keys are required for evaluation")
     auto_dataset = dataset_path is None
     if auto_dataset and predict_only:
@@ -714,9 +740,11 @@ def run_locomo(
     search_dir.mkdir(parents=True, exist_ok=True)
     evaluate_dir.mkdir(parents=True, exist_ok=True)
     rendered = _render_entries(entries, notes)
-    records = _question_records(entries, rendered)
+    records = _question_records(entries, rendered, abstention=abstention)
     corpus_hash = fingerprint([{ "path": path.relative_to(notes).as_posix(), "sha256": _sha256(path.read_bytes()) } for path in sorted(notes.glob("*.md"))]) if notes.exists() else None
     retrieval_config = {"retrieval_mode": retrieval_mode, "top_k": top_k, "cutoffs": list(cutoffs), "conversations": sorted(selected)}
+    if abstention:
+        retrieval_config["evaluation_mode"] = "abstention"
     model_config = {
         "prompt_mode": f"answerer-{'profile' if user_profile else 'no-profile'}+judge-{'with-evidence' if with_evidence else 'without-evidence'}",
         "prompt_version": PROMPT_VERSION,
@@ -758,7 +786,7 @@ def run_locomo(
     worker_config_paths = {
         conversation_index: _worker_config_path(config, scope / "worker-config.toml")
         for conversation_index, (scope, config) in scope_configs.items()
-    } if retrieval_mode == "fused" else {}
+    } if retrieval_mode == "fused" or abstention else {}
     scope_indexes: dict[int, dict[str, object]] = {}
     if existing_ingest is None:
         for conversation_index, (scope, scope_config) in scope_configs.items():
@@ -789,15 +817,15 @@ def run_locomo(
     generation = int(ingest.index_generation or 0)
     if records:
         first_scope = scope_configs[int(records[0]["conversation_index"])]
+        search_kwargs = {"hook_equivalent": True} if abstention else {}
         _search_candidates(
-            first_scope[1],
-            str(records[0]["question"]),
-            top_k,
-            retrieval_mode,
+            first_scope[1], str(records[0]["question"]), top_k, retrieval_mode,
             worker_config_paths.get(int(records[0]["conversation_index"])),
+            **search_kwargs,
         )
     evaluations: list[Evaluation] = []
     diagnostic_records: list[dict[str, object]] = []
+    abstention_records: list[dict[str, object]] = []
     for record in records:
         scope_notes, scope_config = scope_configs[int(record["conversation_index"])]
         scope_metadata = scope_indexes[int(record["conversation_index"])]
@@ -826,16 +854,15 @@ def run_locomo(
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
             raw = _search_record(
-                record,
-                scope_config,
-                scope_notes,
-                top_k,
-                retrieval_mode,
+                record, scope_config, scope_notes, top_k, retrieval_mode,
                 worker_config_paths.get(int(record["conversation_index"])),
+                hook_equivalent=abstention,
             )
             Checkpoint("search", run_id, dataset["fingerprint"], scope_corpus_hash, scope_generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
             raw = checkpoint.output
+        if abstention:
+            abstention_records.append(raw)
         raw_diagnostics = raw.get("retrieval_diagnostics")
         if isinstance(raw_diagnostics, dict):
             diagnostic_records.append(raw_diagnostics)
@@ -859,27 +886,32 @@ def run_locomo(
                 evaluations.append(evaluation_from_dict(evaluation_checkpoint.output))
                 continue
         outcomes: dict[str, CutoffOutcome] = {}
-        if predict_only:
+        if predict_only or abstention:
             for cutoff in cutoffs:
-                relevant, recall, precision, mrr = retrieval_outcome(retrieval, list(raw["targets"]), cutoff)
-                outcomes[str(cutoff)] = CutoffOutcome(
-                    retrieved_count=len(retrieval[:cutoff]),
-                    relevant_count=relevant,
-                    recall=recall,
-                    precision=precision,
-                    mrr=mrr,
-                    abstention_correct=None,
-                    forbidden_sources=0,
-                    score=0.0,
-                    passed=False,
-                )
+                if abstention:
+                    outcomes[str(cutoff)] = abstention_outcome(
+                        retrieval, cutoff, raw.get("retrieval_diagnostics")
+                    )
+                else:
+                    relevant, recall, precision, mrr = retrieval_outcome(retrieval, list(raw["targets"]), cutoff)
+                    outcomes[str(cutoff)] = CutoffOutcome(
+                        retrieved_count=len(retrieval[:cutoff]),
+                        relevant_count=relevant,
+                        recall=recall,
+                        precision=precision,
+                        mrr=mrr,
+                        abstention_correct=None,
+                        forbidden_sources=0,
+                        score=0.0,
+                        passed=False,
+                    )
         else:
             if transport is None:
                 transport = _http_transport
             for cutoff in cutoffs:
                 outcomes[str(cutoff)] = _common_cutoff(raw, retrieval, cutoff, answerer_model=answerer_model, answerer_provider=provider, judge_model=judge_model, judge_provider=selected_judge_provider, with_evidence=with_evidence, user_profile=user_profile, transport=transport)
         primary_outcome = outcomes[str(max(cutoffs))]
-        evaluation = Evaluation(str(raw["case_id"]), str(raw["category"]), str(raw["question"]), tuple(target["evidence_id"] for target in raw["targets"]), str(raw["ground_truth"]), retrieval, float(raw["search_latency_ms"]), outcomes, primary_outcome.score, primary_outcome.error)
+        evaluation = Evaluation(str(raw["case_id"]), str(raw["category"]), str(raw["question"]), tuple(target["evidence_id"] for target in raw["targets"]), raw["ground_truth"], retrieval, float(raw["search_latency_ms"]), outcomes, primary_outcome.score, primary_outcome.error)
         evaluations.append(evaluation)
         if not predict_only:
             Checkpoint(
@@ -931,6 +963,28 @@ def run_locomo(
         result.write(run_root / "run.json")
         print(f"locomo predict-only: {len(evaluations)} search checkpoints; dataset fingerprint {dataset['fingerprint']}")
         return result
+    if abstention:
+        metrics = _abstention_metrics(evaluations, abstention_records)
+        metadata = Metadata(
+            "locomo",
+            run_id,
+            dataset,
+            corpus_hash,
+            generation,
+            None,
+            None,
+            None,
+            fingerprint({"dataset": dataset, "config": config_values, "corpus": corpus_hash}),
+            None,
+            None,
+            {**config_values, "evaluation_mode": "abstention", "category": ABSTENTION_CATEGORY},
+            ingest.started_at,
+            utc_now(),
+        )
+        result = UnifiedResult(metadata, metrics, tuple(evaluations))
+        result.write(run_root / "run.json")
+        print(f"locomo abstention: {metrics.abstention['false_injection_rate']:.2%} false injection rate across {metrics.total} questions")
+        return result
     metrics = _common_metrics(evaluations, cutoffs)
     prompt_hashes = [outcome.prompt_metadata for evaluation in evaluations for outcome in evaluation.cutoff_outcomes.values()]
     answer_hash = fingerprint([metadata["answerer"].template_hash for metadata in prompt_hashes if "answerer" in metadata]) if prompt_hashes else None
@@ -973,11 +1027,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retrieval-mode", choices=("fused", "lexical"), default="lexical")
+    parser.add_argument("--abstention", action="store_true", help="evaluate category-5 adversarial questions")
     args = parser.parse_args(argv)
     try:
         conversations = tuple(int(item) for item in args.conversations.split(",")) if args.conversations else None
         cutoffs = tuple(int(item) for item in args.top_k_cutoffs.split(","))
-        run_locomo(run_id=args.run_id, dataset_path=args.dataset_path, results_dir=args.results_dir, conversations=conversations, top_k=args.top_k, cutoffs=cutoffs, answerer_model=args.answerer_model, judge_model=args.judge_model, provider=args.provider, judge_provider=args.judge_provider, with_evidence=args.with_evidence, user_profile=_profile(args.user_profile), predict_only=args.predict_only, evaluate_only=args.evaluate_only, resume=args.resume, retrieval_mode=args.retrieval_mode)
+        run_locomo(run_id=args.run_id, dataset_path=args.dataset_path, results_dir=args.results_dir, conversations=conversations, top_k=args.top_k, cutoffs=cutoffs, answerer_model=args.answerer_model, judge_model=args.judge_model, provider=args.provider, judge_provider=args.judge_provider, with_evidence=args.with_evidence, user_profile=_profile(args.user_profile), predict_only=args.predict_only, evaluate_only=args.evaluate_only, resume=args.resume, retrieval_mode=args.retrieval_mode, abstention=args.abstention)
         return 0
     except (OSError, ValueError, TypeError, KeyError, LocomoError) as exc:
         print(f"locomo: error: {exc}", file=sys.stderr)
