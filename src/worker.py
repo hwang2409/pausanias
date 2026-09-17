@@ -24,6 +24,7 @@ from .core import (
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
+    SYNONYM_EXPANSION,
     search,
     semantic_search,
 )
@@ -286,6 +287,7 @@ class PersistentWorker:
             "ticket_id_cross_reference_filter", TICKET_ID_CROSS_REFERENCE_FILTER,
         )
         balanced_admission = request.get("balanced_admission", BALANCED_ADMISSION)
+        synonym_expansion = request.get("synonym_expansion", SYNONYM_EXPANSION)
         if project is not None and not isinstance(project, str):
             raise WorkerError("worker project must be a string or null")
         if root_id is not None and not isinstance(root_id, str):
@@ -306,6 +308,8 @@ class PersistentWorker:
             raise WorkerError("worker ticket ID filter is invalid")
         if not isinstance(balanced_admission, bool):
             raise WorkerError("worker balanced admission policy is invalid")
+        if not isinstance(synonym_expansion, bool):
+            raise WorkerError("worker synonym expansion policy is invalid")
         self._check_cancelled(cancelled)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
@@ -327,6 +331,7 @@ class PersistentWorker:
                                                       if relative_semantic_score_floor is not None else None),
                         ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
                         balanced_admission=balanced_admission,
+                        synonym_expansion=synonym_expansion,
                     )
                     self._check_cancelled(cancelled)
                     if not timings.get("semantic_available"):
@@ -352,7 +357,10 @@ class PersistentWorker:
         if fallback:
             self._check_cancelled(cancelled)
             fallback_started = time.perf_counter()
-            candidates = search(self.config, query, project, root_id, all_projects, limit)
+            candidates = search(
+                self.config, query, project, root_id, all_projects, limit,
+                synonym_expansion=synonym_expansion,
+            )
             self._check_cancelled(cancelled)
             timings["fallback_ms"] = _positive_ms(fallback_started)
         timings.setdefault("encode_ms", 0.000001)

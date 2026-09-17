@@ -101,6 +101,22 @@ def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
         thread.join(timeout=2)
 
 
+def test_worker_applies_configured_synonym_table(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    table_path = tmp_path / "synonyms.toml"
+    table_path.write_text('version = 1\n\n[terms]\nmemory = ["recall"]\n')
+    config = type(config)(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, table_path,
+    )
+    core.index(config, encoder=FakeEncoder())
+    worker = PersistentWorker(config, encoder=FakeEncoder())
+
+    response = worker._query({"query": "recall", "project": "p"})
+
+    assert response["items"][0]["heading"] == "Note"
+
+
 def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
     bundle = tmp_path / "invalid-bundle"
     bundle.mkdir()

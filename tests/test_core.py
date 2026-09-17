@@ -605,7 +605,38 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "relative_semantic_score_floor",
         "ticket_id_cross_reference_filter",
         "balanced_admission",
+        "synonym_expansion",
     }
+
+
+def test_synonym_variants_are_conservative_and_versioned(tmp_path: Path):
+    from pausanias.synonyms import load_synonym_table, query_variants
+
+    path = tmp_path / "synonyms.toml"
+    path.write_text('version = 1\n\n[terms]\ndatabase = ["db"]\n')
+    table = load_synonym_table(path)
+
+    assert table.version == 1
+    assert table.fingerprint
+    assert query_variants('database "database" PAUS-11', table) == ('db "database" PAUS-11',)
+
+
+def test_synonym_search_uses_alias_without_changing_disabled_output(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Storage\nUse a database for durable state.\n")
+    table_path = tmp_path / "synonyms.toml"
+    table_path.write_text('version = 1\n\n[terms]\ndatabase = ["db"]\n')
+    config = make_config(tmp_path, [("vault", "p", root)])
+    synonym_config = Config(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, table_path,
+    )
+    index(synonym_config)
+
+    assert search(synonym_config, "db", project="p")[0].heading == "Storage"
+    assert search(synonym_config, "db", project="p", synonym_expansion=False) == []
+    assert search(synonym_config, "database", project="p")[0].heading == "Storage"
 
 
 def test_config_rejects_missing_root(tmp_path: Path):

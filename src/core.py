@@ -41,6 +41,7 @@ from .vectors import (
 )
 from .vectors import OnnxEncoder as _OnnxEncoder
 from .vectors import encoder_vectors as _encoder_vectors
+from .synonyms import SynonymTable, load_synonym_table, query_variants, table_metadata
 
 MAX_QUERY_TERMS = 64
 SEMANTIC_SCORE_FLOOR = 0.30
@@ -58,6 +59,10 @@ TICKET_ID_CROSS_REFERENCE_FILTER_RATIONALE = (
 BALANCED_ADMISSION = True
 BALANCED_ADMISSION_RATIONALE = (
     "interleave unguarded lexical and semantic lanes before the union cap to preserve top candidates from both lanes"
+)
+SYNONYM_EXPANSION = True
+SYNONYM_EXPANSION_RATIONALE = (
+    "replace one unquoted ordinary term at a time from a versioned operator table, without network rewrites"
 )
 RRF_RANK_CONSTANT = 60
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
@@ -81,6 +86,10 @@ SELECTION_POLICIES = {
         "enabled": BALANCED_ADMISSION,
         "rationale": BALANCED_ADMISSION_RATIONALE,
     },
+    "synonym_expansion": {
+        "enabled": SYNONYM_EXPANSION,
+        "rationale": SYNONYM_EXPANSION_RATIONALE,
+    },
 }
 
 FUSION_DIAGNOSTICS = {
@@ -98,6 +107,17 @@ FUSION_DIAGNOSTICS = {
     "ticket_id_cross_reference_filter": SELECTION_POLICIES["ticket_id_cross_reference_filter"],
     "balanced_admission": SELECTION_POLICIES["balanced_admission"],
 }
+
+
+def fusion_diagnostics(config: Config | None = None) -> dict[str, object]:
+    policy = {**SELECTION_POLICIES}
+    table = table_metadata(config.synonym_table if config is not None else None)
+    policy["synonym_expansion"] = {**policy["synonym_expansion"], "table": table}
+    return {
+        **FUSION_DIAGNOSTICS,
+        "selection_policies": policy,
+        "synonym_table": table,
+    }
 
 
 def _semantic_backend_reason(config: Config) -> str | None:
@@ -621,44 +641,62 @@ def _lexical_candidates(
     candidate_limit: int,
     refresh: set[str] | None = None,
     timings: dict[str, float] | None = None,
+    synonym_expansion: bool = SYNONYM_EXPANSION,
 ) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool]:
     if not config.database.exists():
         return [], {}, {}, bool(_guard_atoms(query))
     scope_root_ids, global_paths, effective_project = _scope_parts(config, project, root_id, all_projects)
     if root_id and not any(root.id == root_id for root in config.roots):
         return [], {}, {}, bool(_guard_atoms(query))
-    fts, tokens = _fts_query(_normalize_guard_text(query))
+    normalized_query = _normalize_guard_text(query)
+    fts, tokens = _fts_query(normalized_query)
     if not fts:
         return [], {}, {}, bool(_guard_atoms(query))
+    synonym_table: SynonymTable = load_synonym_table(config.synonym_table) if synonym_expansion else SynonymTable(None, None, ())
+    queries = [(fts, tokens)]
+    for variant in query_variants(normalized_query, synonym_table):
+        variant_fts, variant_tokens = _fts_query(variant)
+        if variant_fts and len(variant_tokens) <= MAX_QUERY_TERMS:
+            queries.append((variant_fts, variant_tokens))
     scope_condition, scope_params = _scope_conditions(scope_root_ids, global_paths)
     conditions = ["sections_fts MATCH ?", scope_condition]
     rows_by_id: dict[str, sqlite3.Row] = {}
+    row_variants: dict[str, int] = {}
     primary_rank: dict[str, int] = {}
     started = time.perf_counter()
     connection = connect(config.database, initialize=False, readonly=True)
     try:
         _require_schema_version(connection)
-        for lane in (None, "heading", "text"):
-            lane_query = fts if lane is None else _column_query(lane, fts)
-            rows = connection.execute(
-                "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
-                "JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
-                + " AND ".join(conditions) + " ORDER BY fts_score, s.section_id LIMIT ?",
-                (lane_query, *scope_params, candidate_limit),
-            ).fetchall()
-            if lane is None:
-                primary_rank = {row["section_id"]: rank for rank, row in enumerate(rows, 1)}
-            rows_by_id.update({row["section_id"]: row for row in rows})
-            if global_paths:
-                global_query = connection.execute(
+        for variant_number, (variant_fts, variant_tokens) in enumerate(queries):
+            for lane in (None, "heading", "text"):
+                lane_query = variant_fts if lane is None else _column_query(lane, variant_fts)
+                rows = connection.execute(
                     "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
-                    "JOIN sections_fts ON sections_fts.section_id = s.section_id "
-                    "WHERE sections_fts MATCH ? AND s.canonical_path IN ("
-                    + ", ".join("?" for _ in global_paths) + ") "
-                    "ORDER BY fts_score, s.section_id LIMIT ?",
-                    (lane_query, *global_paths, candidate_limit),
+                    "JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
+                    + " AND ".join(conditions) + " ORDER BY fts_score, s.section_id LIMIT ?",
+                    (lane_query, *scope_params, candidate_limit),
                 ).fetchall()
-                rows_by_id.update({row["section_id"]: row for row in global_query})
+                if variant_number == 0 and lane is None:
+                    primary_rank = {row["section_id"]: rank for rank, row in enumerate(rows, 1)}
+                for row in rows:
+                    section_id = row["section_id"]
+                    if variant_number <= row_variants.get(section_id, variant_number):
+                        rows_by_id[section_id] = row
+                        row_variants[section_id] = variant_number
+                if global_paths:
+                    global_query = connection.execute(
+                        "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
+                        "JOIN sections_fts ON sections_fts.section_id = s.section_id "
+                        "WHERE sections_fts MATCH ? AND s.canonical_path IN ("
+                        + ", ".join("?" for _ in global_paths) + ") "
+                        "ORDER BY fts_score, s.section_id LIMIT ?",
+                        (lane_query, *global_paths, candidate_limit),
+                    ).fetchall()
+                    for row in global_query:
+                        section_id = row["section_id"]
+                        if variant_number <= row_variants.get(section_id, variant_number):
+                            rows_by_id[section_id] = row
+                            row_variants[section_id] = variant_number
         atom_matches: dict[int, set[str]] = {}
         for ordinal, atom in enumerate(_guard_atoms(query), 1):
             atom_query = _guard_fts_query(atom)
@@ -677,7 +715,7 @@ def _lexical_candidates(
 
     source_cache: dict[str, tuple[Root, Path] | None] = {}
     hash_cache: dict[str, str | None] = {}
-    lower_tokens = {token.casefold() for token in tokens}
+    lower_tokens = {token.casefold() for _, variant_tokens in queries for token in variant_tokens}
     results: list[Candidate] = []
     for row in rows_by_id.values():
         canonical = row["canonical_path"]
@@ -735,7 +773,7 @@ def _lexical_candidates(
             row["created_date"], score, ", ".join(reasons) or "text match",
             None, None, float(row["fts_score"]), None, None, "lexical", None,
         ))
-    results.sort(key=lambda item: (-item.score, item.section_id))
+    results.sort(key=lambda item: (row_variants[item.section_id], -item.score, item.section_id))
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 
@@ -846,7 +884,8 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
                     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
                     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
-                    balanced_admission: bool = BALANCED_ADMISSION) -> list[Candidate]:
+                    balanced_admission: bool = BALANCED_ADMISSION,
+                    synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
     """Fuse bounded lexical and semantic lanes, with lexical fallback on failure."""
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -854,6 +893,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
     validation_refresh: set[str] = set()
     lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
         config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
+        synonym_expansion,
     )
     if timings is not None:
         timings.setdefault("semantic_available", 0.0)
@@ -906,15 +946,18 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
-           semantic: bool = False) -> list[Candidate]:
+           semantic: bool = False, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
     if semantic:
-        return semantic_search(config, query, project, root_id, all_projects, limit, refresh)
+        return semantic_search(
+            config, query, project, root_id, all_projects, limit, refresh,
+            synonym_expansion=synonym_expansion,
+        )
     if limit < 1:
         raise ValueError("limit must be positive")
     validation_refresh: set[str] = set()
     results, _, _, _ = _lexical_candidates(
         config, query, project, root_id, all_projects, min(MAX_CANDIDATES, max(limit * 5, 50)),
-        validation_refresh,
+        validation_refresh, synonym_expansion=synonym_expansion,
     )
     if refresh is not None:
         refresh.update(validation_refresh)
