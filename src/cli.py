@@ -91,6 +91,13 @@ def _result(candidate) -> dict:
         "score": candidate.score,
         "reason": candidate.reason,
         "content_hash": candidate.content_hash,
+        "lane": candidate.lane,
+        "lexical_rank": candidate.lexical_rank,
+        "vector_rank": candidate.vector_rank,
+        "lexical_score": candidate.lexical_score,
+        "vector_score": candidate.vector_score,
+        "fused_score": candidate.fused_score,
+        "guard_reason": candidate.guard_reason,
     }
 
 

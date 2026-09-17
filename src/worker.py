@@ -19,9 +19,9 @@ from typing import Callable
 import uuid
 
 from .config import Config, load_config
-from .core import search
+from .core import search, semantic_search
 from .model_bundle import BundleError, MODEL_BUNDLE_MANIFEST, _resolve_active_bundle
-from .vectors import Candidate, OnnxEncoder, SemanticError, encoder_vectors, scan_vectors, semantic_backend_reason, unpack_vector
+from .vectors import Candidate, OnnxEncoder, SemanticError, semantic_backend_reason
 
 
 ADAPTER_DEADLINE_MS = 750.0
@@ -251,7 +251,10 @@ class PersistentWorker:
             "text": candidate.text, "content_hash": candidate.content_hash,
             "note_type": candidate.note_type, "updated_date": candidate.updated_date,
             "created_date": candidate.created_date, "score": candidate.score,
-            "reason": candidate.reason,
+            "reason": candidate.reason, "lexical_rank": candidate.lexical_rank,
+            "vector_rank": candidate.vector_rank, "lexical_score": candidate.lexical_score,
+            "vector_score": candidate.vector_score, "fused_score": candidate.fused_score,
+            "lane": candidate.lane, "guard_reason": candidate.guard_reason,
         }
 
     @staticmethod
@@ -282,55 +285,35 @@ class PersistentWorker:
         failure_reason: str | None = None
         candidates: list[Candidate] = []
         if encoder is not None:
-            encode_started = time.perf_counter()
-            try:
-                vector = encoder_vectors(encoder, [query])[0]
+            while not self._matrix_lock.acquire(timeout=0.01):
                 self._check_cancelled(cancelled)
-                timings["encode_ms"] = _positive_ms(encode_started)
-                while not self._matrix_lock.acquire(timeout=0.01):
-                    self._check_cancelled(cancelled)
+            try:
                 try:
-                    try:
-                        candidates = scan_vectors(
-                            self.config, unpack_vector(vector, int(MODEL_BUNDLE_MANIFEST["dimension"])),
-                            project, root_id, all_projects, limit, timings=timings,
-                            matrix_cache=self._matrix_cache,
-                        )
-                        self._check_cancelled(cancelled)
-                        if not timings.get("semantic_available"):
-                            fallback = True
-                            semantic_failure = True
-                            failure_reason = "semantic backend unavailable"
-                    except (SemanticError, ValueError, TypeError, RuntimeError, OSError) as exc:
-                        self._matrix_cache.clear()
-                        try:
-                            candidates = scan_vectors(
-                                self.config, unpack_vector(vector, int(MODEL_BUNDLE_MANIFEST["dimension"])),
-                                project, root_id, all_projects, limit, timings=timings,
-                                matrix_cache=self._matrix_cache,
-                            )
-                        except (SemanticError, ValueError, TypeError, RuntimeError, OSError) as retry_exc:
-                            candidates = []
-                            fallback = True
-                            semantic_failure = True
-                            failure_reason = str(retry_exc) or str(exc)
-                        else:
-                            fallback = not bool(timings.get("semantic_available"))
-                            semantic_failure = fallback
-                            failure_reason = "semantic backend unavailable" if fallback else None
+                    candidates = semantic_search(
+                        self.config, query, project, root_id, all_projects, limit,
+                        encoder=encoder, matrix_cache=self._matrix_cache, timings=timings,
+                    )
+                    self._check_cancelled(cancelled)
+                    if not timings.get("semantic_available"):
+                        fallback = True
+                        semantic_failure = True
+                        failure_reason = "semantic backend unavailable"
                     generations = {key[0] for key in self._matrix_cache}
                     if len(generations) > 1:
                         newest = max(generations)
-                        self._matrix_cache = {key: value for key, value in self._matrix_cache.items() if key[0] == newest}
-                finally:
-                    self._matrix_lock.release()
+                        self._matrix_cache = {
+                            key: value for key, value in self._matrix_cache.items() if key[0] == newest
+                        }
+                except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError) as exc:
+                    self._matrix_cache.clear()
+                    candidates = []
+                    fallback = True
+                    semantic_failure = True
+                    failure_reason = str(exc) or "semantic query failed"
             except RequestCancelled:
                 raise
-            except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError) as exc:
-                candidates = []
-                fallback = True
-                semantic_failure = True
-                failure_reason = str(exc) or "semantic query failed"
+            finally:
+                self._matrix_lock.release()
         if fallback:
             self._check_cancelled(cancelled)
             fallback_started = time.perf_counter()
@@ -348,8 +331,8 @@ class PersistentWorker:
                 "worker_startup_ms": 0.000001, "model_load_ms": model_load_ms,
                 "matrix_load_ms": timings["matrix_load_ms"], "encode_ms": timings["encode_ms"],
                 "scan_ms": timings["scan_ms"], "fallback_ms": timings.get("fallback_ms", 0.000001),
-                "fts_search_ms": timings.get("fallback_ms", 0.000001) if fallback else 0.000001,
-                "hybrid_overhead_ms": 0.000001,
+                "fts_search_ms": timings.get("fts_search_ms", 0.000001),
+                "hybrid_overhead_ms": timings.get("hybrid_overhead_ms", 0.000001),
                 "hook_total_ms": _positive_ms(started), "fallback": fallback,
                 "cache_state": "disabled" if self._encoder_error else ("warm" if self._matrix_cache else "cold"),
                 "disabled_reason": self._encoder_error,

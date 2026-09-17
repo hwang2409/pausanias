@@ -40,6 +40,9 @@ def _candidate(value: dict[str, object]) -> Candidate:
         str(value["project_scope"]), str(value["text"]), str(value["content_hash"]),
         value.get("note_type"), value.get("updated_date"), value.get("created_date"),
         float(value["score"]), str(value["reason"]),
+        value.get("lexical_rank"), value.get("vector_rank"),
+        value.get("lexical_score"), value.get("vector_score"), value.get("fused_score"),
+        str(value.get("lane", "lexical")), value.get("guard_reason"),
     )
 
 

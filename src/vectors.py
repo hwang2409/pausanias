@@ -53,6 +53,13 @@ class Candidate:
     created_date: str | None
     score: float
     reason: str
+    lexical_rank: int | None = None
+    vector_rank: int | None = None
+    lexical_score: float | None = None
+    vector_score: float | None = None
+    fused_score: float | None = None
+    lane: str = "lexical"
+    guard_reason: str | None = None
 
 
 class SemanticError(RuntimeError):
@@ -458,7 +465,7 @@ def scan_vectors(
     if not config.database.exists():
         return []
     scope_root_ids, global_paths, effective_project = scope(config, project, root_id, all_projects)
-    if root_id and not scope_root_ids:
+    if root_id and not any(root.id == root_id for root in config.roots):
         return []
     try:
         numpy = optional_numpy()
@@ -590,6 +597,7 @@ def scan_vectors(
             row["section_id"], canonical, row["heading"], tuple(filter(None, row["heading_path"].split("\n"))),
             row["line_start"], row["line_end"], current_root.id, current_root.project, row["text"],
             row["content_hash"], row["note_type"], row["updated_date"], row["created_date"], score, reason,
+            None, len(results) + 1, None, score, None, "semantic", None,
         ))
     return results[:limit]
 
@@ -603,6 +611,8 @@ def vector_candidates(
     limit: int = 20,
     refresh: set[str] | None = None,
     encoder: object | None = None,
+    matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> list[Candidate]:
     """Encode a query and return bounded exact cosine candidates."""
     if encoder is None:
@@ -613,8 +623,11 @@ def vector_candidates(
         except (BundleError, OSError, SemanticError):
             return []
     try:
+        encode_started = time.perf_counter()
         vector = encoder_vectors(encoder, [query])[0]
+        if timings is not None:
+            timings["encode_ms"] = max((time.perf_counter() - encode_started) * 1000.0, 0.000001)
         return scan_vectors(config, unpack_vector(vector, int(MODEL_BUNDLE_MANIFEST["dimension"])), project, root_id,
-                            all_projects, limit, refresh)
+                            all_projects, limit, refresh, matrix_cache, timings)
     except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError, sqlite3.DatabaseError):
         return []

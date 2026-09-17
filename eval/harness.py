@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from pausanias.config import Config, Root, load_config
-from pausanias.core import Candidate, index, search
+from pausanias.core import Candidate, index, search, semantic_search
 
 from .run import (
     CASES_PATH,
@@ -67,7 +67,7 @@ def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, data
 
     roots = tuple(Root(root.id, map_path(root.path), root.project, root.excludes) for root in source.roots)
     global_notes = frozenset(map_path(path) for path in source.global_notes)
-    return Config(roots, global_notes, source.private_paths, database, source.section_bytes)
+    return Config(roots, global_notes, source.private_paths, database, source.section_bytes, source.semantic_bundle)
 
 
 def _corpus_fingerprint(root: Path) -> str:
@@ -100,9 +100,9 @@ def _index_generation(database: Path) -> int:
     return int(row[0])
 
 
-def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str) -> dict[str, Any]:
+def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str, retrieval_mode: str = "lexical") -> dict[str, Any]:
     return {
-        "retrieval_mode": "lexical",
+        "retrieval_mode": retrieval_mode,
         "prompt_mode": "internal-deterministic",
         "top_k": top_k,
         "cutoffs": list(cutoffs),
@@ -318,15 +318,18 @@ def run_internal(
     resume: bool = False,
     predict_only: bool = False,
     evaluate_only: bool = False,
+    retrieval_mode: str = "lexical",
 ) -> UnifiedResult | None:
     if predict_only and evaluate_only:
         raise ValueError("--predict-only and --evaluate-only cannot be combined")
     if top_k < max(cutoffs) or sorted(cutoffs) != list(cutoffs):
         raise ValueError("top-k must include sorted cutoff values")
+    if retrieval_mode not in {"lexical", "fused"}:
+        raise ValueError("retrieval mode must be lexical or fused")
     case_lock = verify_case_lock(cases_path)
     case_set = load_case_set(cases_path)
     cases = list(case_set.cases)
-    config_values = _checkpoint_config(top_k, cutoffs, case_lock)
+    config_values = _checkpoint_config(top_k, cutoffs, case_lock, retrieval_mode)
     run_root = results_dir / BENCHMARK / run_id
     workspace = run_root / "workspace"
     runtime_corpus = workspace / "corpus"
@@ -370,7 +373,7 @@ def run_internal(
         ingest.write(ingest_path)
     generation = int(ingest.index_generation or 0)
     if cases:
-        search(config, cases[0].query, project=cases[0].scope.get("project"), root_id=cases[0].scope.get("root"), all_projects=bool(cases[0].scope.get("all_projects", False)), limit=top_k)
+        _run_search(config, cases[0], top_k, retrieval_mode)
     evaluations: list[Evaluation] = []
     for case in cases:
         checkpoint_path = search_dir / f"{case.id}.json"
@@ -392,15 +395,7 @@ def run_internal(
             with _temporarily_deleted(runtime_corpus, case.delete_sources):
                 refresh: set[str] = set()
                 started = time.perf_counter()
-                candidates = search(
-                    config,
-                    case.query,
-                    project=case.scope.get("project"),
-                    root_id=case.scope.get("root"),
-                    all_projects=bool(case.scope.get("all_projects", False)),
-                    limit=top_k,
-                    refresh=refresh,
-                )
+                candidates = _run_search(config, case, top_k, retrieval_mode, refresh)
                 elapsed = (time.perf_counter() - started) * 1000
             raw = {
                 "case_id": case.id,
@@ -429,6 +424,8 @@ def run_internal(
     if evaluate_only and len(evaluations) != len(cases):
         raise ValueError("evaluation requires complete search checkpoints")
     thresholds = load_thresholds()
+    if retrieval_mode == "fused" and "fused_categories" in thresholds:
+        thresholds = {**thresholds, "categories": thresholds["fused_categories"]}
     metrics = _metrics(evaluations, cutoffs, thresholds)
     started_at = ingest.started_at
     metadata = Metadata(
@@ -456,6 +453,34 @@ def run_internal(
     return result
 
 
+def _run_search(
+    config: Config,
+    case: Case,
+    top_k: int,
+    retrieval_mode: str,
+    refresh: set[str] | None = None,
+) -> list[Candidate]:
+    if retrieval_mode == "fused":
+        return semantic_search(
+            config,
+            case.query,
+            project=case.scope.get("project"),
+            root_id=case.scope.get("root"),
+            all_projects=bool(case.scope.get("all_projects", False)),
+            limit=top_k,
+            refresh=refresh,
+        )
+    return search(
+        config,
+        case.query,
+        project=case.scope.get("project"),
+        root_id=case.scope.get("root"),
+        all_projects=bool(case.scope.get("all_projects", False)),
+        limit=top_k,
+        refresh=refresh,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", default="latest")
@@ -467,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cutoffs", default="1,2,4,8")
     parser.add_argument("--predict-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--retrieval-mode", choices=("lexical", "fused"), default="lexical")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -482,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume,
             predict_only=args.predict_only,
             evaluate_only=args.evaluate_only,
+            retrieval_mode=args.retrieval_mode,
         )
         return 0
     except (OSError, ValueError, TypeError, sqlite3.DatabaseError) as exc:

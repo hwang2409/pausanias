@@ -145,7 +145,21 @@ def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, Any]:
         if any(key not in category_values for key in required):
             raise ValueError(f"threshold category {category} must define all metrics")
         parsed_categories[category] = {key: float(category_values[key]) for key in required}
-    result = {**{key: float(values[key]) for key in required}, "categories": parsed_categories}
+    fused_categories = values.get("fused_categories", {})
+    if not isinstance(fused_categories, dict):
+        raise ValueError("fused threshold categories must be a table")
+    parsed_fused_categories: dict[str, dict[str, float]] = {}
+    for category, category_values in fused_categories.items():
+        if not isinstance(category, str) or not isinstance(category_values, dict):
+            raise ValueError("each fused threshold category must be a table")
+        if any(key not in category_values for key in required):
+            raise ValueError(f"fused threshold category {category} must define all metrics")
+        parsed_fused_categories[category] = {key: float(category_values[key]) for key in required}
+    result = {
+        **{key: float(values[key]) for key in required},
+        "categories": parsed_categories,
+        "fused_categories": parsed_fused_categories,
+    }
     arc2 = document.get("arc2", {})
     if not isinstance(arc2, dict):
         raise ValueError("arc2 thresholds must be a table")
