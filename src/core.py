@@ -577,15 +577,15 @@ def _lexical_candidates(
     candidate_limit: int,
     refresh: set[str] | None = None,
     timings: dict[str, float] | None = None,
-) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool, bool]:
+) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool]:
     if not config.database.exists():
-        return [], {}, {}, bool(_guard_atoms(query)), False
+        return [], {}, {}, bool(_guard_atoms(query))
     scope_root_ids, global_paths, effective_project = _scope_parts(config, project, root_id, all_projects)
     if root_id and not any(root.id == root_id for root in config.roots):
         return [], {}, {}, bool(_guard_atoms(query))
     fts, tokens = _fts_query(_normalize_guard_text(query))
     if not fts:
-        return [], {}, {}, bool(_guard_atoms(query)), False
+        return [], {}, {}, bool(_guard_atoms(query))
     scope_condition, scope_params = _scope_conditions(scope_root_ids, global_paths)
     conditions = ["sections_fts MATCH ?", scope_condition]
     rows_by_id: dict[str, sqlite3.Row] = {}
@@ -635,14 +635,12 @@ def _lexical_candidates(
     hash_cache: dict[str, str | None] = {}
     lower_tokens = {token.casefold() for token in tokens}
     results: list[Candidate] = []
-    stale_source = False
     for row in rows_by_id.values():
         canonical = row["canonical_path"]
         if canonical not in source_cache:
             source_cache[canonical] = _safe_source(config, canonical)
         source = source_cache[canonical]
         if source is None:
-            stale_source = True
             if refresh is not None:
                 refresh.add(canonical)
             continue
@@ -663,7 +661,6 @@ def _lexical_candidates(
                 hash_cache[canonical] = None
         current_hash = hash_cache[canonical]
         if current_hash is None or current_hash != row["content_hash"]:
-            stale_source = True
             if refresh is not None:
                 refresh.add(canonical)
             continue
@@ -696,7 +693,7 @@ def _lexical_candidates(
         ))
     results.sort(key=lambda item: (-item.score, item.section_id))
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
-    return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query)), stale_source
+    return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 
 
 def _fuse_candidates(
