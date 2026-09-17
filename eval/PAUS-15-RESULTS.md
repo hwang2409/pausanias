@@ -9,7 +9,7 @@ this eval measures retrieval-side abstention on LOCOMO category-5 adversarial qu
 | lexical | 446 | 440 | 6 | 1.35% |
 | fused | 446 | 0 | 446 | 100.00% |
 
-the false-injection rate is the primary metric. an abstention is a selection-policy result with zero injectable candidates.
+the false-injection rate is the primary metric. an abstention is a successful selection pass with zero injectable candidates. failed, timed-out, and fallback-degraded selections are errors.
 
 ## injected result counts
 
@@ -139,7 +139,7 @@ scores cover every injected result in a false-injection query. they support late
 
 | mode | results | min | p50 | p95 | max | mean |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| lexical | 6 | 16.510301 | 22.149234 | 29.125708 | 33.164049 | 23.982639 |
+| lexical | 6 | 16.510301 | 22.149234 | 33.164049 | 33.164049 | 23.982639 |
 | fused | 20322 | 0.004115 | 0.011364 | 0.015873 | 0.032787 | 0.011346 |
 
 ## per-conversation breakdown

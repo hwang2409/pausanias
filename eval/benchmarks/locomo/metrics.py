@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from eval.schema import CutoffOutcome, Evaluation, Metrics, RetrievalResult, latency_summary
+from eval.schema import CutoffOutcome, Evaluation, Metrics, RetrievalResult, latency_summary, nearest_rank
 
 COMPARABLE_CATEGORIES = ("single-hop", "multi-hop", "temporal", "open-domain")
 ABSTENTION_CATEGORY = "adversarial"
@@ -135,24 +135,76 @@ def _score_summary(values: list[float]) -> dict[str, float | int]:
         "count": len(values),
         "min": ordered[0],
         "p50": ordered[(len(ordered) - 1) // 2],
-        "p95": ordered[max(0, int(len(ordered) * 0.95) - 1)],
+        "p95": nearest_rank(ordered, 0.95),
         "max": ordered[-1],
         "mean": sum(values) / len(values),
     }
 
 
+def selection_failure_reason(diagnostics: object) -> str | None:
+    if not isinstance(diagnostics, dict):
+        return "missing_diagnostics"
+    if diagnostics.get("status") != "ok":
+        return str(diagnostics.get("failure_reason") or diagnostics.get("status") or "selection_failed")
+    if diagnostics.get("fallback") is not False:
+        return str(diagnostics.get("failure_reason") or "fallback")
+    failure_reason = diagnostics.get("failure_reason")
+    return str(failure_reason) if failure_reason else None
+
+
+def abstention_outcome(
+    results: tuple[RetrievalResult, ...],
+    cutoff: int,
+    diagnostics: object,
+) -> CutoffOutcome:
+    selected = results[:cutoff]
+    failure_reason = selection_failure_reason(diagnostics)
+    if failure_reason is not None:
+        return CutoffOutcome(
+            retrieved_count=len(selected),
+            relevant_count=0,
+            recall=None,
+            precision=None,
+            mrr=None,
+            abstention_correct=None,
+            forbidden_sources=0,
+            score=0.0,
+            passed=False,
+            judgment="ERROR",
+            reason=failure_reason,
+            error="retrieval_error",
+        )
+    injected = len(selected)
+    return CutoffOutcome(
+        retrieved_count=injected,
+        relevant_count=0,
+        recall=None,
+        precision=None,
+        mrr=None,
+        abstention_correct=injected == 0,
+        forbidden_sources=0,
+        score=1.0 if injected == 0 else 0.0,
+        passed=injected == 0,
+    )
+
+
 def _abstention_group(records: list[dict[str, object]]) -> dict[str, object]:
-    injected_counts = [len(record["retrieval_results"]) for record in records]
+    successful = [
+        record for record in records
+        if selection_failure_reason(record.get("retrieval_diagnostics")) is None
+    ]
+    injected_counts = [len(record["retrieval_results"]) for record in successful]
     injected_scores = [
         float(item["score"])
-        for record in records
+        for record in successful
         for item in record["retrieval_results"]
     ]
     false_injections = sum(count > 0 for count in injected_counts)
     return {
         "total": len(records),
-        "abstained": len(records) - false_injections,
+        "abstained": len(successful) - false_injections,
         "false_injections": false_injections,
+        "errors": len(records) - len(successful),
         "false_injection_rate": false_injections / len(records) if records else 0.0,
         "injected_count_distribution": _distribution(injected_counts),
         "injected_score_summary": _score_summary(injected_scores),
@@ -168,6 +220,7 @@ def _abstention_metrics(evaluations: list[Evaluation], records: list[dict[str, o
         by_conversation[conversation_index] = _abstention_group(group)
     summary = _abstention_group(records)
     abstained = int(summary["abstained"])
+    errors = int(summary["errors"])
     total = len(evaluations)
     rate = 100 * abstained / total if total else 0.0
     return Metrics(
@@ -175,7 +228,7 @@ def _abstention_metrics(evaluations: list[Evaluation], records: list[dict[str, o
         overall_avg_score=rate,
         total=total,
         correct=abstained,
-        errors=0,
+        errors=errors,
         by_category={ABSTENTION_CATEGORY: summary},
         by_cutoff={},
         latency_ms={"overall": latency_summary([item.search_latency_ms for item in evaluations])},

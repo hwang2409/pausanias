@@ -1,0 +1,211 @@
+{
+  "source_commit": "b6a19ddd8e38f66cb7ef745ccc1f4d250d0a7488",
+  "regenerate": "from a checkout at b6a19dd, run run_locomo on tests/fixtures/locomo/small.json with top_k=8, cutoffs=(1, 2, 4, 8), predict_only=True, then remove search_latency_ms and retrieval_fingerprint, and remove section_id from retrieval_results",
+  "evaluations": [
+    {
+      "case_id": "conv0_q0",
+      "category": "single-hop",
+      "cutoff_outcomes": {
+        "1": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 0.0,
+          "passed": false,
+          "precision": 0.0,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 0.0,
+          "relevant_count": 0,
+          "retrieved_count": 1,
+          "score": 0.0
+        },
+        "2": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 0.5,
+          "passed": false,
+          "precision": 0.5,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 2,
+          "score": 0.0
+        },
+        "4": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 0.5,
+          "passed": false,
+          "precision": 0.5,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 2,
+          "score": 0.0
+        },
+        "8": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 0.5,
+          "passed": false,
+          "precision": 0.5,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 2,
+          "score": 0.0
+        }
+      },
+      "expected_sources": [
+        "conversation-00--session-01.md#00000005-00000007"
+      ],
+      "failure_reason": null,
+      "ground_truth": "blue",
+      "query": "blue bicycle",
+      "retrieval_results": [
+        {
+          "content_hash": "58eec6920d6324d1eddc4d13647f22afe5255cbb9d400df5dbd763356fce6575",
+          "excerpt": "That blue bicycle sounds useful.",
+          "heading": "turn D1:1 | speaker: Sam | timestamp: 1:01 pm on 1 May, 2023",
+          "line_end": 11,
+          "line_start": 9,
+          "project": "locomo-0",
+          "rank": 1,
+          "reason": "body match",
+          "root_id": "locomo-0",
+          "score": 1.2848934761491813,
+          "source_path": "conversation-00--session-01.md"
+        },
+        {
+          "content_hash": "58eec6920d6324d1eddc4d13647f22afe5255cbb9d400df5dbd763356fce6575",
+          "excerpt": "I bought a blue bicycle for weekend rides.",
+          "heading": "turn D1:0 | speaker: Alex | timestamp: 1:00 pm on 1 May, 2023",
+          "line_end": 8,
+          "line_start": 5,
+          "project": "locomo-0",
+          "rank": 2,
+          "reason": "body match",
+          "root_id": "locomo-0",
+          "score": 1.1826860405464057,
+          "source_path": "conversation-00--session-01.md"
+        }
+      ],
+      "score": 0.0
+    },
+    {
+      "case_id": "conv0_q1",
+      "category": "single-hop",
+      "cutoff_outcomes": {
+        "1": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 1.0,
+          "passed": false,
+          "precision": 1.0,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 1,
+          "score": 0.0
+        },
+        "2": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 1.0,
+          "passed": false,
+          "precision": 1.0,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 1,
+          "score": 0.0
+        },
+        "4": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 1.0,
+          "passed": false,
+          "precision": 1.0,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 1,
+          "score": 0.0
+        },
+        "8": {
+          "abstention_correct": null,
+          "error": null,
+          "forbidden_sources": 0,
+          "generated_answer": null,
+          "judgment": null,
+          "model": null,
+          "mrr": 1.0,
+          "passed": false,
+          "precision": 1.0,
+          "prompt_metadata": {},
+          "reason": null,
+          "recall": 1.0,
+          "relevant_count": 1,
+          "retrieved_count": 1,
+          "score": 0.0
+        }
+      },
+      "expected_sources": [
+        "conversation-00--session-02.md#00000005-00000007"
+      ],
+      "failure_reason": null,
+      "ground_truth": "landscapes",
+      "query": "started painting landscapes",
+      "retrieval_results": [
+        {
+          "content_hash": "10ab8dea87d197711790dbe5a5ee0a80053ead93307a828eaef6c4668dfda556",
+          "excerpt": "I also started painting landscapes.",
+          "heading": "turn D2:0 | speaker: Alex | timestamp: 2:00 pm on 2 May, 2023",
+          "line_end": 7,
+          "line_start": 5,
+          "project": "locomo-0",
+          "rank": 1,
+          "reason": "body match",
+          "root_id": "locomo-0",
+          "score": 3.584379501495044,
+          "source_path": "conversation-00--session-02.md"
+        }
+      ],
+      "score": 0.0
+    }
+  ]
+}

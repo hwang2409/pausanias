@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 from pausanias.config import Config, Root
 from pausanias.core import Candidate, index, search
-from pausanias.hook import run_hook
+from pausanias.hook import HookMetrics, run_hook
 from pausanias.worker import stop_worker
 
 from eval.schema import (
@@ -43,6 +43,7 @@ from eval.benchmarks.locomo.metrics import (
     ABSTENTION_CATEGORY,
     COMPARABLE_CATEGORIES,
     _abstention_metrics,
+    abstention_outcome,
     _predict_metrics,
     has_complete_retrieval_diagnostics,
     retrieval_outcome,
@@ -552,14 +553,23 @@ def _search_candidates(
     if retrieval_mode == "fused" or hook_equivalent:
         if worker_config_path is None:
             raise LocomoError("fused retrieval requires a worker config")
-        response = run_hook(
-            config,
-            worker_config_path,
-            query,
-            project=config.roots[0].project,
-            limit=top_k,
-            retrieval_mode=retrieval_mode,
-        )
+        try:
+            response = run_hook(
+                config,
+                worker_config_path,
+                query,
+                project=config.roots[0].project,
+                limit=top_k,
+                retrieval_mode=retrieval_mode,
+            )
+        except Exception as exc:
+            if not hook_equivalent:
+                raise
+            return [], asdict(HookMetrics(
+                failure_reason=f"{type(exc).__name__}: {exc}",
+                status="error",
+                retrieval_mode=retrieval_mode,
+            ))
         return response.candidates, asdict(response.metrics)
     return search(config, query, project=config.roots[0].project, limit=top_k, semantic=False), None
 
@@ -807,17 +817,12 @@ def run_locomo(
     generation = int(ingest.index_generation or 0)
     if records:
         first_scope = scope_configs[int(records[0]["conversation_index"])]
-        if abstention:
-            _search_candidates(
-                first_scope[1], str(records[0]["question"]), top_k, retrieval_mode,
-                worker_config_paths.get(int(records[0]["conversation_index"])),
-                hook_equivalent=True,
-            )
-        else:
-            _search_candidates(
-                first_scope[1], str(records[0]["question"]), top_k, retrieval_mode,
-                worker_config_paths.get(int(records[0]["conversation_index"])),
-            )
+        search_kwargs = {"hook_equivalent": True} if abstention else {}
+        _search_candidates(
+            first_scope[1], str(records[0]["question"]), top_k, retrieval_mode,
+            worker_config_paths.get(int(records[0]["conversation_index"])),
+            **search_kwargs,
+        )
     evaluations: list[Evaluation] = []
     diagnostic_records: list[dict[str, object]] = []
     abstention_records: list[dict[str, object]] = []
@@ -848,17 +853,11 @@ def run_locomo(
         if checkpoint is None:
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
-            if abstention:
-                raw = _search_record(
-                    record, scope_config, scope_notes, top_k, retrieval_mode,
-                    worker_config_paths.get(int(record["conversation_index"])),
-                    hook_equivalent=True,
-                )
-            else:
-                raw = _search_record(
-                    record, scope_config, scope_notes, top_k, retrieval_mode,
-                    worker_config_paths.get(int(record["conversation_index"])),
-                )
+            raw = _search_record(
+                record, scope_config, scope_notes, top_k, retrieval_mode,
+                worker_config_paths.get(int(record["conversation_index"])),
+                hook_equivalent=abstention,
+            )
             Checkpoint("search", run_id, dataset["fingerprint"], scope_corpus_hash, scope_generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
             raw = checkpoint.output
@@ -890,17 +889,8 @@ def run_locomo(
         if predict_only or abstention:
             for cutoff in cutoffs:
                 if abstention:
-                    injected = len(retrieval[:cutoff])
-                    outcomes[str(cutoff)] = CutoffOutcome(
-                        retrieved_count=injected,
-                        relevant_count=0,
-                        recall=None,
-                        precision=None,
-                        mrr=None,
-                        abstention_correct=injected == 0,
-                        forbidden_sources=0,
-                        score=1.0 if injected == 0 else 0.0,
-                        passed=injected == 0,
+                    outcomes[str(cutoff)] = abstention_outcome(
+                        retrieval, cutoff, raw.get("retrieval_diagnostics")
                     )
                 else:
                     relevant, recall, precision, mrr = retrieval_outcome(retrieval, list(raw["targets"]), cutoff)
