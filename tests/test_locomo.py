@@ -181,7 +181,8 @@ def test_predict_only_resume_reuses_search_checkpoints(tmp_path: Path, monkeypat
     assert (tmp_path / "locomo/predict-resume/run.json").exists()
 
 
-def test_fused_resume_recomputes_checkpoint_without_diagnostics(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("diagnostic_mutation", ("empty", "missing_failure_reason"))
+def test_fused_resume_recomputes_checkpoint_with_incomplete_diagnostics(tmp_path: Path, monkeypatch, diagnostic_mutation: str):
     dataset = Path(__file__).parent / "fixtures/locomo/small.json"
     run_locomo(
         run_id="fused-diagnostics-resume",
@@ -194,7 +195,10 @@ def test_fused_resume_recomputes_checkpoint_without_diagnostics(tmp_path: Path, 
     )
     checkpoint_path = tmp_path / "locomo/fused-diagnostics-resume/checkpoints/search/conv0_q0.json"
     checkpoint = json.loads(checkpoint_path.read_text())
-    del checkpoint["output"]["retrieval_diagnostics"]
+    if diagnostic_mutation == "empty":
+        checkpoint["output"]["retrieval_diagnostics"] = {}
+    else:
+        del checkpoint["output"]["retrieval_diagnostics"]["failure_reason"]
     checkpoint_path.write_text(json.dumps(checkpoint))
 
     real_search_record = locomo_runner._search_record
