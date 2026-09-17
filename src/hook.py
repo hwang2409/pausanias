@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .core import Candidate, search
+from .core import Candidate, SEMANTIC_SCORE_FLOOR, search
 from .worker import ADAPTER_DEADLINE_MS, HookMetrics, WorkerClient, WorkerError, ensure_worker
 
 
@@ -111,6 +111,7 @@ def run_hook(
     all_projects: bool = False,
     limit: int = 20,
     deadline_ms: float = ADAPTER_DEADLINE_MS,
+    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
 ) -> HookResponse:
     """Run one semantic request through a persistent worker or lexical fallback."""
     if deadline_ms <= 0:
@@ -129,6 +130,7 @@ def run_hook(
             "all_projects": all_projects,
             "limit": limit,
             "deadline_ms": deadline_ms,
+            "semantic_score_floor": semantic_score_floor,
         }, deadline)
         items = response.get("items")
         raw_metrics = response.get("metrics")

@@ -375,9 +375,12 @@ def _print_table(
 
 
 def main(argv: list[str] | None = None) -> int:
-    modern_flags = {"--predict-only", "--evaluate-only", "--resume", "--run-id", "--results-dir", "--top-k", "--cutoffs", "--corpus"}
+    modern_flags = {
+        "--predict-only", "--evaluate-only", "--resume", "--run-id", "--results-dir", "--top-k",
+        "--cutoffs", "--corpus", "--retrieval-mode", "--through-worker",
+    }
     arguments = sys.argv[1:] if argv is None else argv
-    if any(flag in arguments for flag in modern_flags):
+    if any(flag in modern_flags or flag.startswith("--retrieval-mode=") for flag in arguments):
         from .harness import main as harness_main
 
         return harness_main(arguments)

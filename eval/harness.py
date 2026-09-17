@@ -8,12 +8,21 @@ import shutil
 import sqlite3
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 from pausanias.config import Config, Root, load_config
-from pausanias.core import Candidate, index, search, semantic_search
+from pausanias.core import (
+    FUSION_DIAGNOSTICS,
+    SEMANTIC_SCORE_FLOOR,
+    Candidate,
+    index,
+    search,
+    semantic_search,
+)
+from pausanias.hook import run_hook
+from pausanias.worker import stop_worker
 
 from .run import (
     CASES_PATH,
@@ -70,6 +79,33 @@ def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, data
     return Config(roots, global_notes, source.private_paths, database, source.section_bytes, source.semantic_bundle)
 
 
+def _runtime_config_path(
+    source: Config,
+    corpus_dir: Path,
+    runtime_corpus: Path,
+    database: Path,
+    path: Path,
+) -> Path:
+    runtime = _runtime_config(source, corpus_dir, runtime_corpus, database)
+    lines = [
+        f"database = {json.dumps(str(runtime.database))}",
+        f"private_paths = {json.dumps(list(runtime.private_paths))}",
+        f"global_notes = {json.dumps(sorted(str(note) for note in runtime.global_notes))}",
+        f"semantic_bundle = {json.dumps(str(runtime.semantic_bundle))}",
+    ]
+    for root in runtime.roots:
+        lines.extend((
+            "",
+            "[[roots]]",
+            f"id = {json.dumps(root.id)}",
+            f"project = {json.dumps(root.project)}",
+            f"path = {json.dumps(str(root.path))}",
+            f"exclude = {json.dumps(list(root.excludes))}",
+        ))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def _corpus_fingerprint(root: Path) -> str:
     files = []
     for path in sorted(root.rglob("*")):
@@ -101,7 +137,7 @@ def _index_generation(database: Path) -> int:
 
 
 def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str, retrieval_mode: str = "lexical") -> dict[str, Any]:
-    return {
+    config = {
         "retrieval_mode": retrieval_mode,
         "prompt_mode": "internal-deterministic",
         "top_k": top_k,
@@ -112,6 +148,9 @@ def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str, ret
         "judge_provider": None,
         "case_set_fingerprint": case_lock,
     }
+    if retrieval_mode == "fused":
+        config["fusion"] = FUSION_DIAGNOSTICS
+    return config
 
 
 def _candidate_result(candidate: Candidate, corpus: Path, rank: int) -> RetrievalResult:
@@ -319,6 +358,7 @@ def run_internal(
     predict_only: bool = False,
     evaluate_only: bool = False,
     retrieval_mode: str = "lexical",
+    through_worker: bool = False,
 ) -> UnifiedResult | None:
     if predict_only and evaluate_only:
         raise ValueError("--predict-only and --evaluate-only cannot be combined")
@@ -343,6 +383,10 @@ def run_internal(
     corpus_hash = _corpus_fingerprint(runtime_corpus)
     source_config = load_config(config_path)
     config = _runtime_config(source_config, corpus_dir, runtime_corpus, database)
+    worker_config_path = (
+        _runtime_config_path(source_config, corpus_dir, runtime_corpus, database, workspace / "worker-config.toml")
+        if through_worker else None
+    )
     reuse_checkpoints = resume or evaluate_only
     ingest = read_checkpoint(
         ingest_path,
@@ -373,8 +417,9 @@ def run_internal(
         ingest.write(ingest_path)
     generation = int(ingest.index_generation or 0)
     if cases:
-        _run_search(config, cases[0], top_k, retrieval_mode)
+        _run_search(config, cases[0], top_k, retrieval_mode, config_path=worker_config_path)
     evaluations: list[Evaluation] = []
+    baseline_evaluations: list[Evaluation] = []
     for case in cases:
         checkpoint_path = search_dir / f"{case.id}.json"
         checkpoint = read_checkpoint(
@@ -392,18 +437,14 @@ def run_internal(
         if checkpoint is not None:
             raw = checkpoint.output
         else:
-            with _temporarily_deleted(runtime_corpus, case.delete_sources):
-                refresh: set[str] = set()
-                started = time.perf_counter()
-                candidates = _run_search(config, case, top_k, retrieval_mode, refresh)
-                elapsed = (time.perf_counter() - started) * 1000
-            raw = {
-                "case_id": case.id,
-                "query": case.query,
-                "search_latency_ms": elapsed,
-                "retrieval_fingerprint": fingerprint([candidate.section_id for candidate in candidates]),
-                "retrieval_results": [asdict(_candidate_result(candidate, runtime_corpus, rank)) for rank, candidate in enumerate(candidates, 1)],
-            }
+            raw = _search_case(
+                config,
+                runtime_corpus,
+                case,
+                top_k,
+                retrieval_mode,
+                worker_config_path,
+            )
             Checkpoint(
                 stage="search",
                 run_id=run_id,
@@ -418,6 +459,22 @@ def run_internal(
                 output=raw,
             ).write(checkpoint_path)
         evaluations.append(_evaluation(case, raw, cutoffs))
+        if retrieval_mode == "fused":
+            baseline_evaluations.append(_evaluation(
+                case,
+                _search_case(
+                    config,
+                    runtime_corpus,
+                    case,
+                    top_k,
+                    retrieval_mode,
+                    worker_config_path,
+                    semantic_score_floor=None,
+                ),
+                cutoffs,
+            ))
+    if through_worker:
+        stop_worker(config.database)
     if predict_only:
         print(f"internal predict-only: {len(evaluations)} search checkpoints; case-set fingerprint {case_lock}")
         return None
@@ -427,6 +484,19 @@ def run_internal(
     if retrieval_mode == "fused" and "fused_categories" in thresholds:
         thresholds = {**thresholds, "categories": thresholds["fused_categories"]}
     metrics = _metrics(evaluations, cutoffs, thresholds)
+    if baseline_evaluations:
+        baseline = _metrics(baseline_evaluations, cutoffs, thresholds)
+        metrics = replace(metrics, baselines={
+            "rrf_only_floor_disabled": {
+                "semantic_score_floor": None,
+                "recall_at_4": baseline.deterministic_gates["by_cutoff"]["4"]["recall"],
+                "precision_at_4": baseline.deterministic_gates["by_cutoff"]["4"]["precision"],
+                "mrr": baseline.deterministic_gates["by_cutoff"]["4"]["mrr"],
+                "abstention_accuracy": baseline.deterministic_gates["by_cutoff"]["4"]["abstention_accuracy"],
+                "forbidden_violations": baseline.deterministic_gates["by_cutoff"]["4"]["forbidden_violations"],
+                "by_category": baseline.deterministic_gates["by_category"],
+            },
+        })
     started_at = ingest.started_at
     metadata = Metadata(
         benchmark=BENCHMARK,
@@ -448,6 +518,8 @@ def run_internal(
     result.write(run_root / "run.json")
     print(f"internal evaluation: {metrics.overall_accuracy:.2f}% accuracy; case-set fingerprint {case_lock}")
     print(json.dumps(metrics.deterministic_gates, sort_keys=True))
+    if metrics.baselines:
+        print(json.dumps({"baselines": metrics.baselines}, sort_keys=True))
     if not metrics.deterministic_gates["by_cutoff"]["4"]["passed"]:
         raise ValueError("internal deterministic gates failed")
     return result
@@ -459,7 +531,21 @@ def _run_search(
     top_k: int,
     retrieval_mode: str,
     refresh: set[str] | None = None,
+    *,
+    config_path: Path | None = None,
+    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
 ) -> list[Candidate]:
+    if config_path is not None and retrieval_mode == "fused":
+        return run_hook(
+            config,
+            config_path,
+            case.query,
+            project=case.scope.get("project"),
+            root_id=case.scope.get("root"),
+            all_projects=bool(case.scope.get("all_projects", False)),
+            limit=top_k,
+            semantic_score_floor=semantic_score_floor,
+        ).candidates
     if retrieval_mode == "fused":
         return semantic_search(
             config,
@@ -469,6 +555,7 @@ def _run_search(
             all_projects=bool(case.scope.get("all_projects", False)),
             limit=top_k,
             refresh=refresh,
+            semantic_score_floor=semantic_score_floor,
         )
     return search(
         config,
@@ -479,6 +566,41 @@ def _run_search(
         limit=top_k,
         refresh=refresh,
     )
+
+
+def _search_case(
+    config: Config,
+    runtime_corpus: Path,
+    case: Case,
+    top_k: int,
+    retrieval_mode: str,
+    worker_config_path: Path | None,
+    *,
+    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+) -> dict[str, Any]:
+    with _temporarily_deleted(runtime_corpus, case.delete_sources):
+        refresh: set[str] = set()
+        started = time.perf_counter()
+        candidates = _run_search(
+            config,
+            case,
+            top_k,
+            retrieval_mode,
+            refresh,
+            config_path=worker_config_path,
+            semantic_score_floor=semantic_score_floor,
+        )
+        elapsed = (time.perf_counter() - started) * 1000
+    return {
+        "case_id": case.id,
+        "query": case.query,
+        "search_latency_ms": elapsed,
+        "retrieval_fingerprint": fingerprint([candidate.section_id for candidate in candidates]),
+        "retrieval_results": [
+            asdict(_candidate_result(candidate, runtime_corpus, rank))
+            for rank, candidate in enumerate(candidates, 1)
+        ],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -493,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--predict-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--retrieval-mode", choices=("lexical", "fused"), default="lexical")
+    parser.add_argument("--through-worker", action="store_true", help="run retrieval through the real hook worker")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -509,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             predict_only=args.predict_only,
             evaluate_only=args.evaluate_only,
             retrieval_mode=args.retrieval_mode,
+            through_worker=args.through_worker,
         )
         return 0
     except (OSError, ValueError, TypeError, sqlite3.DatabaseError) as exc:

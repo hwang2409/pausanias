@@ -6,6 +6,7 @@ import pytest
 
 from pausanias import core
 from pausanias.config import load_config
+from pausanias.vectors import Candidate
 
 
 class FakeEncoder:
@@ -17,6 +18,28 @@ class FakeEncoder:
             vector[1] = 1.0 if "alpha" in text.lower() else 0.0
             vectors.append(vector)
         return vectors
+
+
+class BalancedEncoder:
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        vectors = []
+        for text in texts:
+            vector = [0.0] * 384
+            if text.strip().lower() == "needle phrase" or "semantic target" in text.lower():
+                vector[0] = 1.0
+            else:
+                vector[1] = 1.0
+            vectors.append(vector)
+        return vectors
+
+
+def _candidate(section_id: str, lexical_rank: int | None = None, vector_rank: int | None = None) -> Candidate:
+    return Candidate(
+        section_id, f"/{section_id}.md", section_id, (section_id,), 1, 2, "vault", "p",
+        section_id, section_id, None, None, None, 0.0, "match", lexical_rank, vector_rank,
+        0.0 if lexical_rank is not None else None, 1.0 if vector_rank is not None else None,
+        None, "lexical" if lexical_rank is not None else "semantic", None,
+    )
 
 
 def _config(tmp_path: Path):
@@ -63,3 +86,53 @@ def test_fused_search_uses_semantic_candidate_when_fts_misses(tmp_path: Path):
 
 def test_guard_atoms_normalize_quotes_and_whitespace():
     assert core._guard_atoms('Why did  PAUS-4\tbeat "  Cold\u00a0Path "?') == ["paus-4", "cold path"]
+
+
+def test_unguarded_fusion_admits_top_semantic_candidate_after_lexical_distractors(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    for number in range(50):
+        (root / f"distractor-{number}.md").write_text(f"# Distractor {number}\nneedle phrase distractor\n")
+    (root / "target.md").write_text("# Target\nsemantic target evidence\n")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'database = "{tmp_path / "index.sqlite3"}"\n\n'
+        f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n'
+    )
+    config = load_config(config_path)
+    encoder = BalancedEncoder()
+    core.index(config, encoder=encoder)
+
+    results = core.semantic_search(config, "needle phrase", project="p", limit=4, encoder=encoder)
+
+    target = next(item for item in results if item.heading == "Target")
+    assert target.vector_rank == 1
+
+
+def test_guarded_fusion_keeps_existing_lexical_order():
+    lexical = [_candidate(section_id, rank) for rank, section_id in enumerate(("c", "a", "b", "d"), 1)]
+    semantic = [_candidate(section_id, None, rank) for rank, section_id in enumerate(("b", "c", "a", "d"), 1)]
+    result = core._fuse_candidates(
+        lexical, semantic, {"b": 1, "c": 2, "a": 3, "d": 4},
+        {1: {"a", "b", "c", "d"}}, True, 4,
+    )
+
+    assert [item.section_id for item in result] == ["c", "a", "b", "d"]
+
+
+def test_guard_matching_casefolds_indexed_text(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Straße\nThe road decision.\n")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'database = "{tmp_path / "index.sqlite3"}"\n\n'
+        f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n'
+    )
+    config = load_config(config_path)
+    core.index(config)
+
+    result = core.semantic_search(config, '"STRASSE"', project="p", limit=1, encoder=FakeEncoder())
+
+    assert result[0].guard_reason == "protected:atom-1"

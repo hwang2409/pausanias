@@ -19,7 +19,7 @@ from typing import Callable
 import uuid
 
 from .config import Config, load_config
-from .core import search, semantic_search
+from .core import SEMANTIC_SCORE_FLOOR, search, semantic_search
 from .model_bundle import BundleError, MODEL_BUNDLE_MANIFEST, _resolve_active_bundle
 from .vectors import Candidate, OnnxEncoder, SemanticError, semantic_backend_reason
 
@@ -271,12 +271,18 @@ class PersistentWorker:
         root_id = request.get("root_id")
         all_projects = request.get("all_projects", False)
         limit = request.get("limit", 20)
+        semantic_score_floor = request.get("semantic_score_floor", SEMANTIC_SCORE_FLOOR)
         if project is not None and not isinstance(project, str):
             raise WorkerError("worker project must be a string or null")
         if root_id is not None and not isinstance(root_id, str):
             raise WorkerError("worker root_id must be a string or null")
         if not isinstance(all_projects, bool) or not isinstance(limit, int):
             raise WorkerError("worker scope values are invalid")
+        if (semantic_score_floor is not None
+                and (not isinstance(semantic_score_floor, (int, float))
+                     or isinstance(semantic_score_floor, bool)
+                     or not 0.0 <= float(semantic_score_floor) <= 1.0)):
+            raise WorkerError("worker semantic score floor is invalid")
         self._check_cancelled(cancelled)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
@@ -292,6 +298,8 @@ class PersistentWorker:
                     candidates = semantic_search(
                         self.config, query, project, root_id, all_projects, limit,
                         encoder=encoder, matrix_cache=self._matrix_cache, timings=timings,
+                        semantic_score_floor=(float(semantic_score_floor)
+                                              if semantic_score_floor is not None else None),
                     )
                     self._check_cancelled(cancelled)
                     if not timings.get("semantic_available"):
