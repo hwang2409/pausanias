@@ -17,7 +17,7 @@ import tempfile
 import time
 
 from .config import Config, load_config
-from .core import index, search
+from .core import fusion_diagnostics, index, search
 from .worker import stop_worker
 from .splitter import split_markdown
 from .synth import generate_corpus
@@ -74,6 +74,7 @@ def _write_config(
     database: Path,
     synthetic: bool,
     bundle_dir: str | Path | None = None,
+    synonym_table: str | Path | None = None,
 ) -> tuple[Path, int]:
     source = source.resolve()
     if synthetic:
@@ -91,6 +92,8 @@ def _write_config(
     lines = [f"database = {json.dumps(str(database))}"]
     if bundle_dir is not None:
         lines.append(f"semantic_bundle = {json.dumps(str(Path(bundle_dir).expanduser().resolve()))}")
+    if synonym_table is not None:
+        lines.append(f"synonym_table = {json.dumps(str(Path(synonym_table).expanduser().resolve()))}")
     if global_notes:
         notes = ", ".join(json.dumps(str(path)) for path in global_notes)
         lines += [f"global_notes = [{notes}]"]
@@ -336,6 +339,7 @@ def run_benchmark(
     real_dir: str | Path | None = None,
     hook_path: bool = False,
     bundle_dir: str | Path | None = None,
+    synonym_table: str | Path | None = None,
 ) -> dict:
     """Run the benchmark and return a JSON-serializable report."""
 
@@ -365,7 +369,7 @@ def run_benchmark(
             generated = True
 
         config_path, actual_file_count = _write_config(
-            workspace, source, workspace / "index.sqlite3", synthetic, bundle_dir,
+            workspace, source, workspace / "index.sqlite3", synthetic, bundle_dir, synonym_table,
         )
         config = load_config(config_path)
         documents = _documents(config, source)
@@ -467,6 +471,7 @@ def run_benchmark(
                 "enforced": default_synthetic,
                 "reason": "warm search p95 must be at most 300 ms",
             },
+            "synonym_table": fusion_diagnostics(config)["synonym_table"],
         }
         if hook_path:
             report["hook_path"] = _run_hook_benchmark(

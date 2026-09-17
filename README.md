@@ -12,6 +12,7 @@ Example `config.toml`:
 database = "./index.sqlite3"
 private_paths = ["private/**"]
 global_notes = ["./shared/decision-log.md"]
+synonym_table = "./synonyms.toml"
 
 [[roots]]
 id = "vault"
@@ -32,6 +33,18 @@ python -m pausanias --config ./config.toml read ./vault/decision.md --heading "D
 Use `--rebuild` to recreate the derived database. Use `--all-projects`
 only when cross-project search is intentional. Semantic search is opt-in and falls
 back to lexical results when its model or vector store is unavailable.
+
+The optional synonym table is local and operator-maintained:
+
+```toml
+version = 1
+
+[terms]
+database = ["db"]
+```
+
+Expansion skips ticket identifiers and quoted phrases. It replaces one ordinary term at
+a time and stops at 16 variants. A missing table disables expansion.
 
 ## optional semantic model
 

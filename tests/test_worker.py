@@ -101,6 +101,51 @@ def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
         thread.join(timeout=2)
 
 
+def test_worker_applies_configured_synonym_table(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    table_path = tmp_path / "synonyms.toml"
+    table_path.write_text('version = 1\n\n[terms]\nmemory = ["recall"]\n')
+    config = type(config)(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, table_path,
+    )
+    core.index(config, encoder=FakeEncoder())
+    worker = PersistentWorker(config, encoder=FakeEncoder())
+
+    response = worker._query({"query": "recall", "project": "p"})
+
+    assert response["items"][0]["heading"] == "Note"
+
+
+def test_live_worker_reloads_changed_synonym_config(tmp_path: Path):
+    config_path, config = make_config(tmp_path, semantic_bundle=tmp_path / "missing-bundle")
+    core.index(config)
+    paths = worker_paths(config.database)
+    table_path = tmp_path / "synonyms.toml"
+    try:
+        first = ensure_worker(config, config_path, time.perf_counter() + 2, paths)
+        assert first is not None
+        first_response = WorkerClient(first[0]).query(
+            {"query": "recall", "project": "p"}, time.perf_counter() + 2,
+        )
+        assert first_response["items"] == []
+
+        table_path.write_text('version = 1\n\n[terms]\nmemory = ["recall"]\n')
+        config_path.write_text(
+            f'database = "{config.database}"\nsynonym_table = "{table_path}"\n\n'
+            f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{config.roots[0].path}"\n'
+        )
+        reloaded_config = load_config(config_path)
+        second = ensure_worker(reloaded_config, config_path, time.perf_counter() + 2, paths)
+        assert second is not None
+        second_response = WorkerClient(second[0]).query(
+            {"query": "recall", "project": "p"}, time.perf_counter() + 2,
+        )
+        assert second_response["items"][0]["heading"] == "Note"
+    finally:
+        stop_worker(config.database, paths)
+
+
 def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
     bundle = tmp_path / "invalid-bundle"
     bundle.mkdir()

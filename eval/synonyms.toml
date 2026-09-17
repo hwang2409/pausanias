@@ -1,0 +1,6 @@
+version = 1
+
+[terms]
+backend = ["db"]
+memory = ["recall"]
+worker = ["job"]

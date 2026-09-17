@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import FUSION_DIAGNOSTICS, excerpt, index, read_source, search
+from .core import excerpt, fusion_diagnostics, index, read_source, search
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -66,6 +66,7 @@ def parser() -> argparse.ArgumentParser:
     )
     bench_parser.add_argument("--hook-path", action="store_true", help="measure the real semantic hook path")
     bench_parser.add_argument("--bundle-dir", help="semantic model bundle for hook-path benchmarks")
+    bench_parser.add_argument("--synonym-table", help="operator synonym table for benchmark queries")
     bench_parser.add_argument("--json", action="store_true", help="write the report as JSON")
     model_parser = commands.add_parser("model", help="manage the optional semantic model")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -82,7 +83,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _result(candidate, diagnostics: bool = False) -> dict:
+def _result(candidate, diagnostics: bool = False, config=None) -> dict:
     result = {
         "excerpt": excerpt(candidate.text),
         "path": candidate.canonical_path,
@@ -102,7 +103,7 @@ def _result(candidate, diagnostics: bool = False) -> dict:
             "vector_score": candidate.vector_score,
             "fused_score": candidate.fused_score,
             "guard_reason": candidate.guard_reason,
-            "fusion_policies": FUSION_DIAGNOSTICS,
+            "fusion_policies": fusion_diagnostics(config),
         })
     return result
 
@@ -157,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 real_dir=args.real,
                 hook_path=args.hook_path,
                 bundle_dir=args.bundle_dir,
+                synonym_table=args.synonym_table,
             )
             if args.json:
                 print(json.dumps(report, sort_keys=True))
@@ -190,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.limit,
                 args.deadline_ms,
             )
-            items = [_result(item, diagnostics=True) for item in response.candidates]
+            items = [_result(item, diagnostics=True, config=config) for item in response.candidates]
             if args.json:
                 print(json.dumps({"items": items, "metrics": response.metrics.__dict__}, ensure_ascii=False))
             else:
@@ -225,11 +227,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = load_config(args.config)
             if args.semantic:
-                results = [_result(item, diagnostics=True) for item in run_hook(
+                results = [_result(item, diagnostics=True, config=config) for item in run_hook(
                     config, args.config, args.query, args.project, args.root, args.all_projects, args.limit,
                 ).candidates]
             else:
-                results = [_result(item, diagnostics=args.diagnostics) for item in search(
+                results = [_result(item, diagnostics=args.diagnostics, config=config) for item in search(
                     config, args.query, args.project, args.root, args.all_projects, args.limit,
                 )]
             if args.json:

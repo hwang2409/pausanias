@@ -1,4 +1,5 @@
 database = "./index.sqlite3"
+synonym_table = "synonyms.toml"
 private_paths = ["private/**"]
 global_notes = ["corpus/shared/team-decisions.md", "corpus/shared/security-boundaries.md"]
 

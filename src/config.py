@@ -27,6 +27,7 @@ class Config:
     database: Path
     section_bytes: int = 12000
     semantic_bundle: Path = Path("~/.cache/pausanias/models/all-MiniLM-L6-v2")
+    synonym_table: Path | None = None
 
     @property
     def bundle_dir(self) -> Path:
@@ -193,7 +194,16 @@ def load_config(path: str | Path) -> Config:
     if not bundle_candidate.is_absolute():
         bundle_candidate = config_path.parent / bundle_candidate
     bundle_dir = _resolve(bundle_candidate, strict=False)
-    return Config(tuple(roots), frozenset(global_notes), tuple(private_paths), database, section_bytes, bundle_dir)
+    synonym_raw = raw.get("synonym_table")
+    if synonym_raw is not None and (not isinstance(synonym_raw, str) or not synonym_raw):
+        raise ConfigError("synonym_table must be a non-empty path")
+    synonym_table = None
+    if synonym_raw is not None:
+        synonym_candidate = Path(synonym_raw).expanduser()
+        if not synonym_candidate.is_absolute():
+            synonym_candidate = config_path.parent / synonym_candidate
+        synonym_table = _resolve(synonym_candidate, strict=False)
+    return Config(tuple(roots), frozenset(global_notes), tuple(private_paths), database, section_bytes, bundle_dir, synonym_table)
 
 
 def default_config_path() -> Path:

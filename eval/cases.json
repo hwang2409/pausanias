@@ -803,6 +803,34 @@
       "abstain": false,
       "category": "held-out",
       "rationale": "held-out rephrasing asks if the first version uses hosted search"
+    },
+    {
+      "id": "synonym-database-alias",
+      "query": "db",
+      "scope": {
+        "project": "pausanias"
+      },
+      "expected_source_paths": [
+        "pausanias/decisions/fts-backend.md"
+      ],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "synonym",
+      "rationale": "requires the configured db alias for backend"
+    },
+    {
+      "id": "synonym-worker-alias",
+      "query": "job",
+      "scope": {
+        "project": "phoebe"
+      },
+      "expected_source_paths": [
+        "phoebe/concepts/worker-isolation.md"
+      ],
+      "forbidden_paths": [],
+      "abstain": false,
+      "category": "synonym",
+      "rationale": "requires the configured job alias for worker"
     }
   ]
 }

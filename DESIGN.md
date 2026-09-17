@@ -390,7 +390,7 @@ lexical guard for exact identifiers and quoted phrases.
    requested `limit`. Apply the cap before validation, but never discard a protected
    lexical candidate in favor of a vector candidate.
 
-The fused path has four named selection policies. `SEMANTIC_SCORE_FLOOR` is
+The fused path has six named selection policies. `SEMANTIC_SCORE_FLOOR` is
 `0.30` and rejects weak cosine matches. `RELATIVE_SEMANTIC_SCORE_FLOOR` is `0.70` and
 rejects semantic matches below 70% of the strongest lexical match when the query has a
 lexical overlap. `TICKET_ID_CROSS_REFERENCE_FILTER` is enabled for exact ticket queries;
@@ -398,8 +398,11 @@ it removes semantic candidates whose guarded text, including heading path and bo
 mentions a different ticket identifier. This generic cross-reference rule prevents a
 related ticket from displacing the requested ticket. `BALANCED_ADMISSION` is enabled
 for unguarded queries and interleaves lexical and semantic candidates before the union
-cap. All four policies are named in `src/core.py`, included in fusion diagnostics, and
-have independent worker-path ablations in the internal evaluation harness. The diagnostics
+cap. `SYNONYM_EXPANSION` is enabled when a valid table is configured and adds one-term
+variants to the lexical lane. `SYNONYM_VARIANT_MERGE` ranks expanded sections by their
+best FTS score and breaks ties by section ID. All six policies are named in `src/core.py`
+and included in fusion diagnostics. The tunable policies have independent worker-path
+ablations in the internal evaluation harness. The diagnostics
 also list the query cap, candidate-pool bounds, and RRF rank constant.
 
 For example, query `Why did PAUS-4 beat "cold path"?` has guard atoms `PAUS-4` (ordinal
@@ -427,11 +430,27 @@ global-note rule.
 ### Query expansion
 
 **Recommendation:** add a small, versioned, operator-owned synonym table as a lexical
-complement to embeddings. An entry maps a canonical term to a bounded list of aliases.
+complement to embeddings. Pausanias stores it in an operator-selected TOML file with a
+positive `version` and a `[terms]` table. Each key is one ordinary lexical term and each
+value is a list of at most four ordinary aliases. The file is selected with the optional
+`synonym_table` config path. A missing file means no expansion.
+
 Expand only ordinary lexical terms. Preserve ticket identifiers, quoted phrases, and the
-64-term query cap. Build query variants locally, run them under the same scope, and merge
-them into the lexical lane before RRF. Include the synonym-table fingerprint in the
-ranking trace and index metadata when expansion affects indexing.
+64-term query cap. Build at most 16 local variants, replacing one term at a time. Include
+the original query first. Treat each canonical term and alias as equivalent, so either
+vocabulary direction can find the same indexed text. Run every variant under the same
+scope and merge them into the lexical lane before RRF. Include the table version and
+fingerprint in diagnostics and evaluation fingerprints.
+
+Rank the merged lexical lane by the best FTS score for each section across the original
+query and all variants. Break equal scores by section ID. Alias order has no ranking effect.
+
+The expansion policy is part of the selection-policy inventory:
+
+| Policy | Default | Selection rule | Ablation |
+| --- | --- | --- | --- |
+| Synonym expansion | enabled when configured | one unquoted ordinary term, at most 16 variants | disable the table for the worker path |
+| Synonym variant merge | enabled for expanded queries | best FTS score per section, then section ID | disable synonym expansion |
 
 Do not use network-generated rewrites. Do not expand from retrieved text. Embeddings are
 the primary bridge for ordinary paraphrases; synonyms cover stable local vocabulary such
@@ -522,6 +541,9 @@ The worker lifecycle is bounded and recoverable:
 
 - Keep one ONNX session per model-manifest fingerprint and one vector matrix per index
   generation plus scope key. Load each lazily on the first request that needs it.
+- Record a fingerprint of the resolved worker configuration, including the synonym-table
+  content fingerprint. Reuse a live worker only when this fingerprint matches; otherwise
+  replace it before serving the next request.
 - Before each request, read the committed active generation and manifest fingerprint from
   SQLite. A worker cache key is `(database identity, generation, scope key, manifest
   fingerprint)`, so a new generation invalidates every older matrix for that database.

@@ -15,11 +15,12 @@ from typing import Any
 from pausanias.config import Config, Root, load_config
 from pausanias.core import (
     BALANCED_ADMISSION,
-    FUSION_DIAGNOSTICS,
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
+    SYNONYM_EXPANSION,
     Candidate,
+    fusion_diagnostics,
     index,
     search,
     semantic_search,
@@ -73,6 +74,10 @@ ABLATION_SPECS = {
         "balanced_admission": False,
         "policy": "balanced_admission",
     },
+    "synonym_expansion_disabled": {
+        "synonym_expansion": False,
+        "policy": "synonym_expansion",
+    },
 }
 
 
@@ -97,7 +102,10 @@ def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, data
 
     roots = tuple(Root(root.id, map_path(root.path), root.project, root.excludes) for root in source.roots)
     global_notes = frozenset(map_path(path) for path in source.global_notes)
-    return Config(roots, global_notes, source.private_paths, database, source.section_bytes, source.semantic_bundle)
+    return Config(
+        roots, global_notes, source.private_paths, database, source.section_bytes,
+        source.semantic_bundle, source.synonym_table,
+    )
 
 
 def _runtime_config_path(
@@ -114,6 +122,8 @@ def _runtime_config_path(
         f"global_notes = {json.dumps(sorted(str(note) for note in runtime.global_notes))}",
         f"semantic_bundle = {json.dumps(str(runtime.semantic_bundle))}",
     ]
+    if runtime.synonym_table is not None:
+        lines.append(f"synonym_table = {json.dumps(str(runtime.synonym_table))}")
     for root in runtime.roots:
         lines.extend((
             "",
@@ -157,8 +167,14 @@ def _index_generation(database: Path) -> int:
     return int(row[0])
 
 
-def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str, retrieval_mode: str = "lexical") -> dict[str, Any]:
-    config = {
+def _checkpoint_config(
+    top_k: int,
+    cutoffs: tuple[int, ...],
+    case_lock: str,
+    retrieval_mode: str = "lexical",
+    config: Config | None = None,
+) -> dict[str, Any]:
+    values = {
         "retrieval_mode": retrieval_mode,
         "prompt_mode": "internal-deterministic",
         "top_k": top_k,
@@ -168,10 +184,11 @@ def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str, ret
         "judge_model": None,
         "judge_provider": None,
         "case_set_fingerprint": case_lock,
+        "synonym_table": fusion_diagnostics(config)["synonym_table"],
     }
     if retrieval_mode == "fused":
-        config["fusion"] = FUSION_DIAGNOSTICS
-    return config
+        values["fusion"] = fusion_diagnostics(config)
+    return values
 
 
 def _candidate_result(candidate: Candidate, corpus: Path, rank: int) -> RetrievalResult:
@@ -390,7 +407,8 @@ def run_internal(
     case_lock = verify_case_lock(cases_path)
     case_set = load_case_set(cases_path)
     cases = list(case_set.cases)
-    config_values = _checkpoint_config(top_k, cutoffs, case_lock, retrieval_mode)
+    source_config = load_config(config_path)
+    config_values = _checkpoint_config(top_k, cutoffs, case_lock, retrieval_mode, source_config)
     run_root = results_dir / BENCHMARK / run_id
     workspace = run_root / "workspace"
     runtime_corpus = workspace / "corpus"
@@ -402,7 +420,6 @@ def run_internal(
         runtime_corpus.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(corpus_dir, runtime_corpus)
     corpus_hash = _corpus_fingerprint(runtime_corpus)
-    source_config = load_config(config_path)
     config = _runtime_config(source_config, corpus_dir, runtime_corpus, database)
     worker_config_path = (
         _runtime_config_path(source_config, corpus_dir, runtime_corpus, database, workspace / "worker-config.toml")
@@ -571,6 +588,7 @@ def _run_search(
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
+    synonym_expansion: bool = SYNONYM_EXPANSION,
 ) -> list[Candidate]:
     if config_path is not None and retrieval_mode == "fused":
         return run_hook(
@@ -585,6 +603,7 @@ def _run_search(
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
+            synonym_expansion=synonym_expansion,
         ).candidates
     if retrieval_mode == "fused":
         return semantic_search(
@@ -599,6 +618,7 @@ def _run_search(
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
+            synonym_expansion=synonym_expansion,
         )
     return search(
         config,
@@ -608,6 +628,7 @@ def _run_search(
         all_projects=bool(case.scope.get("all_projects", False)),
         limit=top_k,
         refresh=refresh,
+        synonym_expansion=synonym_expansion,
     )
 
 
@@ -623,6 +644,7 @@ def _search_case(
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
+    synonym_expansion: bool = SYNONYM_EXPANSION,
 ) -> dict[str, Any]:
     with _temporarily_deleted(runtime_corpus, case.delete_sources):
         refresh: set[str] = set()
@@ -638,6 +660,7 @@ def _search_case(
             relative_semantic_score_floor=relative_semantic_score_floor,
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
+            synonym_expansion=synonym_expansion,
         )
         elapsed = (time.perf_counter() - started) * 1000
     return {

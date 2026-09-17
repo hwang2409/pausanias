@@ -14,6 +14,7 @@ from .core import (
     RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
+    SYNONYM_EXPANSION,
     search,
 )
 from .worker import ADAPTER_DEADLINE_MS, HookMetrics, WorkerClient, WorkerError, ensure_worker
@@ -54,9 +55,11 @@ def _candidate(value: dict[str, object]) -> Candidate:
 
 
 def _lexical_search_child(connection, config: Config, query: str, project: str | None,
-                          root_id: str | None, all_projects: bool, limit: int) -> None:
+                          root_id: str | None, all_projects: bool, limit: int,
+                          synonym_expansion: bool) -> None:
     try:
-        connection.send(search(config, query, project, root_id, all_projects, limit))
+        connection.send(search(config, query, project, root_id, all_projects, limit,
+                               synonym_expansion=synonym_expansion))
     except Exception as exc:
         connection.send(exc)
     finally:
@@ -64,7 +67,8 @@ def _lexical_search_child(connection, config: Config, query: str, project: str |
 
 
 def _lexical_search_until(config: Config, query: str, project: str | None, root_id: str | None,
-                          all_projects: bool, limit: int, deadline: float | None) -> list[Candidate]:
+                          all_projects: bool, limit: int, deadline: float | None,
+                          synonym_expansion: bool) -> list[Candidate]:
     if deadline is not None and time.perf_counter() >= deadline:
         return []
     start_method = "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
@@ -72,7 +76,7 @@ def _lexical_search_until(config: Config, query: str, project: str | None, root_
     parent, child = context.Pipe(False)
     process = context.Process(
         target=_lexical_search_child,
-        args=(child, config, query, project, root_id, all_projects, limit),
+        args=(child, config, query, project, root_id, all_projects, limit, synonym_expansion),
         daemon=True,
     )
     process.start()
@@ -95,9 +99,12 @@ def _lexical_search_until(config: Config, query: str, project: str | None, root_
 def _fallback(config: Config, query: str, project: str | None, root_id: str | None,
               all_projects: bool, limit: int, started: float,
               worker_startup_ms: float = 0.000001, deadline: float | None = None,
-              disabled_reason: str | None = None) -> HookResponse:
+              disabled_reason: str | None = None,
+              synonym_expansion: bool = SYNONYM_EXPANSION) -> HookResponse:
     fallback_started = time.perf_counter()
-    candidates = _lexical_search_until(config, query, project, root_id, all_projects, limit, deadline)
+    candidates = _lexical_search_until(
+        config, query, project, root_id, all_projects, limit, deadline, synonym_expansion,
+    )
     fallback_ms = max((time.perf_counter() - fallback_started) * 1000.0, 0.000001)
     return HookResponse(candidates, HookMetrics(
         worker_startup_ms=worker_startup_ms,
@@ -122,6 +129,7 @@ def run_hook(
     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
+    synonym_expansion: bool = SYNONYM_EXPANSION,
 ) -> HookResponse:
     """Run one semantic request through a persistent worker or lexical fallback."""
     if deadline_ms <= 0:
@@ -130,7 +138,10 @@ def run_hook(
     deadline = started + deadline_ms / 1000.0
     startup = ensure_worker(config, Path(config_path), deadline)
     if startup is None:
-        return _fallback(config, query, project, root_id, all_projects, limit, started, deadline=deadline)
+        return _fallback(
+            config, query, project, root_id, all_projects, limit, started, deadline=deadline,
+            synonym_expansion=synonym_expansion,
+        )
     paths, worker_startup_ms = startup
     try:
         response = WorkerClient(paths).query({
@@ -144,6 +155,7 @@ def run_hook(
             "relative_semantic_score_floor": relative_semantic_score_floor,
             "ticket_id_cross_reference_filter": ticket_id_cross_reference_filter,
             "balanced_admission": balanced_admission,
+            "synonym_expansion": synonym_expansion,
         }, deadline)
         items = response.get("items")
         raw_metrics = response.get("metrics")
@@ -173,4 +185,4 @@ def run_hook(
         return HookResponse(candidates, metrics)
     except (OSError, TimeoutError, ValueError, TypeError, OverflowError, WorkerError):
         return _fallback(config, query, project, root_id, all_projects, limit, started,
-                         worker_startup_ms, deadline)
+                         worker_startup_ms, deadline, synonym_expansion=synonym_expansion)
