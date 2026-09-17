@@ -130,7 +130,8 @@ def load_cases(path: Path = CASES_PATH) -> list[Case]:
 
 def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, Any]:
     with path.open("rb") as handle:
-        values = tomllib.load(handle).get("thresholds", {})
+        document = tomllib.load(handle)
+    values = document.get("thresholds", {})
     required = ("recall_at_4", "precision_at_4", "mrr", "abstention_accuracy", "forbidden_violations")
     if any(key not in values for key in required):
         raise ValueError("thresholds must define all aggregate metrics")
@@ -144,7 +145,24 @@ def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, Any]:
         if any(key not in category_values for key in required):
             raise ValueError(f"threshold category {category} must define all metrics")
         parsed_categories[category] = {key: float(category_values[key]) for key in required}
-    return {**{key: float(values[key]) for key in required}, "categories": parsed_categories}
+    result = {**{key: float(values[key]) for key in required}, "categories": parsed_categories}
+    arc2 = document.get("arc2", {})
+    if not isinstance(arc2, dict):
+        raise ValueError("arc2 thresholds must be a table")
+    arc2_keys = (
+        "semantic_recall_at_4",
+        "paraphrase_recall_at_4",
+        "held_out_recall_at_4",
+        "verbatim_recall_at_4",
+        "abstention_accuracy",
+        "forbidden_violations",
+        "warm_hybrid_p95_ms",
+    )
+    if arc2:
+        if any(key not in arc2 for key in arc2_keys):
+            raise ValueError("arc2 thresholds must define all hypotheses")
+        result["arc2"] = {key: float(arc2[key]) for key in arc2_keys}
+    return result
 
 
 def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, database: Path) -> Config:

@@ -6,6 +6,16 @@ mrr = 0.659574468
 abstention_accuracy = 1.0
 forbidden_violations = 0
 
+# Arc 2 hypotheses recorded before retrieval tuning.
+[arc2]
+semantic_recall_at_4 = 0.75
+paraphrase_recall_at_4 = 0.75
+held_out_recall_at_4 = 0.75
+verbatim_recall_at_4 = 0.98
+abstention_accuracy = 1.0
+forbidden_violations = 0
+warm_hybrid_p95_ms = 300.0
+
 [thresholds.categories.verbatim]
 recall_at_4 = 1.0
 precision_at_4 = 1.0
