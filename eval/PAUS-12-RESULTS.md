@@ -1,5 +1,18 @@
 # PAUS-12 Arc 2 results
 
+## Summary
+
+- operators can review the final Arc 2 accuracy, latency, policy, and corpus-envelope evidence.
+- the fused hook path passed all active warm and cold gates on both tested corpora.
+- the evidence supports fused retrieval as the default recommendation, with activation still deferred.
+- the real LOCOMO run remains unexecuted and requires Henry's explicit trigger.
+
+## Implementation notes
+
+- added the reproducible PAUS-12 evaluation record and all measured tables.
+- updated the design status and measured-results section.
+- made no runtime default change and made no real LLM calls.
+
 These results were measured on commit `9d7a2c0` with the pinned
 `all-MiniLM-L6-v2` bundle, ONNX Runtime 1.30.0, NumPy 2.3.3, and the
 case-set fingerprint `03be0de0af3a6bdda282137842889212ff135321eea6268cea774dc7dd5eb3cf`.
