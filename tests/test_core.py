@@ -617,8 +617,51 @@ def test_synonym_variants_are_conservative_and_versioned(tmp_path: Path):
     table = load_synonym_table(path)
 
     assert table.version == 1
-    assert table.fingerprint
+    versioned_path = tmp_path / "synonyms-v2.toml"
+    versioned_path.write_text('version = 2\n\n[terms]\ndatabase = ["db"]\n')
+    versioned_table = load_synonym_table(versioned_path)
+
+    assert table.fingerprint != versioned_table.fingerprint
     assert query_variants('database "database" PAUS-11', table) == ('db "database" PAUS-11',)
+
+
+def test_synonym_alias_order_does_not_change_lexical_ranking(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "alpha.md").write_text("# Alpha\nsql sql sql\n")
+    (root / "beta.md").write_text("# Beta\ndb\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    first_table = tmp_path / "synonyms-first.toml"
+    first_table.write_text('version = 1\n\n[terms]\ndatabase = ["db", "sql"]\n')
+    second_table = tmp_path / "synonyms-second.toml"
+    second_table.write_text('version = 1\n\n[terms]\ndatabase = ["sql", "db"]\n')
+
+    first_config = Config(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, first_table,
+    )
+    second_config = Config(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, second_table,
+    )
+    index(first_config)
+
+    first = [item.heading for item in search(first_config, "database", project="p")]
+    second = [item.heading for item in search(second_config, "database", project="p")]
+
+    assert first[0] == "Alpha"
+    assert first == second
+
+
+def test_synonym_diagnostics_report_effective_state(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    config = make_config(tmp_path, [("vault", "p", root)])
+
+    diagnostics = core.fusion_diagnostics(config)
+
+    assert diagnostics["selection_policies"]["synonym_expansion"]["enabled"] is False
+    assert diagnostics["selection_policies"]["synonym_expansion"]["runtime_toggle"] is True
 
 
 def test_synonym_search_uses_alias_without_changing_disabled_output(tmp_path: Path):

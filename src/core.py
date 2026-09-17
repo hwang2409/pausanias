@@ -41,7 +41,7 @@ from .vectors import (
 )
 from .vectors import OnnxEncoder as _OnnxEncoder
 from .vectors import encoder_vectors as _encoder_vectors
-from .synonyms import SynonymTable, load_synonym_table, query_variants, table_metadata
+from .synonyms import SynonymTable, SynonymTableError, load_synonym_table, query_variants, table_metadata
 
 MAX_QUERY_TERMS = 64
 SEMANTIC_SCORE_FLOOR = 0.30
@@ -109,10 +109,29 @@ FUSION_DIAGNOSTICS = {
 }
 
 
-def fusion_diagnostics(config: Config | None = None) -> dict[str, object]:
+def fusion_diagnostics(
+    config: Config | None = None,
+    synonym_expansion: bool = SYNONYM_EXPANSION,
+) -> dict[str, object]:
     policy = {**SELECTION_POLICIES}
-    table = table_metadata(config.synonym_table if config is not None else None)
-    policy["synonym_expansion"] = {**policy["synonym_expansion"], "table": table}
+    try:
+        table = table_metadata(config.synonym_table if config is not None else None)
+    except SynonymTableError as exc:
+        table = {
+            "configured": config is not None and config.synonym_table is not None,
+            "path": str(config.synonym_table) if config is not None and config.synonym_table is not None else None,
+            "version": None,
+            "fingerprint": None,
+            "entry_count": 0,
+            "error": str(exc),
+            "enabled": False,
+        }
+    policy["synonym_expansion"] = {
+        **policy["synonym_expansion"],
+        "enabled": bool(table["enabled"]) and synonym_expansion,
+        "runtime_toggle": synonym_expansion,
+        "table": table,
+    }
     return {
         **FUSION_DIAGNOSTICS,
         "selection_policies": policy,
@@ -661,7 +680,7 @@ def _lexical_candidates(
     scope_condition, scope_params = _scope_conditions(scope_root_ids, global_paths)
     conditions = ["sections_fts MATCH ?", scope_condition]
     rows_by_id: dict[str, sqlite3.Row] = {}
-    row_variants: dict[str, int] = {}
+    best_fts_scores: dict[str, float] = {}
     primary_rank: dict[str, int] = {}
     started = time.perf_counter()
     connection = connect(config.database, initialize=False, readonly=True)
@@ -680,9 +699,10 @@ def _lexical_candidates(
                     primary_rank = {row["section_id"]: rank for rank, row in enumerate(rows, 1)}
                 for row in rows:
                     section_id = row["section_id"]
-                    if variant_number <= row_variants.get(section_id, variant_number):
+                    fts_score = float(row["fts_score"])
+                    if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
                         rows_by_id[section_id] = row
-                        row_variants[section_id] = variant_number
+                        best_fts_scores[section_id] = fts_score
                 if global_paths:
                     global_query = connection.execute(
                         "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
@@ -694,9 +714,10 @@ def _lexical_candidates(
                     ).fetchall()
                     for row in global_query:
                         section_id = row["section_id"]
-                        if variant_number <= row_variants.get(section_id, variant_number):
+                        fts_score = float(row["fts_score"])
+                        if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
                             rows_by_id[section_id] = row
-                            row_variants[section_id] = variant_number
+                            best_fts_scores[section_id] = fts_score
         atom_matches: dict[int, set[str]] = {}
         for ordinal, atom in enumerate(_guard_atoms(query), 1):
             atom_query = _guard_fts_query(atom)
@@ -773,7 +794,7 @@ def _lexical_candidates(
             row["created_date"], score, ", ".join(reasons) or "text match",
             None, None, float(row["fts_score"]), None, None, "lexical", None,
         ))
-    results.sort(key=lambda item: (row_variants[item.section_id], -item.score, item.section_id))
+    results.sort(key=lambda item: (-item.score, item.section_id))
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 

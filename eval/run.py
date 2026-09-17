@@ -187,7 +187,10 @@ def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, data
 
     roots = tuple(Root(root.id, map_path(root.path), root.project, root.excludes) for root in source.roots)
     global_notes = frozenset(map_path(path) for path in source.global_notes)
-    return Config(roots, global_notes, source.private_paths, database, source.section_bytes)
+    return Config(
+        roots, global_notes, source.private_paths, database, source.section_bytes,
+        source.semantic_bundle, source.synonym_table,
+    )
 
 
 def _delete_path(runtime_corpus: Path, value: str) -> Path:

@@ -32,7 +32,7 @@ class SynonymTable:
         for canonical, aliases in self.groups:
             forms = (canonical, *aliases)
             if normalized in forms:
-                return tuple(form for form in forms if form != normalized)
+                return tuple(sorted(form for form in forms if form != normalized))
         return ()
 
 
@@ -104,6 +104,7 @@ def table_metadata(path: Path | None) -> dict[str, object]:
         "version": table.version,
         "fingerprint": table.fingerprint,
         "entry_count": len(table.groups),
+        "enabled": bool(table.groups),
     }
 
 

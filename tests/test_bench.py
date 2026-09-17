@@ -71,6 +71,16 @@ def test_benchmark_gate_is_only_enforced_for_built_in_corpus(tmp_path: Path):
     assert report["gate"]["enforced"] is False
 
 
+def test_benchmark_reports_configured_synonym_table(tmp_path: Path):
+    table = tmp_path / "synonyms.toml"
+    table.write_text('version = 1\n\n[terms]\nmemory = ["recall"]\n')
+
+    report = run_benchmark(file_count=30, query_count=20, seed=41, synonym_table=table)
+
+    assert report["synonym_table"]["enabled"] is True
+    assert report["synonym_table"]["fingerprint"]
+
+
 def test_targetless_metrics_are_not_reported_as_passed():
     report = run_benchmark(file_count=30, query_count=20, seed=41)
 

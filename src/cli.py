@@ -66,6 +66,7 @@ def parser() -> argparse.ArgumentParser:
     )
     bench_parser.add_argument("--hook-path", action="store_true", help="measure the real semantic hook path")
     bench_parser.add_argument("--bundle-dir", help="semantic model bundle for hook-path benchmarks")
+    bench_parser.add_argument("--synonym-table", help="operator synonym table for benchmark queries")
     bench_parser.add_argument("--json", action="store_true", help="write the report as JSON")
     model_parser = commands.add_parser("model", help="manage the optional semantic model")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -157,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 real_dir=args.real,
                 hook_path=args.hook_path,
                 bundle_dir=args.bundle_dir,
+                synonym_table=args.synonym_table,
             )
             if args.json:
                 print(json.dumps(report, sort_keys=True))

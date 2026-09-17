@@ -1,6 +1,6 @@
 {
-  "case_count": 57,
-  "case_set_fingerprint": "5a36d555afccddb51750fbd77d7ec70e26655fe16eb16f4423bcd3aa371b18b1",
+  "case_count": 59,
+  "case_set_fingerprint": "03be0de0af3a6bdda282137842889212ff135321eea6268cea774dc7dd5eb3cf",
   "case_set_path": "eval/cases.json",
   "fingerprint_algorithm": "sha256(canonical-json)",
   "lock_version": 1

@@ -441,6 +441,9 @@ vocabulary direction can find the same indexed text. Run every variant under the
 scope and merge them into the lexical lane before RRF. Include the table version and
 fingerprint in diagnostics and evaluation fingerprints.
 
+Rank the merged lexical lane by the best FTS score for each section across the original
+query and all variants. Break equal scores by section ID. Alias order has no ranking effect.
+
 The expansion policy is part of the selection-policy inventory:
 
 | Policy | Default | Selection rule | Ablation |
