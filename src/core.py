@@ -64,6 +64,10 @@ SYNONYM_EXPANSION = True
 SYNONYM_EXPANSION_RATIONALE = (
     "replace one unquoted ordinary term at a time from a versioned operator table, without network rewrites"
 )
+SYNONYM_VARIANT_MERGE = True
+SYNONYM_VARIANT_MERGE_RATIONALE = (
+    "merge variants by best FTS score, then break ties by section ID"
+)
 RRF_RANK_CONSTANT = 60
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
@@ -90,6 +94,10 @@ SELECTION_POLICIES = {
         "enabled": SYNONYM_EXPANSION,
         "rationale": SYNONYM_EXPANSION_RATIONALE,
     },
+    "synonym_variant_merge": {
+        "enabled": SYNONYM_VARIANT_MERGE,
+        "rationale": SYNONYM_VARIANT_MERGE_RATIONALE,
+    },
 }
 
 FUSION_DIAGNOSTICS = {
@@ -106,6 +114,7 @@ FUSION_DIAGNOSTICS = {
     "relative_semantic_score_floor": SELECTION_POLICIES["relative_semantic_score_floor"],
     "ticket_id_cross_reference_filter": SELECTION_POLICIES["ticket_id_cross_reference_filter"],
     "balanced_admission": SELECTION_POLICIES["balanced_admission"],
+    "synonym_variant_merge": SELECTION_POLICIES["synonym_variant_merge"],
 }
 
 
@@ -677,6 +686,7 @@ def _lexical_candidates(
         variant_fts, variant_tokens = _fts_query(variant)
         if variant_fts and len(variant_tokens) <= MAX_QUERY_TERMS:
             queries.append((variant_fts, variant_tokens))
+    expansion_active = len(queries) > 1
     scope_condition, scope_params = _scope_conditions(scope_root_ids, global_paths)
     conditions = ["sections_fts MATCH ?", scope_condition]
     rows_by_id: dict[str, sqlite3.Row] = {}
@@ -697,12 +707,15 @@ def _lexical_candidates(
                 ).fetchall()
                 if variant_number == 0 and lane is None:
                     primary_rank = {row["section_id"]: rank for rank, row in enumerate(rows, 1)}
-                for row in rows:
-                    section_id = row["section_id"]
-                    fts_score = float(row["fts_score"])
-                    if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
-                        rows_by_id[section_id] = row
-                        best_fts_scores[section_id] = fts_score
+                if expansion_active:
+                    for row in rows:
+                        section_id = row["section_id"]
+                        fts_score = float(row["fts_score"])
+                        if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
+                            rows_by_id[section_id] = row
+                            best_fts_scores[section_id] = fts_score
+                else:
+                    rows_by_id.update({row["section_id"]: row for row in rows})
                 if global_paths:
                     global_query = connection.execute(
                         "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
@@ -712,12 +725,15 @@ def _lexical_candidates(
                         "ORDER BY fts_score, s.section_id LIMIT ?",
                         (lane_query, *global_paths, candidate_limit),
                     ).fetchall()
-                    for row in global_query:
-                        section_id = row["section_id"]
-                        fts_score = float(row["fts_score"])
-                        if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
-                            rows_by_id[section_id] = row
-                            best_fts_scores[section_id] = fts_score
+                    if expansion_active:
+                        for row in global_query:
+                            section_id = row["section_id"]
+                            fts_score = float(row["fts_score"])
+                            if section_id not in best_fts_scores or fts_score < best_fts_scores[section_id]:
+                                rows_by_id[section_id] = row
+                                best_fts_scores[section_id] = fts_score
+                    else:
+                        rows_by_id.update({row["section_id"]: row for row in global_query})
         atom_matches: dict[int, set[str]] = {}
         for ordinal, atom in enumerate(_guard_atoms(query), 1):
             atom_query = _guard_fts_query(atom)
@@ -736,7 +752,10 @@ def _lexical_candidates(
 
     source_cache: dict[str, tuple[Root, Path] | None] = {}
     hash_cache: dict[str, str | None] = {}
-    lower_tokens = {token.casefold() for _, variant_tokens in queries for token in variant_tokens}
+    lower_tokens = (
+        {token.casefold() for _, variant_tokens in queries for token in variant_tokens}
+        if expansion_active else {token.casefold() for token in tokens}
+    )
     results: list[Candidate] = []
     for row in rows_by_id.values():
         canonical = row["canonical_path"]
@@ -794,7 +813,10 @@ def _lexical_candidates(
             row["created_date"], score, ", ".join(reasons) or "text match",
             None, None, float(row["fts_score"]), None, None, "lexical", None,
         ))
-    results.sort(key=lambda item: (-item.score, item.section_id))
+    if expansion_active:
+        results.sort(key=lambda item: (item.lexical_score, item.section_id))
+    else:
+        results.sort(key=lambda item: (-item.score, item.section_id))
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 

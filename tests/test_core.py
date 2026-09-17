@@ -606,6 +606,7 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "ticket_id_cross_reference_filter",
         "balanced_admission",
         "synonym_expansion",
+        "synonym_variant_merge",
     }
 
 
@@ -651,6 +652,29 @@ def test_synonym_alias_order_does_not_change_lexical_ranking(tmp_path: Path):
 
     assert first[0] == "Alpha"
     assert first == second
+
+
+def test_synonym_merge_uses_best_fts_score_before_boosts(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "worse.md").write_text("# Database architecture\ndb\n")
+    (root / "better.md").write_text("# Better\ndb db db db\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    table_path = tmp_path / "synonyms.toml"
+    table_path.write_text('version = 1\n\n[terms]\ndatabase = ["db"]\n')
+    synonym_config = Config(
+        config.roots, config.global_notes, config.private_paths, config.database,
+        config.section_bytes, config.semantic_bundle, table_path,
+    )
+    index(synonym_config)
+
+    results = search(synonym_config, "database", project="p")
+
+    assert [item.heading for item in results] == ["Better", "Database architecture"]
+    assert [(item.lexical_score, item.section_id) for item in results] == sorted(
+        (item.lexical_score, item.section_id) for item in results
+    )
+    assert results[1].score > results[0].score
 
 
 def test_synonym_diagnostics_report_effective_state(tmp_path: Path):

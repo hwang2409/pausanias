@@ -29,6 +29,7 @@ from .core import (
     semantic_search,
 )
 from .model_bundle import BundleError, MODEL_BUNDLE_MANIFEST, _resolve_active_bundle
+from .synonyms import SynonymTableError, load_synonym_table
 from .vectors import Candidate, OnnxEncoder, SemanticError, semantic_backend_reason
 
 
@@ -102,6 +103,34 @@ def _write_record_fd(fd: int, record: dict[str, object]) -> None:
     while view:
         view = view[os.write(fd, view):]
     os.fsync(fd)
+
+
+def _config_fingerprint(config: Config) -> str:
+    try:
+        table = load_synonym_table(config.synonym_table)
+        synonym = {
+            "path": str(config.synonym_table) if config.synonym_table is not None else None,
+            "fingerprint": table.fingerprint,
+        }
+    except SynonymTableError as exc:
+        synonym = {
+            "path": str(config.synonym_table) if config.synonym_table is not None else None,
+            "error": str(exc),
+        }
+    payload = {
+        "roots": [
+            {"id": root.id, "path": str(root.path), "project": root.project, "excludes": root.excludes}
+            for root in config.roots
+        ],
+        "global_notes": sorted(str(path) for path in config.global_notes),
+        "private_paths": config.private_paths,
+        "database": str(config.database),
+        "section_bytes": config.section_bytes,
+        "semantic_bundle": str(config.semantic_bundle),
+        "synonym_table": synonym,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def pid_alive(pid: int) -> bool:
@@ -190,7 +219,7 @@ class PersistentWorker:
             "database": str(self.config.database), "pid": pid,
             "launch_nonce": os.environ.get("PAUSANIAS_WORKER_NONCE", ""),
             "start_time": self._started, "socket_path": str(self.paths.socket),
-            "readiness": state,
+            "readiness": state, "config_fingerprint": _config_fingerprint(self.config),
         }
         lock_fd = self._lock_fd()
         if lock_fd is None:
@@ -506,11 +535,13 @@ def _acquire_lock(path: Path) -> int | None:
 
 
 def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
-                  database: Path | None = None) -> subprocess.Popen:
+                  database: Path | None = None,
+                  config_fingerprint_value: str | None = None) -> subprocess.Popen:
     nonce = uuid.uuid4().hex
     initial_record = {
         "database": str(database or paths.lock.parent), "pid": 0, "launch_nonce": nonce,
         "start_time": time.time(), "socket_path": str(paths.socket), "readiness": "starting",
+        "config_fingerprint": config_fingerprint_value,
     }
     _write_record_fd(lock_fd, initial_record)
     environment = os.environ.copy()
@@ -532,8 +563,12 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
                   paths: WorkerPaths | None = None) -> tuple[WorkerPaths, float] | None:
     worker_paths_value = paths or worker_paths(config.database)
     started = time.perf_counter()
+    expected_fingerprint = _config_fingerprint(config)
     if socket_ready(worker_paths_value.socket):
-        return worker_paths_value, _positive_ms(started)
+        record = _read_record(worker_paths_value.lock)
+        if record.get("config_fingerprint") == expected_fingerprint:
+            return worker_paths_value, _positive_ms(started)
+        stop_worker(config.database, worker_paths_value)
     lock_fd = _acquire_lock(worker_paths_value.lock)
     if lock_fd is not None:
         record = _read_record(worker_paths_value.lock)
@@ -543,7 +578,9 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
             os.close(lock_fd)
         else:
             try:
-                launch_worker(config_path, worker_paths_value, lock_fd, config.database)
+                launch_worker(
+                    config_path, worker_paths_value, lock_fd, config.database, expected_fingerprint,
+                )
             except OSError:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)

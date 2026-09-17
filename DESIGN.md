@@ -390,7 +390,7 @@ lexical guard for exact identifiers and quoted phrases.
    requested `limit`. Apply the cap before validation, but never discard a protected
    lexical candidate in favor of a vector candidate.
 
-The fused path has five named selection policies. `SEMANTIC_SCORE_FLOOR` is
+The fused path has six named selection policies. `SEMANTIC_SCORE_FLOOR` is
 `0.30` and rejects weak cosine matches. `RELATIVE_SEMANTIC_SCORE_FLOOR` is `0.70` and
 rejects semantic matches below 70% of the strongest lexical match when the query has a
 lexical overlap. `TICKET_ID_CROSS_REFERENCE_FILTER` is enabled for exact ticket queries;
@@ -399,9 +399,10 @@ mentions a different ticket identifier. This generic cross-reference rule preven
 related ticket from displacing the requested ticket. `BALANCED_ADMISSION` is enabled
 for unguarded queries and interleaves lexical and semantic candidates before the union
 cap. `SYNONYM_EXPANSION` is enabled when a valid table is configured and adds one-term
-variants to the lexical lane. All five policies are named in `src/core.py`, included in
-fusion diagnostics, and have independent worker-path ablations in the internal evaluation
-harness. The diagnostics
+variants to the lexical lane. `SYNONYM_VARIANT_MERGE` ranks expanded sections by their
+best FTS score and breaks ties by section ID. All six policies are named in `src/core.py`
+and included in fusion diagnostics. The tunable policies have independent worker-path
+ablations in the internal evaluation harness. The diagnostics
 also list the query cap, candidate-pool bounds, and RRF rank constant.
 
 For example, query `Why did PAUS-4 beat "cold path"?` has guard atoms `PAUS-4` (ordinal
@@ -449,6 +450,7 @@ The expansion policy is part of the selection-policy inventory:
 | Policy | Default | Selection rule | Ablation |
 | --- | --- | --- | --- |
 | Synonym expansion | enabled when configured | one unquoted ordinary term, at most 16 variants | disable the table for the worker path |
+| Synonym variant merge | enabled for expanded queries | best FTS score per section, then section ID | disable synonym expansion |
 
 Do not use network-generated rewrites. Do not expand from retrieved text. Embeddings are
 the primary bridge for ordinary paraphrases; synonyms cover stable local vocabulary such
@@ -539,6 +541,9 @@ The worker lifecycle is bounded and recoverable:
 
 - Keep one ONNX session per model-manifest fingerprint and one vector matrix per index
   generation plus scope key. Load each lazily on the first request that needs it.
+- Record a fingerprint of the resolved worker configuration, including the synonym-table
+  content fingerprint. Reuse a live worker only when this fingerprint matches; otherwise
+  replace it before serving the next request.
 - Before each request, read the committed active generation and manifest fingerprint from
   SQLite. A worker cache key is `(database identity, generation, scope key, manifest
   fingerprint)`, so a new generation invalidates every older matrix for that database.
