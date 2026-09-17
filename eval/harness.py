@@ -15,7 +15,9 @@ from typing import Any
 from pausanias.config import Config, Root, load_config
 from pausanias.core import (
     FUSION_DIAGNOSTICS,
+    RELATIVE_SEMANTIC_SCORE_FLOOR,
     SEMANTIC_SCORE_FLOOR,
+    TICKET_ID_CROSS_REFERENCE_FILTER,
     Candidate,
     index,
     search,
@@ -53,6 +55,20 @@ DEFAULT_TOP_K = 8
 BENCHMARK = "internal"
 LOCK_PATH = Path(__file__).with_name("cases.lock")
 THRESHOLD_KEYS = ("recall_at_4", "precision_at_4", "mrr", "abstention_accuracy", "forbidden_violations")
+ABLATION_SPECS = {
+    "semantic_score_floor_disabled": {
+        "semantic_score_floor": None,
+        "policy": "semantic_score_floor",
+    },
+    "relative_semantic_score_floor_disabled": {
+        "relative_semantic_score_floor": None,
+        "policy": "relative_semantic_score_floor",
+    },
+    "ticket_id_cross_reference_filter_disabled": {
+        "ticket_id_cross_reference_filter": False,
+        "policy": "ticket_id_cross_reference_filter",
+    },
+}
 
 
 def case_set_fingerprint(path: Path = CASES_PATH) -> str:
@@ -419,7 +435,9 @@ def run_internal(
     if cases:
         _run_search(config, cases[0], top_k, retrieval_mode, config_path=worker_config_path)
     evaluations: list[Evaluation] = []
-    baseline_evaluations: list[Evaluation] = []
+    baseline_evaluations: dict[str, list[Evaluation]] = {
+        name: [] for name in ABLATION_SPECS
+    }
     for case in cases:
         checkpoint_path = search_dir / f"{case.id}.json"
         checkpoint = read_checkpoint(
@@ -460,19 +478,20 @@ def run_internal(
             ).write(checkpoint_path)
         evaluations.append(_evaluation(case, raw, cutoffs))
         if retrieval_mode == "fused":
-            baseline_evaluations.append(_evaluation(
-                case,
-                _search_case(
-                    config,
-                    runtime_corpus,
+            for name, options in ABLATION_SPECS.items():
+                baseline_evaluations[name].append(_evaluation(
                     case,
-                    top_k,
-                    retrieval_mode,
-                    worker_config_path,
-                    semantic_score_floor=None,
-                ),
-                cutoffs,
-            ))
+                    _search_case(
+                        config,
+                        runtime_corpus,
+                        case,
+                        top_k,
+                        retrieval_mode,
+                        worker_config_path,
+                        **{key: value for key, value in options.items() if key != "policy"},
+                    ),
+                    cutoffs,
+                ))
     if through_worker:
         stop_worker(config.database)
     if predict_only:
@@ -484,19 +503,29 @@ def run_internal(
     if retrieval_mode == "fused" and "fused_categories" in thresholds:
         thresholds = {**thresholds, "categories": thresholds["fused_categories"]}
     metrics = _metrics(evaluations, cutoffs, thresholds)
-    if baseline_evaluations:
-        baseline = _metrics(baseline_evaluations, cutoffs, thresholds)
-        metrics = replace(metrics, baselines={
-            "rrf_only_floor_disabled": {
-                "semantic_score_floor": None,
-                "recall_at_4": baseline.deterministic_gates["by_cutoff"]["4"]["recall"],
-                "precision_at_4": baseline.deterministic_gates["by_cutoff"]["4"]["precision"],
-                "mrr": baseline.deterministic_gates["by_cutoff"]["4"]["mrr"],
-                "abstention_accuracy": baseline.deterministic_gates["by_cutoff"]["4"]["abstention_accuracy"],
-                "forbidden_violations": baseline.deterministic_gates["by_cutoff"]["4"]["forbidden_violations"],
+    if any(baseline_evaluations.values()):
+        current_gate = metrics.deterministic_gates["by_cutoff"]["4"]
+        baselines: dict[str, Any] = {}
+        for name, options in ABLATION_SPECS.items():
+            baseline = _metrics(baseline_evaluations[name], cutoffs, thresholds)
+            baseline_gate = baseline.deterministic_gates["by_cutoff"]["4"]
+            baselines[name] = {
+                "disabled_policy": options["policy"],
+                "recall_at_4": baseline_gate["recall"],
+                "precision_at_4": baseline_gate["precision"],
+                "mrr": baseline_gate["mrr"],
+                "abstention_accuracy": baseline_gate["abstention_accuracy"],
+                "forbidden_violations": baseline_gate["forbidden_violations"],
+                "delta_from_active": {
+                    "recall_at_4": current_gate["recall"] - baseline_gate["recall"],
+                    "precision_at_4": current_gate["precision"] - baseline_gate["precision"],
+                    "mrr": current_gate["mrr"] - baseline_gate["mrr"],
+                    "abstention_accuracy": current_gate["abstention_accuracy"] - baseline_gate["abstention_accuracy"],
+                    "forbidden_violations": current_gate["forbidden_violations"] - baseline_gate["forbidden_violations"],
+                },
                 "by_category": baseline.deterministic_gates["by_category"],
-            },
-        })
+            }
+        metrics = replace(metrics, baselines=baselines)
     started_at = ingest.started_at
     metadata = Metadata(
         benchmark=BENCHMARK,
@@ -534,6 +563,8 @@ def _run_search(
     *,
     config_path: Path | None = None,
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+    relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
+    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
 ) -> list[Candidate]:
     if config_path is not None and retrieval_mode == "fused":
         return run_hook(
@@ -545,6 +576,8 @@ def _run_search(
             all_projects=bool(case.scope.get("all_projects", False)),
             limit=top_k,
             semantic_score_floor=semantic_score_floor,
+            relative_semantic_score_floor=relative_semantic_score_floor,
+            ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
         ).candidates
     if retrieval_mode == "fused":
         return semantic_search(
@@ -556,6 +589,8 @@ def _run_search(
             limit=top_k,
             refresh=refresh,
             semantic_score_floor=semantic_score_floor,
+            relative_semantic_score_floor=relative_semantic_score_floor,
+            ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
         )
     return search(
         config,
@@ -577,6 +612,8 @@ def _search_case(
     worker_config_path: Path | None,
     *,
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+    relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
+    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
 ) -> dict[str, Any]:
     with _temporarily_deleted(runtime_corpus, case.delete_sources):
         refresh: set[str] = set()
@@ -589,6 +626,8 @@ def _search_case(
             refresh,
             config_path=worker_config_path,
             semantic_score_floor=semantic_score_floor,
+            relative_semantic_score_floor=relative_semantic_score_floor,
+            ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
         )
         elapsed = (time.perf_counter() - started) * 1000
     return {

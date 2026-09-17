@@ -24,8 +24,11 @@ from .store import markdown as _markdown
 from .store import require_schema_version as _require_schema_version
 from .store import safe_source as _safe_source
 from .vectors import (
+    CANDIDATE_OVERSAMPLE,
     EMBEDDING_FORMAT_VERSION,
     EMBEDDING_VERSION,
+    MAX_CANDIDATES,
+    MIN_CANDIDATES,
     SEMANTIC_DISABLED_REASON,
     SEMANTIC_REASON_REFRESH_FAILED,
     SEMANTIC_STATE_DISABLED,
@@ -40,19 +43,51 @@ from .vectors import OnnxEncoder as _OnnxEncoder
 from .vectors import encoder_vectors as _encoder_vectors
 
 MAX_QUERY_TERMS = 64
-MAX_CANDIDATES = 200
 SEMANTIC_SCORE_FLOOR = 0.30
 SEMANTIC_SCORE_FLOOR_RATIONALE = (
     "reject weak cosine matches that add noise while retaining the observed semantic lift"
 )
+RELATIVE_SEMANTIC_SCORE_FLOOR = 0.70
+RELATIVE_SEMANTIC_SCORE_FLOOR_RATIONALE = (
+    "reject semantic candidates far below the strongest lexical match while keeping lexical hits"
+)
+TICKET_ID_CROSS_REFERENCE_FILTER = True
+TICKET_ID_CROSS_REFERENCE_FILTER_RATIONALE = (
+    "avoid cross-reference noise when an exact ticket query retrieves a candidate about another ticket"
+)
+RRF_RANK_CONSTANT = 60
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
-FUSION_DIAGNOSTICS = {
-    "algorithm": "rrf",
+SELECTION_POLICIES = {
     "semantic_score_floor": {
+        "enabled": True,
         "value": SEMANTIC_SCORE_FLOOR,
         "rationale": SEMANTIC_SCORE_FLOOR_RATIONALE,
     },
+    "relative_semantic_score_floor": {
+        "enabled": True,
+        "value": RELATIVE_SEMANTIC_SCORE_FLOOR,
+        "rationale": RELATIVE_SEMANTIC_SCORE_FLOOR_RATIONALE,
+    },
+    "ticket_id_cross_reference_filter": {
+        "enabled": TICKET_ID_CROSS_REFERENCE_FILTER,
+        "rationale": TICKET_ID_CROSS_REFERENCE_FILTER_RATIONALE,
+    },
+}
+
+FUSION_DIAGNOSTICS = {
+    "algorithm": "rrf",
+    "candidate_pool": {
+        "minimum": MIN_CANDIDATES,
+        "oversample": CANDIDATE_OVERSAMPLE,
+        "maximum": MAX_CANDIDATES,
+    },
+    "rrf_rank_constant": RRF_RANK_CONSTANT,
+    "query_term_cap": MAX_QUERY_TERMS,
+    "selection_policies": SELECTION_POLICIES,
+    "semantic_score_floor": SELECTION_POLICIES["semantic_score_floor"],
+    "relative_semantic_score_floor": SELECTION_POLICIES["relative_semantic_score_floor"],
+    "ticket_id_cross_reference_filter": SELECTION_POLICIES["ticket_id_cross_reference_filter"],
 }
 
 
@@ -707,7 +742,7 @@ def _fuse_candidates(
     semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
 ) -> list[Candidate]:
     started = time.perf_counter()
-    candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
+    candidate_limit = min(MAX_CANDIDATES, max(limit * CANDIDATE_OVERSAMPLE, MIN_CANDIDATES))
     admitted: dict[str, Candidate] = {}
     semantic_candidates = [
         item for item in vector
@@ -754,8 +789,8 @@ def _fuse_candidates(
     for section_id, candidate in admitted.items():
         lexical_rank = candidate.lexical_rank
         vector_rank = candidate.vector_rank
-        fused_score = (1.0 / (60 + lexical_rank) if lexical_rank is not None else 0.0) + (
-            1.0 / (60 + vector_rank) if vector_rank is not None else 0.0
+        fused_score = (1.0 / (RRF_RANK_CONSTANT + lexical_rank) if lexical_rank is not None else 0.0) + (
+            1.0 / (RRF_RANK_CONSTANT + vector_rank) if vector_rank is not None else 0.0
         )
         lane = "lexical+semantic" if lexical_rank is not None and vector_rank is not None else (
             "lexical" if lexical_rank is not None else "semantic"
@@ -798,11 +833,13 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                     all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
                     encoder: object | None = None, matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] | None = None,
                     timings: dict[str, float] | None = None,
-                    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR) -> list[Candidate]:
+                    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+                    relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
+                    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER) -> list[Candidate]:
     """Fuse bounded lexical and semantic lanes, with lexical fallback on failure."""
     if limit < 1:
         raise ValueError("limit must be positive")
-    candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
+    candidate_limit = min(MAX_CANDIDATES, max(limit * CANDIDATE_OVERSAMPLE, MIN_CANDIDATES))
     validation_refresh: set[str] = set()
     lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
         config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
@@ -822,7 +859,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
         atom for atom in _guard_atoms(query)
         if re.fullmatch(r"[a-z][a-z0-9]*-\d+", atom)
     }
-    if guard_identifiers:
+    if guard_identifiers and ticket_id_cross_reference_filter:
         semantic = [
             candidate for candidate in semantic
             if not any(
@@ -836,8 +873,12 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
         if candidate.section_id in lexical_ids and candidate.vector_score is not None
     ]
     if lexical_vector_scores:
-        if semantic_score_floor is not None:
-            semantic_floor = max(semantic_score_floor, max(lexical_vector_scores) * 0.70)
+        floors = [floor for floor in (semantic_score_floor,)
+                  if floor is not None]
+        if relative_semantic_score_floor is not None:
+            floors.append(max(lexical_vector_scores) * relative_semantic_score_floor)
+        if floors:
+            semantic_floor = max(floors)
             semantic = [
                 candidate for candidate in semantic
                 if (candidate.vector_score or 0.0) >= semantic_floor
@@ -862,7 +903,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     )
     if refresh is not None:
         refresh.update(validation_refresh)
-    return [] if validation_refresh else results[:limit]
+    return results[:limit]
 
 
 def excerpt(text: str, max_chars: int = 500) -> str:

@@ -553,6 +553,24 @@ def test_read_heading_and_stale_hash(tmp_path: Path):
     assert str(note.resolve()) in refresh
 
 
+def test_search_keeps_valid_results_when_one_match_is_stale(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    stale = root / "stale.md"
+    valid = root / "valid.md"
+    stale.write_text("# Stale\nshared query\n")
+    valid.write_text("# Valid\nshared query\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    stale.write_text("# Stale\nchanged content\n")
+
+    refresh: set[str] = set()
+    results = search(config, "shared query", project="p", refresh=refresh, limit=2)
+
+    assert [result.heading for result in results] == ["Valid"]
+    assert refresh == {str(stale.resolve())}
+
+
 def test_cli_json_output(tmp_path: Path, capsys):
     root = tmp_path / "vault"
     root.mkdir()
@@ -565,6 +583,27 @@ def test_cli_json_output(tmp_path: Path, capsys):
     assert result["excerpt"] == "Use sqlite."
     assert set(result) == {
         "excerpt", "path", "heading", "line_range", "dates", "score", "reason", "content_hash",
+    }
+
+
+def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'database = "{config.database}"\n\n'
+        f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n'
+    )
+    main(["--config", str(config_path), "index"])
+    main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--diagnostics", "--json"])
+
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    assert set(result["fusion_policies"]["selection_policies"]) == {
+        "semantic_score_floor",
+        "relative_semantic_score_floor",
+        "ticket_id_cross_reference_filter",
     }
 
 

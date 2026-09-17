@@ -19,7 +19,13 @@ from typing import Callable
 import uuid
 
 from .config import Config, load_config
-from .core import SEMANTIC_SCORE_FLOOR, search, semantic_search
+from .core import (
+    RELATIVE_SEMANTIC_SCORE_FLOOR,
+    SEMANTIC_SCORE_FLOOR,
+    TICKET_ID_CROSS_REFERENCE_FILTER,
+    search,
+    semantic_search,
+)
 from .model_bundle import BundleError, MODEL_BUNDLE_MANIFEST, _resolve_active_bundle
 from .vectors import Candidate, OnnxEncoder, SemanticError, semantic_backend_reason
 
@@ -272,6 +278,12 @@ class PersistentWorker:
         all_projects = request.get("all_projects", False)
         limit = request.get("limit", 20)
         semantic_score_floor = request.get("semantic_score_floor", SEMANTIC_SCORE_FLOOR)
+        relative_semantic_score_floor = request.get(
+            "relative_semantic_score_floor", RELATIVE_SEMANTIC_SCORE_FLOOR,
+        )
+        ticket_id_cross_reference_filter = request.get(
+            "ticket_id_cross_reference_filter", TICKET_ID_CROSS_REFERENCE_FILTER,
+        )
         if project is not None and not isinstance(project, str):
             raise WorkerError("worker project must be a string or null")
         if root_id is not None and not isinstance(root_id, str):
@@ -283,6 +295,13 @@ class PersistentWorker:
                      or isinstance(semantic_score_floor, bool)
                      or not 0.0 <= float(semantic_score_floor) <= 1.0)):
             raise WorkerError("worker semantic score floor is invalid")
+        if (relative_semantic_score_floor is not None
+                and (not isinstance(relative_semantic_score_floor, (int, float))
+                     or isinstance(relative_semantic_score_floor, bool)
+                     or not 0.0 <= float(relative_semantic_score_floor) <= 1.0)):
+            raise WorkerError("worker relative semantic score floor is invalid")
+        if not isinstance(ticket_id_cross_reference_filter, bool):
+            raise WorkerError("worker ticket ID filter is invalid")
         self._check_cancelled(cancelled)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
@@ -300,6 +319,9 @@ class PersistentWorker:
                         encoder=encoder, matrix_cache=self._matrix_cache, timings=timings,
                         semantic_score_floor=(float(semantic_score_floor)
                                               if semantic_score_floor is not None else None),
+                        relative_semantic_score_floor=(float(relative_semantic_score_floor)
+                                                      if relative_semantic_score_floor is not None else None),
+                        ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
                     )
                     self._check_cancelled(cancelled)
                     if not timings.get("semantic_available"):

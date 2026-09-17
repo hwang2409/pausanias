@@ -388,6 +388,16 @@ lexical guard for exact identifiers and quoted phrases.
    requested `limit`. Apply the cap before validation, but never discard a protected
    lexical candidate in favor of a vector candidate.
 
+The fused path has three named semantic acceptance policies. `SEMANTIC_SCORE_FLOOR` is
+`0.30` and rejects weak cosine matches. `RELATIVE_SEMANTIC_SCORE_FLOOR` is `0.70` and
+rejects semantic matches below 70% of the strongest lexical match when the query has a
+lexical overlap. `TICKET_ID_CROSS_REFERENCE_FILTER` is enabled for exact ticket queries;
+it removes semantic candidates that mention a different ticket identifier. This generic
+cross-reference rule prevents a related ticket from displacing the requested ticket.
+All three policies are named in `src/core.py`, included in fusion diagnostics, and have
+independent worker-path ablations in the internal evaluation harness. The diagnostics
+also list the query cap, candidate-pool bounds, and RRF rank constant.
+
 For example, query `Why did PAUS-4 beat "cold path"?` has guard atoms `PAUS-4` (ordinal
 1) and `cold path` (ordinal 2). Suppose section `sec-c` matches `PAUS-4` and ranks 1 in
 the complete FTS query, `sec-b` matches `cold path` and ranks 2, and `sec-a` matches

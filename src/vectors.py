@@ -22,6 +22,8 @@ from .model_bundle import (
 from .splitter import content_hash
 from .store import connect_readonly, require_schema_version, safe_source
 
+CANDIDATE_OVERSAMPLE = 5
+MIN_CANDIDATES = 50
 MAX_CANDIDATES = 200
 EMBEDDING_VERSION = 1
 EMBEDDING_FORMAT_VERSION = 1
@@ -559,7 +561,8 @@ def scan_vectors(
             scored.append((numeric_score, row))
         elif refresh is not None:
             refresh.add(row["canonical_path"])
-    scored = sorted(scored, key=lambda item: (-item[0], item[1]["section_id"]))[: min(MAX_CANDIDATES, max(limit * 5, 50))]
+    candidate_limit = min(MAX_CANDIDATES, max(limit * CANDIDATE_OVERSAMPLE, MIN_CANDIDATES))
+    scored = sorted(scored, key=lambda item: (-item[0], item[1]["section_id"]))[:candidate_limit]
 
     results: list[Candidate] = []
     source_cache: dict[str, tuple[Root, Path] | None] = {}

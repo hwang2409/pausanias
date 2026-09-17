@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,50 @@ def test_guard_matching_casefolds_indexed_text(tmp_path: Path):
     result = core.semantic_search(config, '"STRASSE"', project="p", limit=1, encoder=FakeEncoder())
 
     assert result[0].guard_reason == "protected:atom-1"
+
+
+def test_ticket_cross_reference_filter_is_named_and_optional(monkeypatch):
+    candidate = replace(
+        _candidate("cross-reference", vector_rank=1),
+        text="PAUS-4 references PHO-123",
+        vector_score=0.9,
+        lane="semantic",
+    )
+    monkeypatch.setattr(
+        core,
+        "_lexical_candidates",
+        lambda *args, **kwargs: ([], {}, {}, True),
+    )
+    monkeypatch.setattr(
+        core,
+        "vector_candidates",
+        lambda *args, **kwargs: [candidate],
+    )
+
+    timings = {"semantic_available": 1.0}
+    assert core.semantic_search(object(), "PAUS-4", timings=timings) == []
+    assert core.semantic_search(
+        object(), "PAUS-4", timings=timings, ticket_id_cross_reference_filter=False,
+    )[0].section_id == "cross-reference"
+
+
+def test_relative_semantic_floor_is_independently_named(monkeypatch):
+    lexical = _candidate("lexical", lexical_rank=1)
+    semantic = [
+        replace(_candidate("weak", vector_rank=1), vector_score=0.69, lane="semantic"),
+        replace(_candidate("strong", vector_rank=2), vector_score=0.70, lane="semantic"),
+        replace(_candidate("lexical", vector_rank=3), vector_score=0.99, lane="semantic"),
+    ]
+    monkeypatch.setattr(
+        core,
+        "_lexical_candidates",
+        lambda *args, **kwargs: ([lexical], {"lexical": 1}, {}, False),
+    )
+    monkeypatch.setattr(core, "vector_candidates", lambda *args, **kwargs: semantic)
+
+    result = core.semantic_search(
+        object(), "ordinary", timings={"semantic_available": 1.0}, semantic_score_floor=None,
+    )
+
+    assert {item.section_id for item in result} == {"strong", "lexical"}
+    assert core.FUSION_DIAGNOSTICS["relative_semantic_score_floor"]["value"] == 0.70

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import excerpt, index, read_source, search
+from .core import FUSION_DIAGNOSTICS, excerpt, index, read_source, search
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -102,6 +102,7 @@ def _result(candidate, diagnostics: bool = False) -> dict:
             "vector_score": candidate.vector_score,
             "fused_score": candidate.fused_score,
             "guard_reason": candidate.guard_reason,
+            "fusion_policies": FUSION_DIAGNOSTICS,
         })
     return result
 
