@@ -274,7 +274,7 @@ def test_real_v1_index_schema_is_recreated_before_indexing(tmp_path: Path, rebui
     state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
     assert state["semantic_generation"] == str(generation)
     assert state["semantic_state"] == "disabled"
-    assert state["semantic_reason"] == "EXTRA_MISSING"
+    assert state["semantic_reason"] == "MODEL_MISSING"
     assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == generation
     assert connection.execute("SELECT count(*) FROM sections WHERE section_id = 'old-v1-section'").fetchone()[0] == 0
     connection.close()

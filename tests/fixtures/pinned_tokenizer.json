@@ -1,0 +1,61 @@
+{
+  "version": "1.0",
+  "truncation": {
+    "direction": "Right",
+    "max_length": 128,
+    "strategy": "LongestFirst",
+    "stride": 0
+  },
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": true,
+    "lowercase": true
+  },
+  "pre_tokenizer": {
+    "type": "BertPreTokenizer"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+    ],
+    "pair": [],
+    "special_tokens": {
+      "[CLS]": {"id": "[CLS]", "ids": [101], "tokens": ["[CLS]"]},
+      "[SEP]": {"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}
+    }
+  },
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 100,
+      "[CLS]": 101,
+      "[SEP]": 102,
+      "[MASK]": 103,
+      "hello": 200,
+      "world": 201,
+      "!": 202,
+      ",": 203,
+      "cafe": 204,
+      "deja": 205,
+      "special": 206,
+      "chars": 207,
+      "long": 208
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[PAD]", "special": true},
+    {"id": 100, "content": "[UNK]", "special": true},
+    {"id": 101, "content": "[CLS]", "special": true},
+    {"id": 102, "content": "[SEP]", "special": true},
+    {"id": 103, "content": "[MASK]", "special": true}
+  ]
+}

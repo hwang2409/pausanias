@@ -1,9 +1,12 @@
+import json
+import math
 import sqlite3
 import struct
 from pathlib import Path
 
 import pytest
 from pausanias import core
+from pausanias import vectors
 from pausanias.config import load_config
 
 
@@ -32,6 +35,31 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     config_path = tmp_path / "config.toml"
     config_path.write_text("\n".join(lines))
     return load_config(config_path)
+
+
+def test_pinned_tokenizer_golden_ids_and_truncation(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    fixture = Path(__file__).parent / "fixtures" / "pinned_tokenizer.json"
+    (bundle / "tokenizer.json").write_bytes(fixture.read_bytes())
+    tokenizer = core._StdlibTokenizer(bundle)
+
+    # These ids come from the vocabulary and TemplateProcessing rules in the pinned fixture.
+    assert tokenizer.tokens("Hello, world!") == [101, 200, 203, 201, 202, 102]
+    assert tokenizer.tokens("CAFÉ déjà") == [101, 204, 205, 102]
+    assert tokenizer.tokens("special [MASK] chars") == [101, 206, 103, 207, 102]
+    assert tokenizer.tokens(" ".join(["long"] * 130)) == [101, *([208] * 126), 102]
+
+
+def test_pinned_tokenizer_rejects_unsupported_truncation_strategy(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "pinned_tokenizer.json").read_text())
+    fixture["truncation"]["strategy"] = "OnlySecond"
+    (bundle / "tokenizer.json").write_text(json.dumps(fixture))
+
+    with pytest.raises(core.SemanticError, match="truncation strategy is unsupported"):
+        core._StdlibTokenizer(bundle)
 
 
 def test_vector_store_scans_normalized_float32_vectors_with_scope(tmp_path: Path):
@@ -104,6 +132,31 @@ def test_source_race_keeps_previous_generation_active(tmp_path: Path):
         connection.close()
 
 
+def test_added_source_race_keeps_previous_generation_active(tmp_path: Path):
+    pytest.importorskip("numpy")
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Note\nold alpha\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    core.index(config, encoder=FakeEncoder())
+    note.write_text("# Note\nnew alpha\n")
+
+    class RacingEncoder(FakeEncoder):
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            (root / "added.md").write_text("# Added\nnew beta\n")
+            return super().encode(texts)
+
+    assert core.index(config, encoder=RacingEncoder()) == 1
+    connection = sqlite3.connect(config.database)
+    try:
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'generation'").fetchone()[0] == "1"
+        assert connection.execute("SELECT count(*) FROM files").fetchone()[0] == 1
+        assert connection.execute("SELECT text FROM sections").fetchone()[0] == "old alpha"
+    finally:
+        connection.close()
+
+
 def test_failed_vector_refresh_publishes_lexical_generation_as_stale(tmp_path: Path):
     pytest.importorskip("numpy")
     root = tmp_path / "vault"
@@ -141,7 +194,7 @@ def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path, monkeypat
     assert [result.heading for result in results] == ["Note"]
     connection = sqlite3.connect(config.database)
     try:
-        assert connection.execute("SELECT value FROM metadata WHERE key = 'semantic_reason'").fetchone()[0] == "EXTRA_MISSING"
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'semantic_reason'").fetchone()[0] == "MODEL_MISSING"
     finally:
         connection.close()
 
@@ -187,12 +240,26 @@ def test_non_finite_vector_falls_back_without_scoring_nan(tmp_path: Path, bad_va
     try:
         connection.execute("UPDATE embeddings SET vector = ?", (bad_vector,))
         connection.commit()
+        raw_row = connection.execute(
+            "SELECT s.canonical_path, e.vector FROM sections s JOIN embeddings e ON e.section_id = s.section_id"
+        ).fetchone()
     finally:
         connection.close()
 
-    results = core.semantic_search(config, "alpha", project="p", encoder=FakeEncoder())
+    import numpy
+    row = {"canonical_path": raw_row[0], "vector": raw_row[1]}
+    refresh: set[str] = set()
+    matrix, valid_rows = vectors.load_vector_matrix(numpy, [row], 384, refresh)
+    assert matrix.shape == (0, 384)
+    assert valid_rows == []
+    assert refresh == {str((root / "note.md").resolve())}
+
+    refresh = set()
+    results = core.semantic_search(config, "alpha", project="p", refresh=refresh, encoder=FakeEncoder())
 
     assert [result.heading for result in results] == ["Note"]
+    assert refresh == {str((root / "note.md").resolve())}
+    assert all(math.isfinite(result.score) for result in results)
 
 
 def test_default_search_does_not_use_vectors(tmp_path: Path):
