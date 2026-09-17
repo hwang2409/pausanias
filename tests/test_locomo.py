@@ -16,6 +16,7 @@ from eval.benchmarks.locomo.run import (
     run_locomo,
 )
 from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
+from pausanias.vectors import Candidate
 
 FIXTURES = Path(__file__).parent.parent / "eval/fixtures/locomo/golden-prompts-v1"
 
@@ -178,6 +179,142 @@ def test_predict_only_resume_reuses_search_checkpoints(tmp_path: Path, monkeypat
     assert result is not None
     assert checkpoint_path.read_bytes() == checkpoint_before
     assert (tmp_path / "locomo/predict-resume/run.json").exists()
+
+
+def test_fused_resume_recomputes_checkpoint_without_diagnostics(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(
+        run_id="fused-diagnostics-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        retrieval_mode="fused",
+    )
+    checkpoint_path = tmp_path / "locomo/fused-diagnostics-resume/checkpoints/search/conv0_q0.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    del checkpoint["output"]["retrieval_diagnostics"]
+    checkpoint_path.write_text(json.dumps(checkpoint))
+
+    real_search_record = locomo_runner._search_record
+    recomputed = []
+
+    def record_recompute(*args, **kwargs):
+        recomputed.append(args[0]["case_id"])
+        return real_search_record(*args, **kwargs)
+
+    monkeypatch.setattr(locomo_runner, "_search_record", record_recompute)
+    result = run_locomo(
+        run_id="fused-diagnostics-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        resume=True,
+        retrieval_mode="fused",
+    )
+
+    assert result is not None
+    assert "conv0_q0" in recomputed
+    assert result.metrics.baselines["retrieval_diagnostics"]["searches"] == 2
+    assert json.loads(checkpoint_path.read_text())["output"]["retrieval_diagnostics"]
+
+
+def test_predict_only_aggregates_multiple_categories_and_diagnostics(tmp_path: Path, monkeypatch):
+    dataset = json.loads((Path(__file__).parent / "fixtures/locomo/small.json").read_text())
+    dataset[0]["qa"][0]["category"] = 1
+    dataset[0]["qa"][1]["category"] = 2
+    dataset_path = tmp_path / "multi-category.json"
+    dataset_path.write_text(json.dumps(dataset))
+
+    def candidate(section_id: str, path: Path, root_id: str, project: str) -> Candidate:
+        return Candidate(
+            section_id,
+            str(path),
+            None,
+            (),
+            1,
+            100,
+            root_id,
+            project,
+            section_id,
+            section_id,
+            None,
+            None,
+            None,
+            1.0,
+            "fixture",
+        )
+
+    def fake_search(config, query, top_k, retrieval_mode, worker_config_path):
+        scope = config.database.parent
+        root_id = config.roots[0].id
+        project = config.roots[0].project
+        session_one = scope / "conversation-00--session-01.md"
+        session_two = scope / "conversation-00--session-02.md"
+        if query == "blue bicycle":
+            results = [
+                candidate("blue", session_one, root_id, project),
+                candidate("wrong", session_two, root_id, project),
+            ]
+        else:
+            results = [
+                candidate("wrong", session_one, root_id, project),
+                candidate("landscapes", session_two, root_id, project),
+            ]
+        return results[:top_k], None
+
+    monkeypatch.setattr(locomo_runner, "_search_candidates", fake_search)
+    result = run_locomo(
+        run_id="multi-category-summary",
+        dataset_path=dataset_path,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        predict_only=True,
+    )
+
+    assert result is not None
+    artifact = json.loads((tmp_path / "locomo/multi-category-summary/run.json").read_text())
+    assert artifact["metrics"]["by_category"] == {
+        "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+        "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 1.0},
+        "temporal": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 0.5},
+        "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+    }
+    assert artifact["metrics"]["by_cutoff"] == {
+        "1": {
+            "cutoff": 1,
+            "overall": {"total": 2, "relevant_count": 1, "recall": 0.5, "precision": 0.5, "mrr": 0.5},
+            "by_category": {
+                "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 1.0, "mrr": 1.0},
+                "temporal": {"total": 1, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+            },
+        },
+        "2": {
+            "cutoff": 2,
+            "overall": {"total": 2, "relevant_count": 2, "recall": 1.0, "precision": 0.5, "mrr": 0.75},
+            "by_category": {
+                "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 1.0},
+                "temporal": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 0.5},
+                "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+            },
+        },
+    }
+    assert artifact["metrics"]["baselines"] == {
+        "retrieval_diagnostics": {
+            "searches": 2,
+            "fallback_count": 0,
+            "retrieval_mode_counts": {"lexical": 2},
+            "semantic_state_counts": {},
+            "failure_reason_counts": {},
+        }
+    }
 
 
 def test_stub_failures_keep_mem0_error_semantics(tmp_path: Path):

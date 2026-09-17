@@ -9,6 +9,9 @@ The results are read from these `run.json` artifacts:
 - `results/locomo/paus14-lexical/run.json`
 - `results/locomo/paus14-fused/run.json`
 
+The tables were generated from these artifacts with a deterministic Python
+snippet. It reads each metrics block and formats percentages to three decimals.
+
 ## Overall retrieval metrics at cutoff 200
 
 These values are from `metrics.by_cutoff["200"].overall`.
@@ -46,7 +49,7 @@ These values are from each `metrics.by_cutoff[k].overall` block.
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10 | 2 | 0.081% | 0.130% | 0.130% | 579 | 29.830% | 4.235% | 16.059% |
 | 20 | 2 | 0.081% | 0.130% | 0.130% | 788 | 39.401% | 3.506% | 16.780% |
-| 50 | 2 | 0.081% | 0.081% | 0.130% | 1,027 | 49.822% | 3.025% | 17.155% |
+| 50 | 2 | 0.081% | 0.130% | 0.130% | 1,027 | 49.822% | 3.025% | 17.155% |
 | 200 | 2 | 0.081% | 0.130% | 0.130% | 1,157 | 55.505% | 2.946% | 17.238% |
 
 ## Search latency
@@ -56,8 +59,8 @@ retrieval only. It excludes ingest, answer generation, judging, and writes.
 
 | mode | searches | p50 | p95 | max |
 | --- | ---: | ---: | ---: | ---: |
-| lexical | 1,540 | 0.421 ms | 0.688 ms | 0.964 ms |
-| fused | 1,540 | 11.268 ms | 13.695 ms | 216.060 ms |
+| lexical | 1,540 | 0.426 ms | 0.712 ms | 1.412 ms |
+| fused | 1,540 | 11.702 ms | 14.487 ms | 252.173 ms |
 
 The fused run used `metrics.baselines.retrieval_diagnostics` for operational
 counts. It recorded 1,540 fused searches, 1,540 ready semantic states, zero

@@ -918,6 +918,14 @@ def run_locomo(
             corpus_fingerprint=scope_corpus_hash,
             index_generation=scope_generation,
         ) if (resume or evaluate_only) else None
+        if (
+            checkpoint is not None
+            and predict_only
+            and resume
+            and retrieval_mode == "fused"
+            and not isinstance(checkpoint.output.get("retrieval_diagnostics"), dict)
+        ):
+            checkpoint = None
         if checkpoint is None:
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
