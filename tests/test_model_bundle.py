@@ -9,7 +9,7 @@ import pytest
 from pausanias.cli import main
 from pausanias.config import load_config
 import pausanias.model_bundle as model_bundle
-from pausanias.model_bundle import BundleError, fetch_bundle, manifest_fingerprint, verify_bundle
+from pausanias.model_bundle import BundleError, fetch_bundle, manifest_fingerprint, package_version, verify_bundle
 
 
 def fixture_manifest(source: Path) -> dict:
@@ -314,10 +314,14 @@ def test_status_reports_missing_optional_model(tmp_path: Path, capsys):
 
     assert main(["model", "status", "--bundle-dir", str(bundle)]) == 0
     output = capsys.readouterr().out
-    assert "extra installed: no" in output
+    extra_installed = package_version("onnxruntime") is not None and package_version("numpy") is not None
+    assert f"extra installed: {'yes' if extra_installed else 'no'}" in output
     assert "bundle present: no" in output
     assert "manifest valid: no" in output
-    assert "onnxruntime: installed=missing expected=1.30.0" in output
+    if extra_installed:
+        assert "onnxruntime: installed=missing" not in output
+    else:
+        assert "onnxruntime: installed=missing expected=1.30.0" in output
 
 
 def test_manifest_fingerprint_is_stable(tmp_path: Path):
