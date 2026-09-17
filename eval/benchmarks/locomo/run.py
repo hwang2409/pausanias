@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from dataclasses import asdict, dataclass
-from datetime import datetime
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
+import shutil
 import sys
 import time
 import unicodedata
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 from pausanias.config import Config, Root
@@ -28,7 +29,6 @@ from eval.schema import (
     PromptMetadata,
     RetrievalResult,
     UnifiedResult,
-    atomic_write_json,
     fingerprint,
     latency_summary,
     read_json,
@@ -43,7 +43,6 @@ from eval.vendor.mem0.benchmarks.locomo.prompts import (
     get_judge_prompt_with_evidence,
     preprocess_answer,
 )
-
 
 DATASET_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 DATASET_COMMIT = "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376"
@@ -110,13 +109,41 @@ def _session_number(key: str) -> int:
     return int(match.group(1))
 
 
-def _date_key(value: str) -> tuple[int, object]:
-    for fmt in ("%I:%M %p on %d %B, %Y", "%I:%M %p on %d %b, %Y"):
+def _parse_locomo_date(value: str) -> datetime | None:
+    cleaned = value.strip().strip("()").strip()
+    formats = (
+        "%I:%M %p on %d %B, %Y",
+        "%I:%M %p on %d %b, %Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    )
+    for fmt in formats:
         try:
-            return (0, datetime.strptime(value, fmt))
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=UTC)
         except ValueError:
             pass
-    return (1, value)
+    return None
+
+
+def _date_key(value: str) -> tuple[int, datetime | str]:
+    parsed = _parse_locomo_date(value)
+    return (0, parsed) if parsed is not None else (1, value)
+
+
+def _prompt_date(value: str) -> str:
+    parsed = _parse_locomo_date(value)
+    if parsed is None:
+        return value
+    return parsed.strftime("%A, %B %d, %Y")
+
+
+def _prompt_created_at(value: str) -> str:
+    parsed = _parse_locomo_date(value)
+    return parsed.isoformat() if parsed is not None else value
 
 
 def sorted_sessions(conversation: dict[str, object]) -> list[tuple[str, str, list[dict[str, object]]]]:
@@ -357,6 +384,8 @@ def _http_transport(*, provider: str, model: str, system: str, user: str, struct
         headers = {"api-key": os.environ["AZURE_OPENAI_API_KEY"]}
     else:
         raise LocomoError(f"real provider adapter is not configured for {provider}")
+    if structured and provider in {"openai", "azure"}:
+        body["response_format"] = {"type": "json_object"}
     request = Request(url, data=json.dumps(body).encode(), headers={**headers, "Content-Type": "application/json"}, method="POST")
     response = json.loads(urlopen(request, timeout=120).read())
     if provider == "anthropic":
@@ -382,6 +411,30 @@ def _call_with_retries(transport: object, **kwargs: object) -> LLMReply:
     raise last_error
 
 
+def _judge_with_retries(
+    transport: object,
+    *,
+    provider: str,
+    model: str,
+    user: str,
+) -> tuple[LLMReply, dict[str, object]]:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            reply = _call_transport(transport, provider=provider, model=model, system=JUDGE_SYSTEM_PROMPT, user=user, structured=True)
+            payload = json.loads(reply.text)
+            if not isinstance(payload, dict) or str(payload.get("label", "")).upper() not in {"CORRECT", "WRONG"}:
+                raise ValueError("invalid judge label")
+            return reply, payload
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4 and not isinstance(transport, StubTransport):
+                time.sleep((attempt + 1) * 2)
+    if last_error is None:
+        raise LocomoError("judge call failed without an error")
+    raise last_error
+
+
 def _question_records(entries: list[dict[str, object]], rendered: dict[tuple[int, str], RenderedSession]) -> list[dict[str, object]]:
     records = []
     for fallback_index, entry in enumerate(entries):
@@ -400,6 +453,7 @@ def _question_records(entries: list[dict[str, object]], rendered: dict[tuple[int
                 "ground_truth": _normalize(question.get("answer")),
                 "targets": targets.get(_normalize(question.get("question")), []),
                 "evidence": question.get("evidence", []),
+                "sessions": sorted_sessions(entry["conversation"]),
             })
     return records
 
@@ -409,18 +463,126 @@ def _reference_date(entry: dict[str, object]) -> str | None:
     if not isinstance(conversation, dict):
         raise LocomoError("conversation must be an object")
     sessions = sorted_sessions(conversation)
-    return sessions[-1][1] if sessions else None
+    return _prompt_date(sessions[-1][1]) if sessions else None
 
 
 def _search_config(notes: Path, database: Path) -> Config:
     return Config((Root("locomo", notes.resolve(), "locomo", ()),), frozenset(), (), database.resolve(), 12000)
 
 
-def _search_record(record: dict[str, object], entries: list[dict[str, object]], config: Config, notes: Path, top_k: int) -> dict[str, object]:
-    entry = next(entry for entry in entries if int(entry.get("_conversation_index", -1)) == int(record["conversation_index"]))
+def _conversation_scope(
+    entry: dict[str, object],
+    conversation_index: int,
+    notes: Path,
+    workspace: Path,
+) -> tuple[Path, Config]:
+    scope = workspace / "scopes" / f"conversation-{conversation_index:02d}"
+    scope.mkdir(parents=True, exist_ok=True)
+    conversation = entry["conversation"]
+    if not isinstance(conversation, dict):
+        raise LocomoError("conversation must be an object")
+    for session_key, _, _ in sorted_sessions(conversation):
+        source = notes / f"conversation-{conversation_index:02d}--session-{_session_number(session_key):02d}.md"
+        destination = scope / source.name
+        if not destination.exists() or destination.read_bytes() != source.read_bytes():
+            temporary = destination.with_suffix(".tmp")
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, destination)
+    config = Config(
+        (Root(f"locomo-{conversation_index}", scope.resolve(), f"locomo-{conversation_index}", ()),),
+        frozenset(),
+        (),
+        (scope / "index.sqlite3").resolve(),
+        12000,
+    )
+    return scope, config
+
+
+def _evaluation_from_dict(value: dict[str, object]) -> Evaluation:
+    raw_outcomes = value.get("cutoff_outcomes")
+    raw_results = value.get("retrieval_results")
+    if not isinstance(raw_outcomes, dict) or not isinstance(raw_results, list):
+        raise LocomoError("evaluation checkpoint is missing output fields")
+    if any(not isinstance(item, dict) for item in raw_results):
+        raise LocomoError("evaluation checkpoint contains invalid retrieval results")
+    outcomes = {}
+    for key, item in raw_outcomes.items():
+        if not isinstance(item, dict):
+            continue
+        raw_metadata = item.get("prompt_metadata", {})
+        if not isinstance(raw_metadata, dict):
+            continue
+        metadata = {
+            str(name): PromptMetadata(**details)
+            for name, details in raw_metadata.items()
+            if isinstance(details, dict)
+        }
+        if len(metadata) != len(raw_metadata):
+            continue
+        outcomes[str(key)] = CutoffOutcome(**{**item, "prompt_metadata": metadata})
+    if len(outcomes) != len(raw_outcomes):
+        raise LocomoError("evaluation checkpoint contains invalid cutoff outcomes")
+    evaluation = Evaluation(
+        case_id=str(value["case_id"]),
+        category=str(value["category"]),
+        query=str(value["query"]),
+        expected_sources=tuple(str(item) for item in value["expected_sources"]),
+        ground_truth=str(value["ground_truth"]),
+        retrieval_results=tuple(RetrievalResult(**item) for item in raw_results),
+        search_latency_ms=float(value["search_latency_ms"]),
+        cutoff_outcomes=outcomes,
+        score=float(value["score"]),
+        failure_reason=value.get("failure_reason") if isinstance(value.get("failure_reason"), str) else None,
+    )
+    if evaluation.case_id == "" or evaluation.query == "":
+        raise LocomoError("evaluation checkpoint contains empty identity fields")
+    return evaluation
+
+
+def _valid_evaluation_checkpoint(
+    path: Path,
+    run_id: str,
+    config: dict[str, object],
+    case_id: str,
+    dataset_fingerprint: str,
+    corpus_fingerprint: str | None,
+    index_generation: int,
+    cutoffs: tuple[int, ...],
+) -> dict[str, object] | None:
+    try:
+        value = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        value.get("checkpoint_version") != "pausanias.eval.checkpoint.v1"
+        or value.get("stage") != "evaluate"
+        or value.get("run_id") != run_id
+        or value.get("case_id") != case_id
+        or value.get("config") != config
+        or value.get("dataset_fingerprint") != dataset_fingerprint
+        or value.get("corpus_fingerprint") != corpus_fingerprint
+        or value.get("index_generation") != index_generation
+        or value.get("status") != "complete"
+    ):
+        return None
+    output = value.get("output")
+    if not isinstance(output, dict):
+        return None
+    if output.get("case_id") != case_id or not isinstance(output.get("query"), str) or not isinstance(output.get("retrieval_results"), list):
+        return None
+    if {str(key) for key in output.get("cutoff_outcomes", {})} != {str(cutoff) for cutoff in cutoffs}:
+        return None
+    try:
+        _evaluation_from_dict(output)
+    except (KeyError, TypeError, ValueError, LocomoError):
+        return None
+    return value
+
+
+def _search_record(record: dict[str, object], config: Config, notes: Path, top_k: int) -> dict[str, object]:
     source_dates = {
-        f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": date
-        for session_key, date, _ in sorted_sessions(entry["conversation"])
+        f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": _prompt_created_at(date)
+        for session_key, date, _ in record["sessions"]
     }
     evidence_lines = []
     for target in record["targets"]:
@@ -428,14 +590,14 @@ def _search_record(record: dict[str, object], entries: list[dict[str, object]], 
         excerpt = "\n".join(lines[int(target["line_start"]) - 1:int(target["line_end"])])
         evidence_lines.append(f"[{target['evidence_id']}] {excerpt}")
     start = time.perf_counter()
-    candidates = search(config, str(record["question"]), project="locomo", limit=top_k)
+    candidates = search(config, str(record["question"]), project=config.roots[0].project, limit=top_k)
     elapsed = (time.perf_counter() - start) * 1000
     return {
         **record,
         "search_latency_ms": elapsed,
         "retrieval_fingerprint": fingerprint([candidate.section_id for candidate in candidates]),
         "retrieval_results": [asdict(_candidate_result(candidate, notes, rank)) for rank, candidate in enumerate(candidates, 1)],
-        "reference_date": _reference_date(entry),
+        "reference_date": _prompt_date(record["sessions"][-1][1]) if record["sessions"] else None,
         "source_dates": source_dates,
         "evidence_context": "\n".join(evidence_lines),
     }
@@ -488,10 +650,7 @@ def _common_cutoff(
     evidence_context = str(record.get("evidence_context", "")) if with_evidence else None
     judge_prompt = build_judge_prompt(int(record["category_number"]), str(record["question"]), preprocess_answer(int(record["category_number"]), str(record["ground_truth"])), generated, evidence_context)
     try:
-        judge_reply = _call_with_retries(transport, provider=judge_provider, model=judge_model, system=JUDGE_SYSTEM_PROMPT, user=judge_prompt, structured=True)
-        payload = json.loads(judge_reply.text)
-        if not isinstance(payload, dict) or str(payload.get("label", "")).upper() not in {"CORRECT", "WRONG"}:
-            raise ValueError("invalid judge label")
+        judge_reply, payload = _judge_with_retries(transport, provider=judge_provider, model=judge_model, user=judge_prompt)
         judgment = str(payload["label"]).upper()
         score = 1.0 if judgment == "CORRECT" else 0.0
         reason = str(payload.get("reasoning", ""))
@@ -568,8 +727,10 @@ def run_locomo(
     notes = workspace / "notes"
     database = workspace / "index.sqlite3"
     search_dir = run_root / "checkpoints" / "search"
+    evaluate_dir = run_root / "checkpoints" / "evaluate"
     ingest_path = run_root / "checkpoints" / "ingest.json"
     search_dir.mkdir(parents=True, exist_ok=True)
+    evaluate_dir.mkdir(parents=True, exist_ok=True)
     rendered = _render_entries(entries, notes)
     records = _question_records(entries, rendered)
     corpus_hash = fingerprint([{ "path": path.relative_to(notes).as_posix(), "sha256": _sha256(path.read_bytes()) } for path in sorted(notes.glob("*.md"))]) if notes.exists() else None
@@ -583,7 +744,7 @@ def run_locomo(
             candidate = None
         candidate_config = candidate.get("config") if isinstance(candidate, dict) else None
         prompt_config_matches = isinstance(candidate_config, dict) and candidate_config.get("prompt_mode") == config_values["prompt_mode"] and candidate_config.get("prompt_fixture_version") == config_values["prompt_fixture_version"]
-        config_matches = candidate_config == config_values or (evaluate_only and transport is not None and prompt_config_matches)
+        config_matches = candidate_config == config_values or ((evaluate_only or resume) and transport is not None and prompt_config_matches)
         if isinstance(candidate, dict) and candidate.get("checkpoint_version") == "pausanias.eval.checkpoint.v1" and candidate.get("stage") == "ingest" and candidate.get("run_id") == run_id and candidate.get("status") == "complete" and config_matches and candidate.get("dataset_fingerprint") == dataset["fingerprint"] and candidate.get("corpus_fingerprint") == corpus_hash:
             existing_ingest = candidate
             checkpoint_config = candidate_config
@@ -593,10 +754,21 @@ def run_locomo(
     elif evaluate_only:
         raise LocomoError("evaluation requires a complete ingest checkpoint")
     else:
-        index(_search_config(notes, database), rebuild=True)
-        generation = 1
+        generation = index(_search_config(notes, database), rebuild=True)
         ingest = Checkpoint("ingest", run_id, dataset["fingerprint"], corpus_hash, generation, config_values, "complete", utc_now(), utc_now(), {"files": [{"path": path.name, "sha256": _sha256(path.read_bytes())} for path in sorted(notes.glob("*.md"))], "index_generation": generation})
         ingest.write(ingest_path)
+    scope_configs = {
+        int(entry["_conversation_index"]): _conversation_scope(entry, int(entry["_conversation_index"]), notes, workspace)
+        for entry in entries
+    }
+    if existing_ingest is None:
+        for _, scope_config in scope_configs.values():
+            index(scope_config, rebuild=True)
+    elif any(not scope_config.database.exists() for _, scope_config in scope_configs.values()):
+        raise LocomoError("evaluation requires complete conversation indexes")
+    if records:
+        first_scope = scope_configs[int(records[0]["conversation_index"])]
+        search(first_scope[1], str(records[0]["question"]), project=first_scope[1].roots[0].project, limit=top_k)
     evaluations: list[Evaluation] = []
     for record in records:
         checkpoint_path = search_dir / f"{record['case_id']}.json"
@@ -604,11 +776,18 @@ def run_locomo(
         if checkpoint is None:
             if evaluate_only:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
-            raw = _search_record(record, entries, _search_config(notes, database), notes, top_k)
+            scope_notes, scope_config = scope_configs[int(record["conversation_index"])]
+            raw = _search_record(record, scope_config, scope_notes, top_k)
             Checkpoint("search", run_id, dataset["fingerprint"], corpus_hash, generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
             raw = checkpoint["output"]
         retrieval = tuple(RetrievalResult(**item) for item in raw["retrieval_results"])
+        evaluation_path = evaluate_dir / f"{record['case_id']}.json"
+        if not predict_only:
+            evaluation_checkpoint = _valid_evaluation_checkpoint(evaluation_path, run_id, config_values, str(record["case_id"]), str(dataset["fingerprint"]), corpus_hash, generation, cutoffs) if (resume or evaluate_only) else None
+            if evaluation_checkpoint is not None:
+                evaluations.append(_evaluation_from_dict(evaluation_checkpoint["output"]))
+                continue
         outcomes: dict[str, CutoffOutcome] = {}
         if predict_only:
             outcomes = {
@@ -631,7 +810,22 @@ def run_locomo(
             for cutoff in cutoffs:
                 outcomes[str(cutoff)] = _common_cutoff(raw, retrieval, cutoff, answerer_model=answerer_model, answerer_provider=provider, judge_model=judge_model, judge_provider=selected_judge_provider, with_evidence=with_evidence, user_profile=user_profile, transport=transport)
         primary_outcome = outcomes[str(max(cutoffs))]
-        evaluations.append(Evaluation(str(raw["case_id"]), str(raw["category"]), str(raw["question"]), tuple(target["evidence_id"] for target in raw["targets"]), str(raw["ground_truth"]), retrieval, float(raw["search_latency_ms"]), outcomes, primary_outcome.score, primary_outcome.error))
+        evaluation = Evaluation(str(raw["case_id"]), str(raw["category"]), str(raw["question"]), tuple(target["evidence_id"] for target in raw["targets"]), str(raw["ground_truth"]), retrieval, float(raw["search_latency_ms"]), outcomes, primary_outcome.score, primary_outcome.error)
+        evaluations.append(evaluation)
+        if not predict_only:
+            Checkpoint(
+                stage="evaluate",
+                run_id=run_id,
+                case_id=str(record["case_id"]),
+                dataset_fingerprint=dataset["fingerprint"],
+                corpus_fingerprint=corpus_hash,
+                index_generation=generation,
+                config=config_values,
+                status="complete",
+                started_at=utc_now(),
+                finished_at=utc_now(),
+                output=asdict(evaluation),
+            ).write(evaluation_path)
     if predict_only:
         print(f"locomo predict-only: {len(evaluations)} search checkpoints; dataset fingerprint {dataset['fingerprint']}")
         return None

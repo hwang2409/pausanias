@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from eval import harness as eval_harness
 from eval import run as eval_run
 from eval.run import Case, load_cases, run_cases, score_case
+from eval.schema import CutoffOutcome, Evaluation
 
 
 def _threshold_file(path: Path, *, recall: float = 0.0) -> Path:
@@ -204,3 +206,56 @@ def test_single_case_validates_its_expectations_without_thresholds(tmp_path: Pat
 
     assert eval_run.main(["--case", "exact-pho-123", "--thresholds", str(thresholds)]) == 0
     assert "full-run thresholds not applied" in capsys.readouterr().out
+
+
+def test_internal_cutoff_overall_uses_that_cutoff_scores():
+    outcome_one = CutoffOutcome(1, 1, 1.0, 1.0, 1.0, None, 0, 1.0, True)
+    outcome_four = CutoffOutcome(4, 1, 1.0, 0.25, 1.0, None, 0, 0.0, False)
+    evaluation = Evaluation(
+        case_id="case",
+        category="verbatim",
+        query="query",
+        expected_sources=("source.md",),
+        ground_truth=None,
+        retrieval_results=(),
+        search_latency_ms=1.0,
+        cutoff_outcomes={"1": outcome_one, "4": outcome_four},
+        score=0.0,
+    )
+
+    metrics = eval_harness._metrics([evaluation], (1, 4), {
+        "recall_at_4": 0.0,
+        "precision_at_4": 0.0,
+        "mrr": 0.0,
+        "abstention_accuracy": 0.0,
+        "forbidden_violations": 0.0,
+    })
+
+    assert metrics.by_cutoff["1"]["overall"]["correct"] == 1
+    assert metrics.by_cutoff["4"]["overall"]["correct"] == 0
+
+
+def test_internal_category_gate_rejects_zeroed_category():
+    outcome = CutoffOutcome(4, 0, 0.0, 0.0, 0.0, None, 0, 0.0, False)
+    evaluation = Evaluation("case", "verbatim", "query", ("source.md",), None, (), 1.0, {"4": outcome}, 0.0)
+    thresholds = {
+        "recall_at_4": 0.0,
+        "precision_at_4": 0.0,
+        "mrr": 0.0,
+        "abstention_accuracy": 0.0,
+        "forbidden_violations": 0.0,
+        "categories": {
+            "verbatim": {
+                "recall_at_4": 1.0,
+                "precision_at_4": 1.0,
+                "mrr": 1.0,
+                "abstention_accuracy": 1.0,
+                "forbidden_violations": 0.0,
+            }
+        },
+    }
+
+    metrics = eval_harness._metrics([evaluation], (4,), thresholds)
+
+    assert metrics.deterministic_gates["by_category"]["verbatim"]["passed"] is False
+    assert metrics.deterministic_gates["by_cutoff"]["4"]["passed"] is False

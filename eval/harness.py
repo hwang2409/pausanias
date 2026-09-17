@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
-from pathlib import Path
 import shutil
 import sqlite3
 import sys
 import time
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from pausanias.config import Config, Root, load_config
 from pausanias.core import Candidate, index, search
 
-from .run import CASES_PATH, CONFIG_PATH, CORPUS_DIR, Case, _temporarily_deleted, load_case_set, load_thresholds
+from .run import (
+    CASES_PATH,
+    CONFIG_PATH,
+    CORPUS_DIR,
+    Case,
+    _temporarily_deleted,
+    load_case_set,
+    load_thresholds,
+)
 from .schema import (
     Checkpoint,
     CutoffOutcome,
@@ -30,7 +38,6 @@ from .schema import (
     read_json,
     utc_now,
 )
-
 
 DEFAULT_CUTOFFS = (1, 2, 4, 8)
 DEFAULT_TOP_K = 8
@@ -214,7 +221,40 @@ def _group_metrics(evaluations: list[Evaluation]) -> dict[str, Any]:
     }
 
 
-def _metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...], thresholds: dict[str, float]) -> Metrics:
+def _outcome_metrics(outcomes: list[CutoffOutcome]) -> dict[str, Any]:
+    return {
+        "total": len(outcomes),
+        "correct": sum(value.score >= 0.5 for value in outcomes),
+        "accuracy": 100 * sum(value.score >= 0.5 for value in outcomes) / len(outcomes) if outcomes else 0.0,
+        "avg_score": 100 * sum(value.score for value in outcomes) / len(outcomes) if outcomes else 0.0,
+        "errors": sum(value.error is not None for value in outcomes),
+    }
+
+
+def _category_gate(
+    outcomes: list[CutoffOutcome],
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    retrieval = [value for value in outcomes if value.recall is not None]
+    abstention = [value for value in outcomes if value.abstention_correct is not None]
+    measured = {
+        "recall_at_4": sum(value.recall for value in retrieval) / len(retrieval) if retrieval else 1.0,
+        "precision_at_4": sum(value.precision for value in retrieval) / len(retrieval) if retrieval else 1.0,
+        "mrr": sum(value.mrr for value in retrieval) / len(retrieval) if retrieval else 1.0,
+        "abstention_accuracy": sum(value.abstention_correct for value in abstention) / len(abstention) if abstention else 1.0,
+        "forbidden_violations": sum(value.forbidden_sources for value in outcomes),
+    }
+    passed = (
+        measured["recall_at_4"] >= thresholds["recall_at_4"]
+        and measured["precision_at_4"] >= thresholds["precision_at_4"]
+        and measured["mrr"] >= thresholds["mrr"]
+        and measured["abstention_accuracy"] >= thresholds["abstention_accuracy"]
+        and measured["forbidden_violations"] <= thresholds["forbidden_violations"]
+    )
+    return {**measured, "thresholds": thresholds, "passed": passed}
+
+
+def _metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...], thresholds: dict[str, Any]) -> Metrics:
     by_category = {category: _group_metrics([item for item in evaluations if item.category == category]) for category in sorted({item.category for item in evaluations})}
     by_cutoff: dict[str, Any] = {}
     gates: dict[str, Any] | None = None
@@ -233,7 +273,7 @@ def _metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...], thresholds
             }
         by_cutoff[str(cutoff)] = {
             "cutoff": cutoff,
-            "overall": _group_metrics(evaluations),
+            "overall": _outcome_metrics(outcomes),
             "by_category": groups,
         }
         if cutoff == 4:
@@ -248,6 +288,12 @@ def _metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...], thresholds
             }
     if gates is None:
         raise ValueError("cutoffs must include 4 for deterministic gates")
+    category_thresholds = thresholds.get("categories", {})
+    category_gates = {}
+    for category in sorted({item.category for item in evaluations}):
+        category_values = [item.cutoff_outcomes["4"] for item in evaluations if item.category == category]
+        category_gate_thresholds = category_thresholds.get(category, thresholds)
+        category_gates[category] = _category_gate(category_values, category_gate_thresholds)
     deterministic = {
         "by_cutoff": {
             "4": {
@@ -265,9 +311,11 @@ def _metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...], thresholds
                     and gates["mrr"] >= thresholds["mrr"]
                     and gates["abstention_accuracy"] >= thresholds["abstention_accuracy"]
                     and gates["forbidden_violations"] <= thresholds["forbidden_violations"]
+                    and all(category["passed"] for category in category_gates.values())
                 ),
             }
-        }
+        },
+        "by_category": category_gates,
     }
     latencies = [item.search_latency_ms for item in evaluations]
     by_category_latency = {
@@ -347,6 +395,8 @@ def run_internal(
         ).to_dict()
         atomic_write_json(ingest_path, ingest)
     generation = int(ingest["index_generation"])
+    if cases:
+        search(config, cases[0].query, project=cases[0].scope.get("project"), root_id=cases[0].scope.get("root"), all_projects=bool(cases[0].scope.get("all_projects", False)), limit=top_k)
     evaluations: list[Evaluation] = []
     for case in cases:
         checkpoint_path = search_dir / f"{case.id}.json"
