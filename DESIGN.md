@@ -1,6 +1,8 @@
 # Pausanias: Automatic Memory Context for Agents
 
-Status: proposed design. No implementation exists yet.
+Status: Arc 2 implementation and evaluation complete through PAUS-12. Measured
+thresholds and the tested corpus envelope are recorded in `eval/PAUS-12-RESULTS.md`.
+Default activation remains a product decision.
 Date: 2026-09-16
 
 ## Purpose
@@ -595,6 +597,27 @@ budget. It has less lifecycle code, but it makes every hook turn pay process sta
 risks repeated 90 MB model loads. The persistent worker is the single recommendation
 because it makes the measured warm path match normal use while retaining a bounded cold
 fallback.
+
+### PAUS-12 measured results
+
+PAUS-12 reran the active scan-path and fused hook-path gates on this head. The small
+30-file corpus passed with warm and cold p95 values of 91.71 ms and 272.14 ms. The
+2,000-file synthetic corpus passed with warm and cold p95 values of 165.34 ms and
+366.73 ms. Both workloads had zero semantic fallbacks. The current Phase B benchmark
+reports the scan-path and fused gate names over the same real hook-path samples.
+
+The full 59-case Arc 2 evaluation measured fused-with-synonyms recall@4 of 1.0000,
+precision@4 of 0.8622, MRR of 0.9898, 1.0000 abstention accuracy, and zero
+forbidden-source violations. Paraphrase precision remained 0.6875. The scale corpus
+contained 2,000 files and 8,040 sections. Its index build took 33,979.73 ms, its
+incremental refresh took 439.95 ms, its persistent vector payload was 11.78 MiB, and
+the SQLite index was 31.05 MiB. The measured peak RSS during indexed build was 31.77
+GiB, so the result does not validate the 50,000-section planning envelope.
+
+The evidence supports fused retrieval as the default runtime recommendation with the
+lexical fallback retained. This ticket changes no default. Full tables, policy
+ablations, hypothesis comparisons, LOCOMO readiness, commands, and caveats are in
+`eval/PAUS-12-RESULTS.md`.
 
 ### Performance budgets
 
