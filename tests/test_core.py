@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 import sqlite3
 import threading
@@ -15,11 +16,19 @@ from pausanias.core import connect, index, read_source, search
 from pausanias.splitter import explicit_links, split_markdown
 
 
-def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes: list[Path] | None = None, private: list[str] | None = None):
+def make_config(
+    tmp_path: Path,
+    roots: list[tuple[str, str, Path]],
+    global_notes: list[Path] | None = None,
+    private: list[str] | None = None,
+    semantic_bundle: Path | None = None,
+):
     global_notes = global_notes or []
     private = private or []
     database = tmp_path / "index.sqlite3"
     lines = [f'database = "{database}"']
+    if semantic_bundle is not None:
+        lines += ["", f'semantic_bundle = "{semantic_bundle}"']
     if global_notes:
         lines += ["", "global_notes = [" + ", ".join(f'"{item}"' for item in global_notes) + "]"]
     if private:
@@ -29,6 +38,10 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     config_path = tmp_path / "config.toml"
     config_path.write_text("\n".join(lines))
     return load_config(config_path)
+
+
+def semantic_extra_available() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime"))
 
 
 def create_v1_index(database: Path, canonical_path: str, root_id: str) -> None:
@@ -212,7 +225,9 @@ def test_schema_v2_records_missing_model_generation_metadata(tmp_path: Path, mon
     root = tmp_path / "vault"
     root.mkdir()
     (root / "note.md").write_text("# Schema\nrecord generation metadata\n")
-    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config = make_config(tmp_path, [("vault", "phoebe", root)], semantic_bundle=bundle)
     monkeypatch.setattr(core, "package_version", lambda name: {
         "numpy": core.MODEL_BUNDLE_MANIFEST["numpy_version"],
         "onnxruntime": core.MODEL_BUNDLE_MANIFEST["runtime"]["version"],
@@ -260,7 +275,9 @@ def test_real_v1_index_schema_is_recreated_before_indexing(tmp_path: Path, rebui
     root.mkdir()
     note = root / "note.md"
     note.write_text("# Decision\nUse the new schema.\n")
-    config = make_config(tmp_path, [("vault", "phoebe", root)])
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config = make_config(tmp_path, [("vault", "phoebe", root)], semantic_bundle=bundle)
     create_v1_index(config.database, str(note.resolve()), "vault")
 
     generation = index(config, rebuild=rebuild)
@@ -274,7 +291,8 @@ def test_real_v1_index_schema_is_recreated_before_indexing(tmp_path: Path, rebui
     state = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
     assert state["semantic_generation"] == str(generation)
     assert state["semantic_state"] == "disabled"
-    assert state["semantic_reason"] == "MODEL_MISSING"
+    expected_reason = "MODEL_MISSING" if semantic_extra_available() else "EXTRA_MISSING"
+    assert state["semantic_reason"] == expected_reason
     assert connection.execute("SELECT generation FROM embedding_metadata").fetchone()[0] == generation
     assert connection.execute("SELECT count(*) FROM sections WHERE section_id = 'old-v1-section'").fetchone()[0] == 0
     connection.close()
@@ -535,6 +553,24 @@ def test_read_heading_and_stale_hash(tmp_path: Path):
     assert str(note.resolve()) in refresh
 
 
+def test_search_keeps_valid_results_when_one_match_is_stale(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    stale = root / "stale.md"
+    valid = root / "valid.md"
+    stale.write_text("# Stale\nshared query\n")
+    valid.write_text("# Valid\nshared query\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    stale.write_text("# Stale\nchanged content\n")
+
+    refresh: set[str] = set()
+    results = search(config, "shared query", project="p", refresh=refresh, limit=2)
+
+    assert [result.heading for result in results] == ["Valid"]
+    assert refresh == {str(stale.resolve())}
+
+
 def test_cli_json_output(tmp_path: Path, capsys):
     root = tmp_path / "vault"
     root.mkdir()
@@ -543,7 +579,33 @@ def test_cli_json_output(tmp_path: Path, capsys):
     config_path = tmp_path / "config.toml"
     assert main(["--config", str(config_path), "index"]) == 0
     assert main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out.splitlines()[-1])[0]["excerpt"] == "Use sqlite."
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    assert result["excerpt"] == "Use sqlite."
+    assert set(result) == {
+        "excerpt", "path", "heading", "line_range", "dates", "score", "reason", "content_hash",
+    }
+
+
+def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'database = "{config.database}"\n\n'
+        f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n'
+    )
+    main(["--config", str(config_path), "index"])
+    main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--diagnostics", "--json"])
+
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    assert set(result["fusion_policies"]["selection_policies"]) == {
+        "semantic_score_floor",
+        "relative_semantic_score_floor",
+        "ticket_id_cross_reference_filter",
+        "balanced_admission",
+    }
 
 
 def test_config_rejects_missing_root(tmp_path: Path):

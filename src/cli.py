@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import excerpt, index, read_source, search
+from .core import FUSION_DIAGNOSTICS, excerpt, index, read_source, search
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -36,6 +36,7 @@ def parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--all-projects", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--semantic", action="store_true", help="use semantic candidates with lexical fallback")
+    search_parser.add_argument("--diagnostics", action="store_true", help="include retrieval diagnostics in JSON output")
     search_parser.add_argument("--json", action="store_true")
     hook_parser = commands.add_parser("hook", help="run one request through the semantic hook path")
     hook_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
@@ -81,8 +82,8 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _result(candidate) -> dict:
-    return {
+def _result(candidate, diagnostics: bool = False) -> dict:
+    result = {
         "excerpt": excerpt(candidate.text),
         "path": candidate.canonical_path,
         "heading": list(candidate.heading_path),
@@ -92,6 +93,18 @@ def _result(candidate) -> dict:
         "reason": candidate.reason,
         "content_hash": candidate.content_hash,
     }
+    if diagnostics:
+        result.update({
+            "lane": candidate.lane,
+            "lexical_rank": candidate.lexical_rank,
+            "vector_rank": candidate.vector_rank,
+            "lexical_score": candidate.lexical_score,
+            "vector_score": candidate.vector_score,
+            "fused_score": candidate.fused_score,
+            "guard_reason": candidate.guard_reason,
+            "fusion_policies": FUSION_DIAGNOSTICS,
+        })
+    return result
 
 
 def _model_status(bundle_dir: str | Path) -> dict:
@@ -177,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.limit,
                 args.deadline_ms,
             )
-            items = [_result(item) for item in response.candidates]
+            items = [_result(item, diagnostics=True) for item in response.candidates]
             if args.json:
                 print(json.dumps({"items": items, "metrics": response.metrics.__dict__}, ensure_ascii=False))
             else:
@@ -212,11 +225,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = load_config(args.config)
             if args.semantic:
-                results = [_result(item) for item in run_hook(
+                results = [_result(item, diagnostics=True) for item in run_hook(
                     config, args.config, args.query, args.project, args.root, args.all_projects, args.limit,
                 ).candidates]
             else:
-                results = [_result(item) for item in search(
+                results = [_result(item, diagnostics=args.diagnostics) for item in search(
                     config, args.query, args.project, args.root, args.all_projects, args.limit,
                 )]
             if args.json:

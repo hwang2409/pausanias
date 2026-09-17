@@ -592,6 +592,8 @@ def _run_hook_benchmark(
             "fallback_count": cold["fallback_count"],
         }
     result = {
+        "phase": "B",
+        "retrieval_mode": "fused",
         "query_count": query_count,
         "throughput": {
             "warm_queries_per_second": warm["throughput"]["queries_per_second"],
@@ -613,7 +615,12 @@ def _run_hook_benchmark(
         ),
         "warm": {**warm, "gate": warm_gate},
         "cold": {**cold, "gate": cold_gate},
-        "gates": {"warm_scan_path": warm_gate, "cold_scan_path": cold_gate},
+        "gates": {
+            "warm_fused": warm_gate,
+            "cold_fused": cold_gate,
+            "warm_scan_path": warm_gate,
+            "cold_scan_path": cold_gate,
+        },
         "passed": warm_gate["passed"] is not False and cold_gate["passed"] is not False,
     }
     stop_worker(config.database)
@@ -672,7 +679,7 @@ def format_report(report: dict) -> str:
         ]
         for phase_name in ("warm", "cold"):
             phase = hook[phase_name]
-            lines.append(f"{phase_name} scan path:")
+            lines.append(f"{phase_name} fused path:")
             for name, values in phase["metrics"].items():
                 lines.append(
                     f"  {name:20} {values['p50_ms']:8.2f} / {values['p95_ms']:8.2f} / {values['max_ms']:8.2f}"

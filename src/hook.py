@@ -8,7 +8,14 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .core import Candidate, search
+from .core import (
+    BALANCED_ADMISSION,
+    Candidate,
+    RELATIVE_SEMANTIC_SCORE_FLOOR,
+    SEMANTIC_SCORE_FLOOR,
+    TICKET_ID_CROSS_REFERENCE_FILTER,
+    search,
+)
 from .worker import ADAPTER_DEADLINE_MS, HookMetrics, WorkerClient, WorkerError, ensure_worker
 
 
@@ -40,6 +47,9 @@ def _candidate(value: dict[str, object]) -> Candidate:
         str(value["project_scope"]), str(value["text"]), str(value["content_hash"]),
         value.get("note_type"), value.get("updated_date"), value.get("created_date"),
         float(value["score"]), str(value["reason"]),
+        value.get("lexical_rank"), value.get("vector_rank"),
+        value.get("lexical_score"), value.get("vector_score"), value.get("fused_score"),
+        str(value.get("lane", "lexical")), value.get("guard_reason"),
     )
 
 
@@ -108,6 +118,10 @@ def run_hook(
     all_projects: bool = False,
     limit: int = 20,
     deadline_ms: float = ADAPTER_DEADLINE_MS,
+    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
+    relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
+    ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
+    balanced_admission: bool = BALANCED_ADMISSION,
 ) -> HookResponse:
     """Run one semantic request through a persistent worker or lexical fallback."""
     if deadline_ms <= 0:
@@ -126,6 +140,10 @@ def run_hook(
             "all_projects": all_projects,
             "limit": limit,
             "deadline_ms": deadline_ms,
+            "semantic_score_floor": semantic_score_floor,
+            "relative_semantic_score_floor": relative_semantic_score_floor,
+            "ticket_id_cross_reference_filter": ticket_id_cross_reference_filter,
+            "balanced_admission": balanced_admission,
         }, deadline)
         items = response.get("items")
         raw_metrics = response.get("metrics")
