@@ -2,11 +2,12 @@ import json
 import math
 import sqlite3
 import struct
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from pausanias import core
-from pausanias import vectors
+from pausanias import core, vectors
 from pausanias.config import load_config
 
 
@@ -37,18 +38,25 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     return load_config(config_path)
 
 
-def test_pinned_tokenizer_golden_ids_and_truncation(tmp_path: Path):
+def test_pinned_tokenizer_defaults_missing_direction_and_truncates(tmp_path: Path):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     fixture = Path(__file__).parent / "fixtures" / "pinned_tokenizer.json"
     (bundle / "tokenizer.json").write_bytes(fixture.read_bytes())
-    tokenizer = core._StdlibTokenizer(bundle)
+    tokenizer = vectors.StdlibTokenizer(bundle)
 
+    assert tokenizer.truncation_direction == "Right"
     # These ids come from the vocabulary and TemplateProcessing rules in the pinned fixture.
     assert tokenizer.tokens("Hello, world!") == [101, 200, 203, 201, 202, 102]
     assert tokenizer.tokens("CAFÉ déjà") == [101, 204, 205, 102]
     assert tokenizer.tokens("special [MASK] chars") == [101, 206, 103, 207, 102]
     assert tokenizer.tokens(" ".join(["long"] * 130)) == [101, *([208] * 126), 102]
+
+
+@pytest.mark.parametrize("order", [("core", "vectors"), ("vectors", "core")])
+def test_core_and_vectors_import_in_both_orders(order: tuple[str, str]):
+    code = f"import pausanias.{order[0]}; import pausanias.{order[1]}"
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=Path(__file__).parents[1])
 
 
 def test_pinned_tokenizer_rejects_unsupported_truncation_strategy(tmp_path: Path):
@@ -59,7 +67,7 @@ def test_pinned_tokenizer_rejects_unsupported_truncation_strategy(tmp_path: Path
     (bundle / "tokenizer.json").write_text(json.dumps(fixture))
 
     with pytest.raises(core.SemanticError, match="truncation strategy is unsupported"):
-        core._StdlibTokenizer(bundle)
+        vectors.StdlibTokenizer(bundle)
 
 
 def test_vector_store_scans_normalized_float32_vectors_with_scope(tmp_path: Path):

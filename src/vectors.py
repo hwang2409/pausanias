@@ -19,6 +19,7 @@ from .model_bundle import (
     verify_bundle,
 )
 from .splitter import content_hash
+from .store import connect_readonly, require_schema_version, safe_source
 
 MAX_CANDIDATES = 200
 EMBEDDING_VERSION = 1
@@ -159,7 +160,7 @@ class StdlibTokenizer:
             raise SemanticError("tokenizer truncation settings are missing")
         max_length = truncation.get("max_length")
         strategy = truncation.get("strategy")
-        direction = truncation.get("direction")
+        direction = truncation.get("direction", "Right")
         stride = truncation.get("stride", 0)
         if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 1:
             raise SemanticError("tokenizer truncation length is invalid")
@@ -463,15 +464,13 @@ def scan_vectors(
     except (SemanticError, ValueError, TypeError):
         return []
 
-    from .core import _require_schema_version, _safe_source, connect
-
     def placeholders(values: list[str]) -> str:
         return ", ".join("?" for _ in values) or "NULL"
 
-    connection = connect(config.database, initialize=False, readonly=True)
+    connection = connect_readonly(config.database)
     try:
         connection.execute("BEGIN")
-        _require_schema_version(connection)
+        require_schema_version(connection)
         state = dict(connection.execute("SELECT key, value FROM metadata WHERE key IN ('generation', 'semantic_state', 'semantic_generation')").fetchall())
         if state.get("semantic_state") != SEMANTIC_STATE_READY or state.get("generation") != state.get("semantic_generation"):
             return []
@@ -536,7 +535,7 @@ def scan_vectors(
     for score, row in scored:
         canonical = row["canonical_path"]
         if canonical not in source_cache:
-            source_cache[canonical] = _safe_source(config, canonical)
+            source_cache[canonical] = safe_source(config, canonical)
         source = source_cache[canonical]
         if source is None:
             if refresh is not None:
@@ -594,21 +593,3 @@ def vector_candidates(
                             all_projects, limit, refresh)
     except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError, sqlite3.DatabaseError):
         return []
-
-
-def semantic_search(
-    config: Config,
-    query: str,
-    project: str | None = None,
-    root_id: str | None = None,
-    all_projects: bool = False,
-    limit: int = 20,
-    refresh: set[str] | None = None,
-    encoder: object | None = None,
-) -> list[Candidate]:
-    """Use semantic candidates when ready, with lexical fallback on failure."""
-    candidates = vector_candidates(config, query, project, root_id, all_projects, limit, refresh, encoder)
-    if candidates:
-        return candidates
-    from .core import search
-    return search(config, query, project, root_id, all_projects, limit, refresh)

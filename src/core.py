@@ -17,33 +17,28 @@ from .model_bundle import (
     package_version,
 )
 from .splitter import content_hash, explicit_links, split_markdown
+from .store import SCHEMA_VERSION
+from .store import markdown as _markdown
+from .store import require_schema_version as _require_schema_version
+from .store import safe_source as _safe_source
 from .vectors import (
     EMBEDDING_FORMAT_VERSION,
     EMBEDDING_VERSION,
     SEMANTIC_DISABLED_REASON,
-    SEMANTIC_REASON_MANIFEST_CHANGED,
-    SEMANTIC_REASON_MODEL_HASH_MISMATCH,
-    SEMANTIC_REASON_MODEL_MISSING,
     SEMANTIC_REASON_REFRESH_FAILED,
-    SEMANTIC_REASON_VECTOR_TABLE_CORRUPT,
     SEMANTIC_STATE_DISABLED,
     SEMANTIC_STATE_READY,
     SEMANTIC_STATE_STALE,
     Candidate,
-    OnnxEncoder as _OnnxEncoder,
     SemanticError,
-    StdlibTokenizer as _StdlibTokenizer,
-    encoder_vectors as _encoder_vectors,
     semantic_backend_reason,
-    semantic_search,
-    scan_vectors,
-    unpack_vector as _unpack_vector,
     vector_candidates,
 )
+from .vectors import OnnxEncoder as _OnnxEncoder
+from .vectors import encoder_vectors as _encoder_vectors
 
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
-SCHEMA_VERSION = 2
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
 
@@ -253,16 +248,6 @@ def connect(database: Path, initialize: bool = True, readonly: bool = False) -> 
     return connection
 
 
-def _require_schema_version(connection: sqlite3.Connection) -> None:
-    stored_version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if stored_version != SCHEMA_VERSION:
-        raise ValueError(f"index schema is v{stored_version}; run `pausanias index` to rebuild")
-
-
-def _markdown(path: Path) -> bool:
-    return path.suffix.lower() in {".md", ".markdown"}
-
-
 def _files(config: Config) -> dict[str, tuple[Root, Path]]:
     found: dict[str, tuple[Root, Path]] = {}
     for root in config.roots:
@@ -424,24 +409,6 @@ def index(config: Config, rebuild: bool = False, encoder: object | None = None) 
         connection.close()
 
 
-def _safe_source(config: Config, raw_path: str | Path) -> tuple[Root, Path] | None:
-    requested = Path(raw_path).expanduser()
-    options = [requested] if requested.is_absolute() else [Path.cwd() / requested, *(root.path / requested for root in config.roots)]
-    seen: set[Path] = set()
-    for option in options:
-        try:
-            canonical = option.resolve(strict=True)
-        except OSError:
-            continue
-        if canonical in seen:
-            continue
-        seen.add(canonical)
-        root = config.root_for(canonical)
-        if root and canonical.is_file() and _markdown(canonical) and not config.is_excluded(canonical, root):
-            return root, canonical
-    return None
-
-
 def read_source(config: Config, raw_path: str, heading: str | None = None, max_bytes: int = 20000) -> str:
     if max_bytes < 1:
         raise ValueError("max-bytes must be positive")
@@ -511,6 +478,14 @@ def _column_query(column: str, fts: str) -> str:
 
 def _token_set(value: str) -> set[str]:
     return {token.lower() for token in TOKEN_PATTERN.findall(value)}
+
+
+def semantic_search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
+                    all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
+                    encoder: object | None = None) -> list[Candidate]:
+    """Use semantic candidates, with lexical fallback on failure."""
+    candidates = vector_candidates(config, query, project, root_id, all_projects, limit, refresh, encoder)
+    return candidates if candidates else search(config, query, project, root_id, all_projects, limit, refresh)
 
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
