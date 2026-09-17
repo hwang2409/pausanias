@@ -7,15 +7,21 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import random
 import re
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 
 from .config import Config, load_config
 from .core import index, search
+from .worker import stop_worker
 from .splitter import split_markdown
 from .synth import generate_corpus
+from .model_bundle import BundleError, _resolve_active_bundle, manifest_fingerprint, verify_bundle
 
 
 IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
@@ -67,6 +73,7 @@ def _write_config(
     source: Path,
     database: Path,
     synthetic: bool,
+    bundle_dir: str | Path | None = None,
 ) -> tuple[Path, int]:
     source = source.resolve()
     if synthetic:
@@ -82,6 +89,8 @@ def _write_config(
         root_entries.append((f"root-{number}", root.name if synthetic else "real", root))
     global_notes = [path for path in _markdown_files(source) if path.name.startswith("global-")]
     lines = [f"database = {json.dumps(str(database))}"]
+    if bundle_dir is not None:
+        lines.append(f"semantic_bundle = {json.dumps(str(Path(bundle_dir).expanduser().resolve()))}")
     if global_notes:
         notes = ", ".join(json.dumps(str(path)) for path in global_notes)
         lines += [f"global_notes = [{notes}]"]
@@ -325,6 +334,8 @@ def run_benchmark(
     seed: int = 0,
     corpus_dir: str | Path | None = None,
     real_dir: str | Path | None = None,
+    hook_path: bool = False,
+    bundle_dir: str | Path | None = None,
 ) -> dict:
     """Run the benchmark and return a JSON-serializable report."""
 
@@ -353,17 +364,20 @@ def run_benchmark(
             generate_corpus(source, file_count=file_count, seed=seed)
             generated = True
 
-        config_path, actual_file_count = _write_config(workspace, source, workspace / "index.sqlite3", synthetic)
+        config_path, actual_file_count = _write_config(
+            workspace, source, workspace / "index.sqlite3", synthetic, bundle_dir,
+        )
         config = load_config(config_path)
         documents = _documents(config, source)
         queries = _make_queries(documents, query_count, seed)
 
         started = time.perf_counter()
-        index(config, rebuild=True)
+        encoding_metrics = {"section_count": 0.0, "elapsed_ms": 0.0}
+        index(config, rebuild=True, encoding_metrics=encoding_metrics)
         index_build_ms = _positive_milliseconds(time.perf_counter() - started)
 
         started = time.perf_counter()
-        index(config)
+        index(config, encoding_metrics=encoding_metrics)
         refresh_ms = _positive_milliseconds(time.perf_counter() - started)
 
         first_query = queries[0]
@@ -454,7 +468,156 @@ def run_benchmark(
                 "reason": "warm search p95 must be at most 300 ms",
             },
         }
+        if hook_path:
+            report["hook_path"] = _run_hook_benchmark(
+                config_path, config, queries, query_count, encoding_metrics,
+            )
         return report
+
+
+def _hook_process(config_path: Path, query: QuerySpec) -> dict:
+    command = [
+        sys.executable, "-m", "pausanias", "--config", str(config_path), "hook", query.query,
+        "--limit", "20", "--json",
+    ]
+    if query.project is not None:
+        command.extend(["--project", query.project])
+    if query.root_id is not None:
+        command.extend(["--root", query.root_id])
+    if query.all_projects:
+        command.append("--all-projects")
+    environment = os.environ.copy()
+    repository = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = repository if not existing_pythonpath else repository + os.pathsep + existing_pythonpath
+    started = time.perf_counter()
+    completed = subprocess.run(command, capture_output=True, text=True, cwd=repository, env=environment, check=False)
+    wall_ms = _positive_milliseconds(time.perf_counter() - started)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "hook process failed")
+    value = json.loads(completed.stdout)
+    if not isinstance(value, dict) or not isinstance(value.get("metrics"), dict):
+        raise RuntimeError("hook process returned an invalid report")
+    metrics = value["metrics"]
+    metrics["hook_internal_ms"] = metrics.get("hook_total_ms", 0.000001)
+    metrics["hook_total_ms"] = wall_ms
+    value["candidate_count"] = len(value.get("items", [])) if isinstance(value.get("items"), list) else 0
+    metrics["candidate_count"] = value["candidate_count"]
+    return value
+
+
+def _stage_summary(values: list[float]) -> dict[str, float]:
+    return {"p50_ms": _percentile(values, 0.50), "p95_ms": _percentile(values, 0.95), "max_ms": max(values)}
+
+
+def _phase_report(samples: list[dict], corpus_section_count: int = 0) -> dict[str, object]:
+    names = (
+        "hook_total_ms", "worker_startup_ms", "model_load_ms", "matrix_load_ms",
+        "encode_ms", "scan_ms", "fallback_ms", "fts_search_ms", "hybrid_overhead_ms",
+    )
+    metrics = {
+        name: _stage_summary([max(float(sample.get(name, 0.000001)), 0.000001) for sample in samples])
+        for name in names
+    }
+    return {
+        "metrics": metrics,
+        "fallback_count": sum(bool(sample.get("fallback", False)) for sample in samples),
+        "candidate_count": sum(int(sample.get("candidate_count", 0)) for sample in samples),
+        "corpus_section_count": corpus_section_count,
+        "throughput": {
+            "queries_per_second": len(samples) / max(sum(float(sample.get("hook_total_ms", 0.000001)) for sample in samples) / 1000.0, 0.000001),
+        },
+        "samples": len(samples),
+        "cache_states": sorted({str(sample.get("cache_state", "unknown")) for sample in samples}),
+    }
+
+
+def _read_verified_bundle_manifest(bundle_dir: Path) -> dict[str, object] | None:
+    try:
+        root = _resolve_active_bundle(bundle_dir)
+        manifest_path = root / "manifest.json"
+        stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict):
+            raise BundleError("bundle manifest must be an object")
+        verify_bundle(bundle_dir)
+        fingerprint = stored.get("manifest_fingerprint")
+        if not isinstance(fingerprint, str) or manifest_fingerprint(stored) != fingerprint:
+            raise BundleError("bundle manifest fingerprint is invalid")
+        return stored
+    except (BundleError, OSError, ValueError, TypeError):
+        return None
+
+
+def _run_hook_benchmark(
+    config_path: Path,
+    config: Config,
+    queries: list[QuerySpec],
+    query_count: int,
+    encoding_metrics: dict[str, float] | None = None,
+) -> dict[str, object]:
+    _hook_process(config_path, queries[0])
+    warm_samples = [_hook_process(config_path, query)["metrics"] for query in queries]
+    cold_samples: list[dict] = []
+    for query in queries:
+        stop_worker(config.database)
+        cold_samples.append(_hook_process(config_path, query)["metrics"])
+    with sqlite3.connect(config.database) as connection:
+        corpus_section_count = int(connection.execute("SELECT count(*) FROM sections").fetchone()[0])
+    warm = _phase_report(warm_samples, corpus_section_count)
+    cold = _phase_report(cold_samples, corpus_section_count)
+    encoded_sections = int((encoding_metrics or {}).get("section_count", 0.0))
+    encoded_ms = float((encoding_metrics or {}).get("elapsed_ms", 0.0))
+    encoded_throughput = (
+        encoded_sections / max(encoded_ms / 1000.0, 0.000001)
+        if encoded_sections else None
+    )
+    bundle_manifest = _read_verified_bundle_manifest(config.bundle_dir)
+    runtime = bundle_manifest.get("runtime") if bundle_manifest is not None else None
+    semantic_enabled = any(not bool(sample.get("fallback", False)) for sample in warm_samples + cold_samples)
+    if not semantic_enabled:
+        reason = "semantic backend unavailable; lexical gate remains active"
+        warm_gate = {"enabled": False, "passed": None, "reason": reason}
+        cold_gate = {"enabled": False, "passed": None, "reason": reason}
+    else:
+        warm_gate = {
+            "enabled": True,
+            "passed": warm["metrics"]["hook_total_ms"]["p95_ms"] <= 300.0 and warm["fallback_count"] == 0,
+            "target_ms": 300.0,
+            "fallback_count": warm["fallback_count"],
+        }
+        cold_gate = {
+            "enabled": True,
+            "passed": cold["metrics"]["hook_total_ms"]["p95_ms"] <= 750.0 and cold["fallback_count"] == 0,
+            "target_ms": 750.0,
+            "fallback_count": cold["fallback_count"],
+        }
+    result = {
+        "query_count": query_count,
+        "throughput": {
+            "warm_queries_per_second": warm["throughput"]["queries_per_second"],
+            "cold_queries_per_second": cold["throughput"]["queries_per_second"],
+            "encoded_sections_per_second": encoded_throughput,
+        },
+        "encoded_section_count": encoded_sections,
+        "encoded_section_ms": encoded_ms if encoded_sections else None,
+        "candidate_count": warm["candidate_count"] + cold["candidate_count"],
+        "corpus_size": {
+            "files": sum(len(_markdown_files(root.path)) for root in config.roots),
+            "sections": corpus_section_count,
+        },
+        "platform": platform.platform(),
+        "provider": runtime.get("provider") if isinstance(runtime, dict) else None,
+        "model_manifest": bundle_manifest,
+        "model_manifest_fingerprint": (
+            bundle_manifest.get("manifest_fingerprint") if bundle_manifest is not None else None
+        ),
+        "warm": {**warm, "gate": warm_gate},
+        "cold": {**cold, "gate": cold_gate},
+        "gates": {"warm_scan_path": warm_gate, "cold_scan_path": cold_gate},
+        "passed": warm_gate["passed"] is not False and cold_gate["passed"] is not False,
+    }
+    stop_worker(config.database)
+    return result
 
 
 def format_report(report: dict) -> str:
@@ -497,4 +660,24 @@ def format_report(report: dict) -> str:
     status = "pass" if gate["passed"] else "fail"
     enforcement = " (enforced)" if gate["enforced"] else ""
     lines += ["", f"warm p95 gate: {status}{enforcement}"]
+    hook = report.get("hook_path")
+    if hook is not None:
+        corpus = hook["corpus_size"]
+        lines += [
+            "",
+            f"hook corpus: {corpus['files']} files, {corpus['sections']} sections; candidates={hook['candidate_count']}",
+            f"hook platform: {hook['platform']}; provider: {hook['provider']}",
+            f"encoded sections/s: {hook['throughput']['encoded_sections_per_second'] or 'n/a'}",
+            "hook-path stage metrics (p50 / p95 / max ms)",
+        ]
+        for phase_name in ("warm", "cold"):
+            phase = hook[phase_name]
+            lines.append(f"{phase_name} scan path:")
+            for name, values in phase["metrics"].items():
+                lines.append(
+                    f"  {name:20} {values['p50_ms']:8.2f} / {values['p95_ms']:8.2f} / {values['max_ms']:8.2f}"
+                )
+            phase_gate = phase["gate"]
+            result = "disabled" if not phase_gate["enabled"] else ("pass" if phase_gate["passed"] else "fail")
+            lines.append(f"  gate: {result}; fallbacks={phase['fallback_count']}")
     return "\n".join(lines)

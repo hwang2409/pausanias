@@ -286,7 +286,12 @@ def _sources_unchanged(config: Config, observed: dict[str, str]) -> bool:
         return False
 
 
-def index(config: Config, rebuild: bool = False, encoder: object | None = None) -> int:
+def index(
+    config: Config,
+    rebuild: bool = False,
+    encoder: object | None = None,
+    encoding_metrics: dict[str, float] | None = None,
+) -> int:
     found = _files(config)
     config.database.parent.mkdir(parents=True, exist_ok=True)
     connection = connect(config.database, initialize=False)
@@ -361,9 +366,18 @@ def index(config: Config, rebuild: bool = False, encoder: object | None = None) 
                 if to_encode:
                     if encoder is None:
                         encoder = _OnnxEncoder(_resolve_active_bundle(config.bundle_dir))
+                    encode_started = time.perf_counter()
                     vectors = _encoder_vectors(encoder, [row["text"] for row in to_encode])
                     if len(vectors) != len(to_encode):
                         raise SemanticError("embedding backend returned the wrong number of vectors")
+                    if encoding_metrics is not None:
+                        encoding_metrics["section_count"] = (
+                            encoding_metrics.get("section_count", 0.0) + len(to_encode)
+                        )
+                        encoding_metrics["elapsed_ms"] = (
+                            encoding_metrics.get("elapsed_ms", 0.0)
+                            + (time.perf_counter() - encode_started) * 1000.0
+                        )
                     for row, vector in zip(to_encode, vectors, strict=True):
                         connection.execute(
                             "INSERT INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?) "
