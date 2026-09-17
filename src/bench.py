@@ -9,11 +9,14 @@ import os
 from pathlib import Path
 import random
 import re
+import subprocess
+import sys
 import tempfile
 import time
 
 from .config import Config, load_config
 from .core import index, search
+from .worker import stop_worker
 from .splitter import split_markdown
 from .synth import generate_corpus
 
@@ -67,6 +70,7 @@ def _write_config(
     source: Path,
     database: Path,
     synthetic: bool,
+    bundle_dir: str | Path | None = None,
 ) -> tuple[Path, int]:
     source = source.resolve()
     if synthetic:
@@ -82,6 +86,8 @@ def _write_config(
         root_entries.append((f"root-{number}", root.name if synthetic else "real", root))
     global_notes = [path for path in _markdown_files(source) if path.name.startswith("global-")]
     lines = [f"database = {json.dumps(str(database))}"]
+    if bundle_dir is not None:
+        lines.append(f"semantic_bundle = {json.dumps(str(Path(bundle_dir).expanduser().resolve()))}")
     if global_notes:
         notes = ", ".join(json.dumps(str(path)) for path in global_notes)
         lines += [f"global_notes = [{notes}]"]
@@ -325,6 +331,8 @@ def run_benchmark(
     seed: int = 0,
     corpus_dir: str | Path | None = None,
     real_dir: str | Path | None = None,
+    hook_path: bool = False,
+    bundle_dir: str | Path | None = None,
 ) -> dict:
     """Run the benchmark and return a JSON-serializable report."""
 
@@ -353,7 +361,9 @@ def run_benchmark(
             generate_corpus(source, file_count=file_count, seed=seed)
             generated = True
 
-        config_path, actual_file_count = _write_config(workspace, source, workspace / "index.sqlite3", synthetic)
+        config_path, actual_file_count = _write_config(
+            workspace, source, workspace / "index.sqlite3", synthetic, bundle_dir,
+        )
         config = load_config(config_path)
         documents = _documents(config, source)
         queries = _make_queries(documents, query_count, seed)
@@ -454,7 +464,92 @@ def run_benchmark(
                 "reason": "warm search p95 must be at most 300 ms",
             },
         }
+        if hook_path:
+            report["hook_path"] = _run_hook_benchmark(config_path, config, queries, query_count)
         return report
+
+
+def _hook_process(config_path: Path, query: QuerySpec) -> dict:
+    command = [
+        sys.executable, "-m", "pausanias", "--config", str(config_path), "hook", query.query,
+        "--limit", "20", "--json",
+    ]
+    if query.project is not None:
+        command.extend(["--project", query.project])
+    if query.root_id is not None:
+        command.extend(["--root", query.root_id])
+    if query.all_projects:
+        command.append("--all-projects")
+    environment = os.environ.copy()
+    repository = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = repository if not existing_pythonpath else repository + os.pathsep + existing_pythonpath
+    completed = subprocess.run(command, capture_output=True, text=True, cwd=repository, env=environment, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "hook process failed")
+    value = json.loads(completed.stdout)
+    if not isinstance(value, dict) or not isinstance(value.get("metrics"), dict):
+        raise RuntimeError("hook process returned an invalid report")
+    return value
+
+
+def _stage_summary(values: list[float]) -> dict[str, float]:
+    return {"p50_ms": _percentile(values, 0.50), "p95_ms": _percentile(values, 0.95), "max_ms": max(values)}
+
+
+def _phase_report(samples: list[dict]) -> dict[str, object]:
+    names = (
+        "hook_total_ms", "worker_startup_ms", "model_load_ms", "matrix_load_ms",
+        "encode_ms", "scan_ms", "fallback_ms", "fts_search_ms", "hybrid_overhead_ms",
+    )
+    metrics = {
+        name: _stage_summary([max(float(sample.get(name, 0.000001)), 0.000001) for sample in samples])
+        for name in names
+    }
+    return {
+        "metrics": metrics,
+        "fallback_count": sum(bool(sample.get("fallback", False)) for sample in samples),
+        "samples": len(samples),
+        "cache_states": sorted({str(sample.get("cache_state", "unknown")) for sample in samples}),
+    }
+
+
+def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySpec], query_count: int) -> dict[str, object]:
+    _hook_process(config_path, queries[0])
+    warm_samples = [_hook_process(config_path, query)["metrics"] for query in queries]
+    cold_samples: list[dict] = []
+    for query in queries:
+        stop_worker(config.database)
+        cold_samples.append(_hook_process(config_path, query)["metrics"])
+    warm = _phase_report(warm_samples)
+    cold = _phase_report(cold_samples)
+    semantic_enabled = any(not bool(sample.get("fallback", False)) for sample in warm_samples + cold_samples)
+    if not semantic_enabled:
+        reason = "semantic backend unavailable; lexical gate remains active"
+        warm_gate = {"enabled": False, "passed": None, "reason": reason}
+        cold_gate = {"enabled": False, "passed": None, "reason": reason}
+    else:
+        warm_gate = {
+            "enabled": True,
+            "passed": warm["metrics"]["hook_total_ms"]["p95_ms"] <= 300.0 and warm["fallback_count"] == 0,
+            "target_ms": 300.0,
+            "fallback_count": warm["fallback_count"],
+        }
+        cold_gate = {
+            "enabled": True,
+            "passed": cold["metrics"]["hook_total_ms"]["p95_ms"] <= 750.0 and cold["fallback_count"] == 0,
+            "target_ms": 750.0,
+            "fallback_count": cold["fallback_count"],
+        }
+    result = {
+        "query_count": query_count,
+        "warm": {**warm, "gate": warm_gate},
+        "cold": {**cold, "gate": cold_gate},
+        "gates": {"warm_scan_path": warm_gate, "cold_scan_path": cold_gate},
+        "passed": warm_gate["passed"] is not False and cold_gate["passed"] is not False,
+    }
+    stop_worker(config.database)
+    return result
 
 
 def format_report(report: dict) -> str:
@@ -497,4 +592,17 @@ def format_report(report: dict) -> str:
     status = "pass" if gate["passed"] else "fail"
     enforcement = " (enforced)" if gate["enforced"] else ""
     lines += ["", f"warm p95 gate: {status}{enforcement}"]
+    hook = report.get("hook_path")
+    if hook is not None:
+        lines += ["", "hook-path stage metrics (p50 / p95 / max ms)"]
+        for phase_name in ("warm", "cold"):
+            phase = hook[phase_name]
+            lines.append(f"{phase_name} scan path:")
+            for name, values in phase["metrics"].items():
+                lines.append(
+                    f"  {name:20} {values['p50_ms']:8.2f} / {values['p95_ms']:8.2f} / {values['max_ms']:8.2f}"
+                )
+            phase_gate = phase["gate"]
+            result = "disabled" if not phase_gate["enabled"] else ("pass" if phase_gate["passed"] else "fail")
+            lines.append(f"  gate: {result}; fallbacks={phase['fallback_count']}")
     return "\n".join(lines)

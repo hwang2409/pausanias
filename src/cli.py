@@ -8,6 +8,7 @@ from pathlib import Path
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
 from .core import excerpt, index, read_source, search
+from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
     NUMPY_VERSION,
@@ -36,6 +37,15 @@ def parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--semantic", action="store_true", help="use semantic candidates with lexical fallback")
     search_parser.add_argument("--json", action="store_true")
+    hook_parser = commands.add_parser("hook", help="run one request through the semantic hook path")
+    hook_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
+    hook_parser.add_argument("query")
+    hook_parser.add_argument("--project")
+    hook_parser.add_argument("--root")
+    hook_parser.add_argument("--all-projects", action="store_true")
+    hook_parser.add_argument("--limit", type=int, default=20)
+    hook_parser.add_argument("--deadline-ms", type=float, default=750.0)
+    hook_parser.add_argument("--json", action="store_true")
     read_parser = commands.add_parser("read")
     read_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
     read_parser.add_argument("path")
@@ -53,6 +63,8 @@ def parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="benchmark an existing Markdown directory read-only; results reflect local cost only",
     )
+    bench_parser.add_argument("--hook-path", action="store_true", help="measure the real semantic hook path")
+    bench_parser.add_argument("--bundle-dir", help="semantic model bundle for hook-path benchmarks")
     bench_parser.add_argument("--json", action="store_true", help="write the report as JSON")
     model_parser = commands.add_parser("model", help="manage the optional semantic model")
     model_commands = model_parser.add_subparsers(dest="model_command", required=True)
@@ -130,12 +142,15 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 corpus_dir=args.corpus_dir,
                 real_dir=args.real,
+                hook_path=args.hook_path,
+                bundle_dir=args.bundle_dir,
             )
             if args.json:
                 print(json.dumps(report, sort_keys=True))
             else:
                 print(format_report(report))
-            return 1 if report["gate"]["enforced"] and not report["gate"]["passed"] else 0
+            hook_failed = "hook_path" in report and not report["hook_path"]["passed"]
+            return 1 if (report["gate"]["enforced"] and not report["gate"]["passed"]) or hook_failed else 0
         if args.command == "model" and args.model_command == "license":
             bundle_dir = args.bundle_dir
             if bundle_dir is None:
@@ -149,6 +164,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{record.get('name', 'license')}: {record.get('spdx_id', 'unknown')}")
                 if isinstance(record.get("notice"), str):
                     print(record["notice"], end="" if record["notice"].endswith("\n") else "\n")
+            return 0
+        if args.command == "hook":
+            config = load_config(args.config)
+            response = run_hook(
+                config,
+                args.config,
+                args.query,
+                args.project,
+                args.root,
+                args.all_projects,
+                args.limit,
+                args.deadline_ms,
+            )
+            items = [_result(item) for item in response.candidates]
+            if args.json:
+                print(json.dumps({"items": items, "metrics": response.metrics.__dict__}, ensure_ascii=False))
+            else:
+                for item in items:
+                    print(f"{item['path']}:{item['line_range'][0]}-{item['line_range'][1]} {item['heading']}")
+                    print(f"  {item['excerpt']}")
+                    print(f"  reason: {item['reason']}")
             return 0
         if args.command == "model" and args.model_command == "status":
             status = _model_status(_configured_bundle(args))
@@ -175,8 +211,14 @@ def main(argv: list[str] | None = None) -> int:
             print(read_source(config, args.path, args.heading, args.max_bytes))
         else:
             config = load_config(args.config)
-            results = [_result(item) for item in search(config, args.query, args.project, args.root, args.all_projects, args.limit,
-                                                       semantic=args.semantic)]
+            if args.semantic:
+                results = [_result(item) for item in run_hook(
+                    config, args.config, args.query, args.project, args.root, args.all_projects, args.limit,
+                ).candidates]
+            else:
+                results = [_result(item) for item in search(
+                    config, args.query, args.project, args.root, args.all_projects, args.limit,
+                )]
             if args.json:
                 print(json.dumps(results, ensure_ascii=False))
             else:

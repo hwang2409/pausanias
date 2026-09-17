@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 import struct
+import time
 import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -446,8 +447,12 @@ def scan_vectors(
     all_projects: bool = False,
     limit: int = 20,
     refresh: set[str] | None = None,
+    matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> list[Candidate]:
     """Return bounded, scope-filtered exact cosine candidates for a vector."""
+    if timings is not None:
+        timings["semantic_available"] = 0.0
     if limit < 1:
         raise ValueError("limit must be positive")
     if not config.database.exists():
@@ -490,6 +495,8 @@ def scan_vectors(
         section_count = connection.execute("SELECT count(*) FROM sections WHERE index_generation = ?", (generation,)).fetchone()[0]
         if complete_count != section_count:
             return []
+        if timings is not None:
+            timings["semantic_available"] = 1.0
         conditions = [
             "s.index_generation = ?",
             "e.generation = ?",
@@ -506,15 +513,33 @@ def scan_vectors(
             scope_conditions.append(f"s.canonical_path IN ({placeholders(global_paths)})")
             params.extend(global_paths)
         conditions.append("(" + " OR ".join(scope_conditions) + ")" if scope_conditions else "0")
-        rows = connection.execute(
-            "SELECT s.*, e.vector FROM sections s JOIN embeddings e ON e.section_id = s.section_id WHERE "
-            + " AND ".join(conditions),
-            params,
-        ).fetchall()
+        cache_key = (generation, tuple(scope_root_ids), tuple(global_paths))
+        cached = matrix_cache.get(cache_key) if matrix_cache is not None else None
+        if cached is None:
+            rows = connection.execute(
+                "SELECT s.*, e.vector FROM sections s JOIN embeddings e ON e.section_id = s.section_id WHERE "
+                + " AND ".join(conditions),
+                params,
+            ).fetchall()
+        else:
+            rows = cached[1]
         dimension = int(MODEL_BUNDLE_MANIFEST["dimension"])
         try:
-            matrix, valid_rows = load_vector_matrix(numpy, rows, dimension, refresh)
+            if cached is None:
+                matrix_started = time.perf_counter()
+                matrix, valid_rows = load_vector_matrix(numpy, rows, dimension, refresh)
+                if timings is not None:
+                    timings["matrix_load_ms"] = max((time.perf_counter() - matrix_started) * 1000.0, 0.000001)
+                if matrix_cache is not None:
+                    matrix_cache[cache_key] = (matrix, valid_rows)
+            else:
+                matrix, valid_rows = cached
+                if timings is not None:
+                    timings["matrix_load_ms"] = 0.000001
+            scan_started = time.perf_counter()
             scores = matrix @ query if valid_rows else numpy.empty(0, dtype=numpy.float32)
+            if timings is not None:
+                timings["scan_ms"] = max((time.perf_counter() - scan_started) * 1000.0, 0.000001)
         except (ValueError, TypeError, RuntimeError):
             return []
     finally:
