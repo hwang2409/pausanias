@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import time
 import tomllib
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -21,7 +20,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from pausanias.config import Config, Root, load_config
 from pausanias.core import Candidate, index, search
-
 
 EVAL_DIR = Path(__file__).resolve().parent
 CORPUS_DIR = EVAL_DIR / "corpus"
@@ -130,13 +128,23 @@ def load_cases(path: Path = CASES_PATH) -> list[Case]:
     return list(load_case_set(path).cases)
 
 
-def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, float]:
+def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, Any]:
     with path.open("rb") as handle:
         values = tomllib.load(handle).get("thresholds", {})
     required = ("recall_at_4", "precision_at_4", "mrr", "abstention_accuracy", "forbidden_violations")
     if any(key not in values for key in required):
         raise ValueError("thresholds must define all aggregate metrics")
-    return {key: float(values[key]) for key in required}
+    categories = values.get("categories", {})
+    if not isinstance(categories, dict):
+        raise ValueError("threshold categories must be a table")
+    parsed_categories: dict[str, dict[str, float]] = {}
+    for category, category_values in categories.items():
+        if not isinstance(category, str) or not isinstance(category_values, dict):
+            raise ValueError("each threshold category must be a table")
+        if any(key not in category_values for key in required):
+            raise ValueError(f"threshold category {category} must define all metrics")
+        parsed_categories[category] = {key: float(category_values[key]) for key in required}
+    return {**{key: float(values[key]) for key in required}, "categories": parsed_categories}
 
 
 def _runtime_config(source: Config, corpus_dir: Path, runtime_corpus: Path, database: Path) -> Config:
@@ -335,6 +343,12 @@ def _print_table(
 
 
 def main(argv: list[str] | None = None) -> int:
+    modern_flags = {"--predict-only", "--evaluate-only", "--resume", "--run-id", "--results-dir", "--top-k", "--cutoffs", "--corpus"}
+    arguments = sys.argv[1:] if argv is None else argv
+    if any(flag in arguments for flag in modern_flags):
+        from .harness import main as harness_main
+
+        return harness_main(arguments)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="print machine-readable results")
     parser.add_argument("--case", help="run one case by id")

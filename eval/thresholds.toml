@@ -5,3 +5,38 @@ precision_at_4 = 0.659574468
 mrr = 0.659574468
 abstention_accuracy = 1.0
 forbidden_violations = 0
+
+[thresholds.categories.verbatim]
+recall_at_4 = 1.0
+precision_at_4 = 1.0
+mrr = 1.0
+abstention_accuracy = 1.0
+forbidden_violations = 0
+
+[thresholds.categories.paraphrase]
+recall_at_4 = 0.0
+precision_at_4 = 0.0
+mrr = 0.0
+abstention_accuracy = 1.0
+forbidden_violations = 0
+
+[thresholds.categories.held-out]
+recall_at_4 = 0.0
+precision_at_4 = 0.0
+mrr = 0.0
+abstention_accuracy = 1.0
+forbidden_violations = 0
+
+[thresholds.categories.abstention]
+recall_at_4 = 1.0
+precision_at_4 = 1.0
+mrr = 1.0
+abstention_accuracy = 1.0
+forbidden_violations = 0
+
+[thresholds.categories.wrong-project]
+recall_at_4 = 1.0
+precision_at_4 = 1.0
+mrr = 1.0
+abstention_accuracy = 1.0
+forbidden_violations = 0
