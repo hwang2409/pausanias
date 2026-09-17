@@ -29,27 +29,19 @@ jobs:
       - name: prove zero runtime dependencies
         run: |
           .venv/bin/python - <<'PY'
-          from importlib.metadata import distributions
+          from importlib.metadata import requires
+          from packaging.requirements import Requirement
 
-          allowed = {
-              "pausanias",
-              "pytest",
-              "iniconfig",
-              "packaging",
-              "pluggy",
-              "pygments",
-              "pip",
-              "setuptools",
-              "wheel",
-          }
-          installed = {
-              distribution.metadata["Name"].lower().replace("_", "-")
-              for distribution in distributions()
-          }
-          unexpected = sorted(installed - allowed)
-          print("installed:", ", ".join(sorted(installed)))
-          if unexpected:
-              raise SystemExit(f"unexpected base packages: {unexpected}")
+          declared = [Requirement(value) for value in requires("pausanias") or []]
+          base = [
+              str(requirement)
+              for requirement in declared
+              if requirement.marker is None
+              or requirement.marker.evaluate({"extra": ""})
+          ]
+          print("declared requirements:", ", ".join(map(str, declared)) or "none")
+          if base:
+              raise SystemExit(f"base requirements declared: {base}")
           PY
       - name: run tests
         run: .venv/bin/python -m pytest -q
