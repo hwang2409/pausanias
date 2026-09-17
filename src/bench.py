@@ -386,7 +386,10 @@ def run_benchmark(
 
         first_query = queries[0]
         started = time.perf_counter()
-        search(config, first_query.query, first_query.project, first_query.root_id, first_query.all_projects, limit=20)
+        search(
+            config, first_query.query, first_query.project, first_query.root_id,
+            first_query.all_projects, limit=20, semantic=False,
+        )
         first_query_ms = _positive_milliseconds(time.perf_counter() - started)
 
         warm_timings: list[float] = []
@@ -395,7 +398,10 @@ def run_benchmark(
         mode_timings: dict[str, list[float]] = {}
         for query in queries:
             started = time.perf_counter()
-            results = search(config, query.query, query.project, query.root_id, query.all_projects, limit=20)
+            results = search(
+                config, query.query, query.project, query.root_id, query.all_projects,
+                limit=20, semantic=False,
+            )
             elapsed_ms = _positive_milliseconds(time.perf_counter() - started)
             warm_timings.append(elapsed_ms)
             result_count = len(results)
@@ -463,6 +469,7 @@ def run_benchmark(
                 "modes": query_modes,
                 "hit_count_mix": hit_count_mix,
             },
+            "retrieval_mode": "lexical",
             "metrics": metrics,
             "targets": targets,
             "checks": checks,
@@ -566,6 +573,13 @@ def _run_hook_benchmark(
     for query in queries:
         stop_worker(config.database)
         cold_samples.append(_hook_process(config_path, query)["metrics"])
+    for sample in [*warm_samples, *cold_samples]:
+        expected_mode = "lexical" if bool(sample.get("fallback", False)) else "fused"
+        actual_mode = sample.get("retrieval_mode")
+        if actual_mode is not None and actual_mode != expected_mode:
+            raise ValueError(
+                f"hook benchmark reported {actual_mode} mode for {expected_mode} sample"
+            )
     with sqlite3.connect(config.database) as connection:
         corpus_section_count = int(connection.execute("SELECT count(*) FROM sections").fetchone()[0])
     warm = _phase_report(warm_samples, corpus_section_count)

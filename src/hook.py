@@ -15,6 +15,7 @@ from .core import (
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
     SYNONYM_EXPANSION,
+    semantic_index_state,
     search,
 )
 from .worker import ADAPTER_DEADLINE_MS, HookMetrics, WorkerClient, WorkerError, ensure_worker
@@ -100,7 +101,12 @@ def _fallback(config: Config, query: str, project: str | None, root_id: str | No
               all_projects: bool, limit: int, started: float,
               worker_startup_ms: float = 0.000001, deadline: float | None = None,
               disabled_reason: str | None = None,
-              synonym_expansion: bool = SYNONYM_EXPANSION) -> HookResponse:
+              synonym_expansion: bool = SYNONYM_EXPANSION,
+              fallback: bool = True,
+              cache_state: str = "fallback",
+              semantic_state: str = "unknown",
+              status: str = "semantic_failure",
+              failure_reason: str | None = None) -> HookResponse:
     fallback_started = time.perf_counter()
     candidates = _lexical_search_until(
         config, query, project, root_id, all_projects, limit, deadline, synonym_expansion,
@@ -110,9 +116,12 @@ def _fallback(config: Config, query: str, project: str | None, root_id: str | No
         worker_startup_ms=worker_startup_ms,
         fallback_ms=fallback_ms,
         hook_total_ms=max((time.perf_counter() - started) * 1000.0, 0.000001),
-        fallback=True,
-        cache_state="fallback",
+        fallback=fallback,
+        cache_state=cache_state,
         disabled_reason=disabled_reason,
+        failure_reason=failure_reason,
+        semantic_state=semantic_state,
+        status=status,
         retrieval_mode="lexical",
     ))
 
@@ -141,9 +150,13 @@ def run_hook(
     started = time.perf_counter()
     deadline = started + deadline_ms / 1000.0
     if retrieval_mode == "lexical":
+        semantic_state = "unknown"
+        if config.database.exists():
+            semantic_state, _ = semantic_index_state(config)
         return _fallback(
             config, query, project, root_id, all_projects, limit, started, deadline=deadline,
-            synonym_expansion=synonym_expansion,
+            synonym_expansion=synonym_expansion, fallback=False, cache_state="lexical",
+            semantic_state=semantic_state, status="ok",
         )
     startup = ensure_worker(config, Path(config_path), deadline)
     if startup is None:
@@ -174,6 +187,7 @@ def run_hook(
             raise ValueError("worker candidates are invalid")
         candidates = [_candidate(item) for item in items]
         status = raw_metrics.get("status", response.get("status", "ok"))
+        failure_reason = raw_metrics.get("failure_reason", response.get("failure_reason"))
         if status == "semantic_failure" and not bool(raw_metrics.get("fallback", False)):
             raise WorkerError("worker reported semantic failure without fallback")
         metrics = HookMetrics(
@@ -190,6 +204,9 @@ def run_hook(
             cache_state=str(raw_metrics.get("cache_state", "unknown")),
             disabled_reason=(str(raw_metrics["disabled_reason"])
                              if raw_metrics.get("disabled_reason") is not None else None),
+            failure_reason=(str(failure_reason) if failure_reason is not None else None),
+            semantic_state=str(raw_metrics.get("semantic_state", "unknown")),
+            status=str(status),
             retrieval_mode=str(raw_metrics.get("retrieval_mode", "lexical")),
         )
         return HookResponse(candidates, metrics)

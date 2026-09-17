@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import excerpt, fusion_diagnostics, index, read_source, search
+from .core import excerpt, fusion_diagnostics, index, read_source, search, semantic_index_state
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -19,6 +19,7 @@ from .model_bundle import (
     package_version,
     verify_bundle,
 )
+from .vectors import semantic_backend_reason
 
 
 def parser() -> argparse.ArgumentParser:
@@ -161,6 +162,25 @@ def _configured_bundle(args) -> Path:
     return load_config(args.config).bundle_dir
 
 
+def _search_diagnostics(config: Config, requested_mode: str) -> dict[str, object]:
+    semantic_state, semantic_reason = semantic_index_state(config)
+    backend_available = semantic_backend_reason(config) is None
+    effective_mode = "lexical"
+    if requested_mode == "fused" and backend_available and semantic_state == "ready":
+        effective_mode = "fused"
+    return {
+        "requested_mode": requested_mode,
+        "retrieval_mode": effective_mode,
+        "semantic_state": semantic_state,
+        "semantic_reason": semantic_reason,
+        "fallback": effective_mode != requested_mode,
+    }
+
+
+def _include_search_diagnostics(config: Config, requested_mode: str, explicit: bool) -> bool:
+    return explicit or (requested_mode == "fused" and semantic_backend_reason(config) is None)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -263,7 +283,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             ]
             if args.json:
-                print(json.dumps(results, ensure_ascii=False))
+                payload: object = results
+                if _include_search_diagnostics(config, selected_mode, args.diagnostics):
+                    payload = {
+                        "items": results,
+                        "diagnostics": _search_diagnostics(config, selected_mode),
+                    }
+                print(json.dumps(payload, ensure_ascii=False))
             else:
                 for item in results:
                     print(f"{item['path']}:{item['line_range'][0]}-{item['line_range'][1]} {item['heading']}")

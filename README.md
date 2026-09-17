@@ -34,7 +34,9 @@ Use `--rebuild` to recreate the derived database. Use `--all-projects`
 only when cross-project search is intentional. Search uses fused retrieval when the
 semantic extra is installed and the index is ready. Use `--retrieval-mode lexical` to
 force lexical retrieval. Fused retrieval falls back to lexical results when its model,
-index, or runtime is unavailable.
+index, or runtime is unavailable. With `--diagnostics --json`, search returns an
+`items` array and a sibling `diagnostics` object, including state and reason for empty
+results. A default base-install lexical search keeps its legacy JSON array shape.
 
 The optional synonym table is local and operator-maintained:
 

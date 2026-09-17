@@ -52,6 +52,21 @@ def test_benchmark_query_modes_have_hits():
     assert modes["miss"]["hit_count_max"] == 0
 
 
+def test_lexical_benchmark_calls_lexical_search(monkeypatch):
+    real_search = bench.search
+    modes = []
+
+    def recording_search(*args, **kwargs):
+        modes.append(kwargs.get("semantic"))
+        return real_search(*args, **kwargs)
+
+    monkeypatch.setattr(bench, "search", recording_search)
+    bench.run_benchmark(file_count=10, query_count=5, seed=41)
+
+    assert modes
+    assert modes == [False] * len(modes)
+
+
 def test_default_workload_has_representative_hit_count_mix():
     report = run_benchmark()
 

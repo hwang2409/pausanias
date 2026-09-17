@@ -44,6 +44,10 @@ def semantic_extra_available() -> bool:
     return all(importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime"))
 
 
+def cli_items(payload):
+    return payload["items"] if isinstance(payload, dict) else payload
+
+
 def create_v1_index(database: Path, canonical_path: str, root_id: str) -> None:
     connection = sqlite3.connect(database)
     connection.executescript("""
@@ -579,7 +583,7 @@ def test_cli_json_output(tmp_path: Path, capsys):
     config_path = tmp_path / "config.toml"
     assert main(["--config", str(config_path), "index"]) == 0
     assert main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--json"]) == 0
-    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    result = cli_items(json.loads(capsys.readouterr().out.splitlines()[-1]))[0]
     assert result["excerpt"] == "Use sqlite."
     assert set(result) == {
         "excerpt", "path", "heading", "line_range", "dates", "score", "reason", "content_hash",
@@ -599,7 +603,7 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
     main(["--config", str(config_path), "index"])
     main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--diagnostics", "--json"])
 
-    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])["items"][0]
     assert set(result["fusion_policies"]["selection_policies"]) == {
         "semantic_score_floor",
         "relative_semantic_score_floor",
@@ -608,6 +612,97 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "synonym_expansion",
         "synonym_variant_merge",
     }
+
+
+def test_cli_diagnostics_include_empty_search_state(tmp_path: Path, capsys):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+    main(["--config", str(config_path), "index"])
+
+    main([
+        "--config", str(config_path), "search", "missing", "--project", "p",
+        "--diagnostics", "--json",
+    ])
+
+    payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert payload["items"] == []
+    assert payload["diagnostics"]["semantic_state"] in {"disabled", "ready"}
+    expected_mode = "fused" if payload["diagnostics"]["semantic_state"] == "ready" else "lexical"
+    assert payload["diagnostics"]["retrieval_mode"] == expected_mode
+
+
+def test_cli_explicit_lexical_mode_reports_lexical_diagnostics(tmp_path: Path, capsys):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+    main(["--config", str(config_path), "index"])
+
+    main([
+        "--config", str(config_path), "search", "sqlite", "--project", "p",
+        "--retrieval-mode", "lexical", "--diagnostics", "--json",
+    ])
+
+    payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert payload["diagnostics"]["requested_mode"] == "lexical"
+    assert payload["diagnostics"]["retrieval_mode"] == "lexical"
+    assert payload["diagnostics"]["fallback"] is False
+
+
+def test_cli_diagnostics_report_ready_state(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Choice\nUse sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+
+    class Encoder:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+    core.index(config, encoder=Encoder())
+    monkeypatch.setattr("pausanias.cli.semantic_backend_reason", lambda config: None)
+    main([
+        "--config", str(config_path), "search", "sqlite", "--project", "p", "--json",
+    ])
+
+    payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert payload["diagnostics"]["semantic_state"] == "ready"
+    assert payload["diagnostics"]["retrieval_mode"] == "fused"
+
+
+def test_cli_diagnostics_report_stale_reason(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("# Choice\nold sqlite.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    config_path = tmp_path / "config.toml"
+
+    class Encoder:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+    class FailingEncoder:
+        def encode(self, texts: list[str]):
+            raise RuntimeError("refresh failed")
+
+    core.index(config, encoder=Encoder())
+    note.write_text("# Choice\nnew sqlite.\n")
+    core.index(config, encoder=FailingEncoder())
+    monkeypatch.setattr("pausanias.cli.semantic_backend_reason", lambda config: None)
+    main([
+        "--config", str(config_path), "search", "sqlite", "--project", "p", "--json",
+    ])
+
+    payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert payload["diagnostics"]["semantic_state"] == "stale"
+    assert payload["diagnostics"]["semantic_reason"] == "REFRESH_FAILED"
+    assert payload["diagnostics"]["retrieval_mode"] == "lexical"
 
 
 def test_synonym_variants_are_conservative_and_versioned(tmp_path: Path):
@@ -772,16 +867,16 @@ def test_cli_root_scope_defaults_to_that_project(tmp_path: Path, capsys):
     capsys.readouterr()
 
     assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--json"]) == 0
-    root_results = json.loads(capsys.readouterr().out)
+    root_results = cli_items(json.loads(capsys.readouterr().out))
     assert len(root_results) == 1
     assert root_results[0]["heading"] == ["One"]
 
     assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--project", "alpha", "--json"]) == 0
-    project_results = json.loads(capsys.readouterr().out)
+    project_results = cli_items(json.loads(capsys.readouterr().out))
     assert len(project_results) == 1
 
     assert main(["--config", str(config_path), "search", "root-only", "--root", "one", "--all-projects", "--json"]) == 0
-    all_results = json.loads(capsys.readouterr().out)
+    all_results = cli_items(json.loads(capsys.readouterr().out))
     assert len(all_results) == 1
 
 
@@ -802,16 +897,16 @@ def test_cli_root_scope_includes_global_notes_from_any_root(tmp_path: Path, caps
     capsys.readouterr()
 
     assert main(["--config", str(config_path), "search", "global", "--root", "one", "--json"]) == 0
-    root_results = json.loads(capsys.readouterr().out)
+    root_results = cli_items(json.loads(capsys.readouterr().out))
     assert {result["path"] for result in root_results} == {str(inside_global.resolve()), str(global_note.resolve())}
     assert all(result["reason"].startswith("global-note inclusion") for result in root_results)
 
     assert main(["--config", str(config_path), "search", "global", "--root", "one", "--all-projects", "--json"]) == 0
-    all_results = json.loads(capsys.readouterr().out)
+    all_results = cli_items(json.loads(capsys.readouterr().out))
     assert {result["path"] for result in all_results} == {str(inside_global.resolve()), str(global_note.resolve())}
 
     assert main(["--config", str(config_path), "search", "global", "--root", "one", "--project", "alpha", "--json"]) == 0
-    project_results = json.loads(capsys.readouterr().out)
+    project_results = cli_items(json.loads(capsys.readouterr().out))
     assert {result["path"] for result in project_results} == {str(inside_global.resolve()), str(global_note.resolve())}
 
 

@@ -25,6 +25,7 @@ from .core import (
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
     SYNONYM_EXPANSION,
+    semantic_index_state,
     search,
     semantic_search,
 )
@@ -67,6 +68,9 @@ class HookMetrics:
     fallback: bool = False
     cache_state: str = "cold"
     disabled_reason: str | None = None
+    failure_reason: str | None = None
+    semantic_state: str = "unknown"
+    status: str = "ok"
     retrieval_mode: str = "lexical"
 
 
@@ -341,6 +345,7 @@ class PersistentWorker:
         if not isinstance(synonym_expansion, bool):
             raise WorkerError("worker synonym expansion policy is invalid")
         self._check_cancelled(cancelled)
+        semantic_state, semantic_reason = semantic_index_state(self.config)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
         fallback = encoder is None
@@ -367,7 +372,10 @@ class PersistentWorker:
                     if not timings.get("semantic_available"):
                         fallback = True
                         semantic_failure = True
-                        failure_reason = "semantic backend unavailable"
+                        failure_reason = str(
+                            timings.get("semantic_reason") or semantic_reason or "semantic backend unavailable"
+                        )
+                        semantic_state = str(timings.get("semantic_state", semantic_state))
                     generations = {key[0] for key in self._matrix_cache}
                     if len(generations) > 1:
                         newest = max(generations)
@@ -393,6 +401,9 @@ class PersistentWorker:
             )
             self._check_cancelled(cancelled)
             timings["fallback_ms"] = _positive_ms(fallback_started)
+        if encoder is None:
+            failure_reason = self._encoder_error or semantic_reason
+        status = "semantic_failure" if semantic_failure else ("semantic_disabled" if encoder is None else "ok")
         timings.setdefault("encode_ms", 0.000001)
         timings.setdefault("matrix_load_ms", 0.000001)
         timings.setdefault("scan_ms", 0.000001)
@@ -409,6 +420,9 @@ class PersistentWorker:
                 "hook_total_ms": _positive_ms(started), "fallback": fallback,
                 "cache_state": "disabled" if self._encoder_error else ("warm" if self._matrix_cache else "cold"),
                 "disabled_reason": self._encoder_error,
+                "failure_reason": failure_reason,
+                "semantic_state": semantic_state,
+                "status": status,
                 "retrieval_mode": "lexical" if fallback else "fused",
             },
         }

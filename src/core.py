@@ -148,6 +148,28 @@ def fusion_diagnostics(
     }
 
 
+def semantic_index_state(config: Config) -> tuple[str, str | None]:
+    """Return the committed semantic state and its reason for a readable index."""
+    if not config.database.exists():
+        return "disabled", "INDEX_MISSING"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = connect(config.database, initialize=False, readonly=True)
+        state = dict(connection.execute(
+            "SELECT key, value FROM metadata WHERE key IN ('semantic_state', 'semantic_reason')"
+        ).fetchall())
+    except (OSError, sqlite3.DatabaseError, ValueError):
+        return "disabled", "INDEX_UNAVAILABLE"
+    finally:
+        if connection is not None:
+            connection.close()
+    semantic_state = state.get("semantic_state")
+    if not isinstance(semantic_state, str):
+        return "disabled", "INDEX_UNAVAILABLE"
+    semantic_reason = state.get("semantic_reason")
+    return semantic_state, semantic_reason if isinstance(semantic_reason, str) and semantic_reason else None
+
+
 def _semantic_backend_reason(config: Config) -> str | None:
     return semantic_backend_reason(config, version_checker=package_version)
 
