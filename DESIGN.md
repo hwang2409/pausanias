@@ -1,6 +1,7 @@
 # Pausanias: Automatic Memory Context for Agents
 
-Status: Arc 2 implementation and evaluation complete through PAUS-12. Measured
+Status: Arc 2 implementation and engineering evaluation complete except the deferred
+operator-triggered LOCOMO comparison. Measured
 thresholds and the tested corpus envelope are recorded in `eval/PAUS-12-RESULTS.md`.
 Default activation remains a product decision.
 Date: 2026-09-16
@@ -646,8 +647,11 @@ path, records fusion overhead separately, and activates the fused warm and cold 
 A cold timeout or fallback fails its active gate; the adapter still returns lexical or
 empty context before its hard deadline. If the optional backend is unavailable, report
 the semantic gates as disabled and enforce the lexical gate instead. PAUS-12 reruns the
-already active gates, runs the complete common LOCOMO benchmark, and reports its numbers
-beside mem0's matching published tables; it does not defer activation.
+already active gates. The comparable LOCOMO run is explicitly waived from this change and
+deferred to an operator-triggered execution under the standing cost rule. Its 12,320-call
+no-retry minimum, retry ceiling, expected range, and trigger command are recorded in
+`eval/PAUS-12-RESULTS.md`. This waiver does not defer the engineering evaluation or change
+activation.
 
 | Stage | Warm p95 planning budget |
 | --- | ---: |
@@ -719,10 +723,11 @@ from categories 1, 2, 3, and 4 of the 1,986-question dataset. The category filte
 new result formats. The runner is `eval/benchmarks/locomo/run.py` and accepts
 `--dataset-path`, `--run-id`, `--conversations`, `--top-k`, `--top-k-cutoffs`,
 `--answerer-model`, `--judge-model`, `--provider`, `--judge-provider`, `--with-evidence`,
-`--user-profile`, `--predict-only`, `--evaluate-only`, and `--resume`. A cheap smoke run selects a conversation subset with
+`--user-profile`, `--predict-only`, `--evaluate-only`, `--resume`, and
+`--retrieval-mode fused|lexical`. A cheap smoke run selects a conversation subset with
 `--conversations`;
 a comparable full run selects all ten conversations and all 1,540 questions. Comparable
-runs use mem0's defaults: `top-k=200` and cutoffs `10,20,50,200`.
+runs use fused retrieval with mem0's defaults: `top-k=200` and cutoffs `10,20,50,200`.
 
 LOCOMO provenance is the Snap Research dataset at
 `https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json`, pinned

@@ -167,19 +167,24 @@ run_locomo(run_id="paus12-smoke", dataset_path=fixture, results_dir=results,
 PY
 ```
 
-The comparable real run is expected to make 12,320 calls: 1,540 questions,
-four cutoffs, one answerer call, and one judge call per cutoff. It needs no
-calls for the predict-only stage. Henry can run it after caching and verifying
+The comparable real run uses fused retrieval and has a 12,320-call no-retry
+minimum: 1,540 questions, four cutoffs, one answerer call, and one judge call
+per cutoff. The retry ceiling is about 61,600 calls when every answerer and
+judge call uses all five attempts. The expected practical range is 12,320 to
+24,640 calls when retries are rare or limited to one extra attempt. It needs no
+calls for the predict-only stage. Henry can trigger it after caching and verifying
 `datasets/locomo/locomo10.json`:
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m eval.benchmarks.locomo.run \
   --dataset-path datasets/locomo/locomo10.json --run-id locomo-full \
+  --retrieval-mode fused \
   --top-k 200 --top-k-cutoffs 10,20,50,200 --provider openai \
   --judge-provider openai --answerer-model gpt-4o-mini \
   --judge-model gpt-4o-mini --predict-only
 PYTHONPATH=. .venv/bin/python -m eval.benchmarks.locomo.run \
   --dataset-path datasets/locomo/locomo10.json --run-id locomo-full \
+  --retrieval-mode fused \
   --top-k 200 --top-k-cutoffs 10,20,50,200 --provider openai \
   --judge-provider openai --answerer-model gpt-4o-mini \
   --judge-model gpt-4o-mini --resume

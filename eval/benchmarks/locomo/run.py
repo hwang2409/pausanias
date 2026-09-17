@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 
 from pausanias.config import Config, Root
 from pausanias.core import Candidate, index, search
+from pausanias.hook import run_hook
+from pausanias.worker import stop_worker
 
 from eval.schema import (
     Checkpoint,
@@ -497,6 +499,7 @@ def _conversation_scope(
         (),
         (scope / "index.sqlite3").resolve(),
         12000,
+        Path("~/.cache/pausanias/models/all-MiniLM-L6-v2").expanduser(),
     )
     return scope, config
 
@@ -522,7 +525,55 @@ def _index_generation(database: Path) -> int:
     return generation
 
 
-def _search_record(record: dict[str, object], config: Config, notes: Path, top_k: int) -> dict[str, object]:
+def _worker_config_path(config: Config, path: Path) -> Path:
+    lines = [
+        f"database = {json.dumps(str(config.database))}",
+        f"private_paths = {json.dumps(list(config.private_paths))}",
+        f"global_notes = {json.dumps(sorted(str(note) for note in config.global_notes))}",
+        f"section_bytes = {config.section_bytes}",
+        f"semantic_bundle = {json.dumps(str(config.semantic_bundle))}",
+    ]
+    for root in config.roots:
+        lines.extend((
+            "",
+            "[[roots]]",
+            f"id = {json.dumps(root.id)}",
+            f"project = {json.dumps(root.project)}",
+            f"path = {json.dumps(str(root.path))}",
+            f"exclude = {json.dumps(list(root.excludes))}",
+        ))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _search_candidates(
+    config: Config,
+    query: str,
+    top_k: int,
+    retrieval_mode: str,
+    worker_config_path: Path | None,
+) -> list[Candidate]:
+    if retrieval_mode == "fused":
+        if worker_config_path is None:
+            raise LocomoError("fused retrieval requires a worker config")
+        return run_hook(
+            config,
+            worker_config_path,
+            query,
+            project=config.roots[0].project,
+            limit=top_k,
+        ).candidates
+    return search(config, query, project=config.roots[0].project, limit=top_k)
+
+
+def _search_record(
+    record: dict[str, object],
+    config: Config,
+    notes: Path,
+    top_k: int,
+    retrieval_mode: str = "lexical",
+    worker_config_path: Path | None = None,
+) -> dict[str, object]:
     source_dates = {
         f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": _prompt_created_at(date)
         for session_key, date, _ in record["sessions"]
@@ -533,7 +584,13 @@ def _search_record(record: dict[str, object], config: Config, notes: Path, top_k
         excerpt = "\n".join(lines[int(target["line_start"]) - 1:int(target["line_end"])])
         evidence_lines.append(f"[{target['evidence_id']}] {excerpt}")
     start = time.perf_counter()
-    candidates = search(config, str(record["question"]), project=config.roots[0].project, limit=top_k)
+    candidates = _search_candidates(
+        config,
+        str(record["question"]),
+        top_k,
+        retrieval_mode,
+        worker_config_path,
+    )
     elapsed = (time.perf_counter() - start) * 1000
     return {
         **record,
@@ -642,9 +699,12 @@ def run_locomo(
     evaluate_only: bool = False,
     resume: bool = False,
     transport: object | None = None,
+    retrieval_mode: str = "lexical",
 ) -> UnifiedResult | None:
     if top_k < max(cutoffs) or not cutoffs:
         raise ValueError("top-k must include all cutoffs")
+    if retrieval_mode not in {"lexical", "fused"}:
+        raise ValueError("retrieval mode must be lexical or fused")
     selected_judge_provider = judge_provider or provider
     if not predict_only and transport is None and (not _required_key(provider) or not _required_key(selected_judge_provider)):
         raise LocomoError("answerer and judge API keys are required for evaluation")
@@ -664,7 +724,7 @@ def run_locomo(
     rendered = _render_entries(entries, notes)
     records = _question_records(entries, rendered)
     corpus_hash = fingerprint([{ "path": path.relative_to(notes).as_posix(), "sha256": _sha256(path.read_bytes()) } for path in sorted(notes.glob("*.md"))]) if notes.exists() else None
-    retrieval_config = {"retrieval_mode": "lexical", "top_k": top_k, "cutoffs": list(cutoffs), "conversations": sorted(selected)}
+    retrieval_config = {"retrieval_mode": retrieval_mode, "top_k": top_k, "cutoffs": list(cutoffs), "conversations": sorted(selected)}
     model_config = {
         "prompt_mode": f"answerer-{'profile' if user_profile else 'no-profile'}+judge-{'with-evidence' if with_evidence else 'without-evidence'}",
         "prompt_version": PROMPT_VERSION,
@@ -703,6 +763,10 @@ def run_locomo(
         int(entry["_conversation_index"]): _conversation_scope(entry, int(entry["_conversation_index"]), notes, workspace)
         for entry in entries
     }
+    worker_config_paths = {
+        conversation_index: _worker_config_path(config, scope / "worker-config.toml")
+        for conversation_index, (scope, config) in scope_configs.items()
+    } if retrieval_mode == "fused" else {}
     scope_indexes: dict[int, dict[str, object]] = {}
     if existing_ingest is None:
         for conversation_index, (scope, scope_config) in scope_configs.items():
@@ -733,7 +797,13 @@ def run_locomo(
     generation = int(ingest.index_generation or 0)
     if records:
         first_scope = scope_configs[int(records[0]["conversation_index"])]
-        search(first_scope[1], str(records[0]["question"]), project=first_scope[1].roots[0].project, limit=top_k)
+        _search_candidates(
+            first_scope[1],
+            str(records[0]["question"]),
+            top_k,
+            retrieval_mode,
+            worker_config_paths.get(int(records[0]["conversation_index"])),
+        )
     evaluations: list[Evaluation] = []
     for record in records:
         scope_notes, scope_config = scope_configs[int(record["conversation_index"])]
@@ -754,7 +824,14 @@ def run_locomo(
         if checkpoint is None:
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
-            raw = _search_record(record, scope_config, scope_notes, top_k)
+            raw = _search_record(
+                record,
+                scope_config,
+                scope_notes,
+                top_k,
+                retrieval_mode,
+                worker_config_paths.get(int(record["conversation_index"])),
+            )
             Checkpoint("search", run_id, dataset["fingerprint"], scope_corpus_hash, scope_generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
             raw = checkpoint.output
@@ -813,6 +890,9 @@ def run_locomo(
                 finished_at=utc_now(),
                 output=asdict(evaluation),
             ).write(evaluation_path)
+    if retrieval_mode == "fused":
+        for _, scope_config in scope_configs.values():
+            stop_worker(scope_config.database)
     if predict_only:
         print(f"locomo predict-only: {len(evaluations)} search checkpoints; dataset fingerprint {dataset['fingerprint']}")
         return None
@@ -857,11 +937,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--predict-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--retrieval-mode", choices=("fused", "lexical"), default="lexical")
     args = parser.parse_args(argv)
     try:
         conversations = tuple(int(item) for item in args.conversations.split(",")) if args.conversations else None
         cutoffs = tuple(int(item) for item in args.top_k_cutoffs.split(","))
-        run_locomo(run_id=args.run_id, dataset_path=args.dataset_path, results_dir=args.results_dir, conversations=conversations, top_k=args.top_k, cutoffs=cutoffs, answerer_model=args.answerer_model, judge_model=args.judge_model, provider=args.provider, judge_provider=args.judge_provider, with_evidence=args.with_evidence, user_profile=_profile(args.user_profile), predict_only=args.predict_only, evaluate_only=args.evaluate_only, resume=args.resume)
+        run_locomo(run_id=args.run_id, dataset_path=args.dataset_path, results_dir=args.results_dir, conversations=conversations, top_k=args.top_k, cutoffs=cutoffs, answerer_model=args.answerer_model, judge_model=args.judge_model, provider=args.provider, judge_provider=args.judge_provider, with_evidence=args.with_evidence, user_profile=_profile(args.user_profile), predict_only=args.predict_only, evaluate_only=args.evaluate_only, resume=args.resume, retrieval_mode=args.retrieval_mode)
         return 0
     except (OSError, ValueError, TypeError, KeyError, LocomoError) as exc:
         print(f"locomo: error: {exc}", file=sys.stderr)
