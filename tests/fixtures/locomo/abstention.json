@@ -1,0 +1,37 @@
+[
+  {
+    "conversation": {
+      "speaker_a": "Alex",
+      "speaker_b": "Sam",
+      "session_1": [
+        {
+          "dia_id": "D1:0",
+          "speaker": "Alex",
+          "text": "I bought a blue bicycle for weekend rides.",
+          "session_date_time": "1:00 pm on 1 May, 2023"
+        }
+      ],
+      "session_1_date_time": "1:00 pm on 1 May, 2023"
+    },
+    "qa": [
+      {
+        "question": "What is the color of the bicycle?",
+        "answer": "blue",
+        "category": 4,
+        "evidence": ["D1:0"]
+      },
+      {
+        "question": "What is Alex's favorite planet?",
+        "answer": "",
+        "category": 5,
+        "evidence": []
+      },
+      {
+        "question": "What is Sam's favorite instrument?",
+        "answer": "",
+        "category": 5,
+        "evidence": []
+      }
+    ]
+  }
+]

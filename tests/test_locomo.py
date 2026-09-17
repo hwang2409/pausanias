@@ -16,6 +16,7 @@ from eval.benchmarks.locomo.run import (
     run_locomo,
 )
 from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
+from pausanias.hook import HookMetrics, HookResponse
 from pausanias.vectors import Candidate
 
 FIXTURES = Path(__file__).parent.parent / "eval/fixtures/locomo/golden-prompts-v1"
@@ -457,6 +458,148 @@ def test_locomo_fused_and_lexical_smoke_modes(tmp_path: Path, monkeypatch):
     )
     assert lexical_checkpoint["config"]["retrieval_mode"] == "lexical"
     assert lexical_checkpoint["config"]["retrieval_config"]["retrieval_mode"] == "lexical"
+
+
+@pytest.mark.parametrize("retrieval_mode", ("lexical", "fused"))
+def test_abstention_mode_filters_category_five_and_scores_injection(tmp_path: Path, monkeypatch, retrieval_mode: str):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+    hook_calls = []
+
+    def fake_run_hook(config, config_path, query, **kwargs):
+        hook_calls.append((query, kwargs["retrieval_mode"]))
+        if "planet" in query:
+            candidates = []
+        else:
+            path = config.roots[0].path / "conversation-00--session-01.md"
+            candidates = [Candidate(
+                "false-positive",
+                str(path),
+                None,
+                (),
+                1,
+                5,
+                config.roots[0].id,
+                config.roots[0].project,
+                "unrelated result",
+                "hash",
+                None,
+                None,
+                None,
+                0.42,
+                "fixture",
+            )]
+        return HookResponse(candidates, HookMetrics(retrieval_mode=retrieval_mode))
+
+    monkeypatch.setattr(locomo_runner, "run_hook", fake_run_hook)
+    result = run_locomo(
+        run_id=f"abstention-{retrieval_mode}",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode=retrieval_mode,
+        abstention=True,
+    )
+
+    assert result is not None
+    assert len(result.evaluations) == 2
+    assert all(item.category == "adversarial" for item in result.evaluations)
+    assert all(item.expected_sources == () and item.ground_truth is None for item in result.evaluations)
+    assert result.evaluations[0].cutoff_outcomes["2"].abstention_correct is True
+    assert result.evaluations[1].cutoff_outcomes["2"].abstention_correct is False
+    assert result.evaluations[0].cutoff_outcomes["2"].recall is None
+    assert result.evaluations[1].cutoff_outcomes["2"].precision is None
+    assert hook_calls == [
+        ("What is Alex's favorite planet?", retrieval_mode),
+        ("What is Alex's favorite planet?", retrieval_mode),
+        ("What is Sam's favorite instrument?", retrieval_mode),
+    ]
+
+    artifact = json.loads((tmp_path / f"locomo/abstention-{retrieval_mode}/run.json").read_text())
+    assert artifact["metadata"]["config"]["evaluation_mode"] == "abstention"
+    assert artifact["metrics"]["abstention"] == {
+        "total": 2,
+        "abstained": 1,
+        "false_injections": 1,
+        "false_injection_rate": 0.5,
+        "injected_count_distribution": {"0": 1, "1": 1},
+        "injected_score_summary": {
+            "count": 1,
+            "min": 0.42,
+            "p50": 0.42,
+            "p95": 0.42,
+            "max": 0.42,
+            "mean": 0.42,
+        },
+        "by_conversation": {
+            "0": {
+                "total": 2,
+                "abstained": 1,
+                "false_injections": 1,
+                "false_injection_rate": 0.5,
+                "injected_count_distribution": {"0": 1, "1": 1},
+                "injected_score_summary": {
+                    "count": 1,
+                    "min": 0.42,
+                    "p50": 0.42,
+                    "p95": 0.42,
+                    "max": 0.42,
+                    "mean": 0.42,
+                },
+            }
+        },
+    }
+
+
+def test_regular_locomo_path_keeps_lexical_search_outside_hook(monkeypatch, tmp_path: Path):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("category 1-4 lexical mode must keep its existing search path")
+
+    monkeypatch.setattr(locomo_runner, "run_hook", fail_if_called)
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    result = run_locomo(
+        run_id="regular-lexical-path",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=1,
+        cutoffs=(1,),
+        predict_only=True,
+    )
+    explicit = run_locomo(
+        run_id="regular-lexical-path",
+        dataset_path=dataset,
+        results_dir=tmp_path / "explicit",
+        top_k=1,
+        cutoffs=(1,),
+        predict_only=True,
+        abstention=False,
+    )
+
+    assert result is not None
+    assert explicit is not None
+    assert result.metrics.total == 2
+    assert "abstention" not in result.to_dict()["metrics"]
+
+    def stable(value):
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in value.items()
+                if key not in {
+                    "started_at", "finished_at", "search_latency_ms",
+                    "section_id", "retrieval_fingerprint",
+                    "p50_ms", "p95_ms", "max_ms",
+                }
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        return value
+
+    default_artifact = json.loads((tmp_path / "locomo/regular-lexical-path/run.json").read_text())
+    explicit_artifact = json.loads(
+        (tmp_path / "explicit/locomo/regular-lexical-path/run.json").read_text()
+    )
+    assert stable(default_artifact) == stable(explicit_artifact)
 
 
 def test_locomo_corrupt_score_checkpoint_is_recomputed(tmp_path: Path):
