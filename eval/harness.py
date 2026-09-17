@@ -32,9 +32,9 @@ from .schema import (
     Metrics,
     RetrievalResult,
     UnifiedResult,
-    atomic_write_json,
     fingerprint,
     latency_summary,
+    read_checkpoint,
     read_json,
     utc_now,
 )
@@ -112,37 +112,6 @@ def _checkpoint_config(top_k: int, cutoffs: tuple[int, ...], case_lock: str) -> 
         "judge_provider": None,
         "case_set_fingerprint": case_lock,
     }
-
-
-def _valid_checkpoint(path: Path, stage: str, run_id: str, config: dict[str, Any], *, case_id: str | None = None) -> dict[str, Any] | None:
-    try:
-        value = read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if (
-        value.get("checkpoint_version") != "pausanias.eval.checkpoint.v1"
-        or value.get("stage") != stage
-        or value.get("run_id") != run_id
-        or value.get("config") != config
-        or value.get("status") != "complete"
-        or case_id is not None and value.get("case_id") != case_id
-    ):
-        return None
-    required = {"dataset_fingerprint", "corpus_fingerprint", "index_generation", "started_at", "finished_at", "output"}
-    if not required <= value.keys() or not isinstance(value["output"], dict):
-        return None
-    output = value["output"]
-    if stage == "ingest" and (not isinstance(output.get("files"), list) or not output.get("index_generation")):
-        return None
-    if stage == "search" and (
-        output.get("case_id") != case_id
-        or not isinstance(output.get("query"), str)
-        or not isinstance(output.get("search_latency_ms"), (int, float))
-        or not isinstance(output.get("retrieval_results"), list)
-        or not isinstance(output.get("retrieval_fingerprint"), str)
-    ):
-        return None
-    return value
 
 
 def _candidate_result(candidate: Candidate, corpus: Path, rank: int) -> RetrievalResult:
@@ -372,9 +341,14 @@ def run_internal(
     source_config = load_config(config_path)
     config = _runtime_config(source_config, corpus_dir, runtime_corpus, database)
     reuse_checkpoints = resume or evaluate_only
-    ingest = _valid_checkpoint(ingest_path, "ingest", run_id, config_values) if reuse_checkpoints else None
-    if ingest is not None and (ingest["dataset_fingerprint"] != case_lock or ingest["corpus_fingerprint"] != corpus_hash):
-        ingest = None
+    ingest = read_checkpoint(
+        ingest_path,
+        stage="ingest",
+        run_id=run_id,
+        config=config_values,
+        dataset_fingerprint=case_lock,
+        corpus_fingerprint=corpus_hash,
+    ) if reuse_checkpoints else None
     if evaluate_only and ingest is None:
         raise ValueError("evaluation requires a complete ingest checkpoint")
     if ingest is None:
@@ -392,19 +366,28 @@ def run_internal(
             started_at=started,
             finished_at=utc_now(),
             output={"files": _file_records(runtime_corpus), "index_generation": generation},
-        ).to_dict()
-        atomic_write_json(ingest_path, ingest)
-    generation = int(ingest["index_generation"])
+        )
+        ingest.write(ingest_path)
+    generation = int(ingest.index_generation or 0)
     if cases:
         search(config, cases[0].query, project=cases[0].scope.get("project"), root_id=cases[0].scope.get("root"), all_projects=bool(cases[0].scope.get("all_projects", False)), limit=top_k)
     evaluations: list[Evaluation] = []
     for case in cases:
         checkpoint_path = search_dir / f"{case.id}.json"
-        checkpoint = _valid_checkpoint(checkpoint_path, "search", run_id, config_values, case_id=case.id) if reuse_checkpoints else None
+        checkpoint = read_checkpoint(
+            checkpoint_path,
+            stage="search",
+            run_id=run_id,
+            config=config_values,
+            case_id=case.id,
+            dataset_fingerprint=case_lock,
+            corpus_fingerprint=corpus_hash,
+            index_generation=generation,
+        ) if reuse_checkpoints else None
         if evaluate_only and checkpoint is None:
             raise ValueError(f"evaluation requires a complete search checkpoint for {case.id}")
-        if checkpoint is not None and checkpoint["corpus_fingerprint"] == corpus_hash and checkpoint["index_generation"] == generation:
-            raw = checkpoint["output"]
+        if checkpoint is not None:
+            raw = checkpoint.output
         else:
             with _temporarily_deleted(runtime_corpus, case.delete_sources):
                 refresh: set[str] = set()
@@ -447,7 +430,7 @@ def run_internal(
         raise ValueError("evaluation requires complete search checkpoints")
     thresholds = load_thresholds()
     metrics = _metrics(evaluations, cutoffs, thresholds)
-    started_at = ingest["started_at"]
+    started_at = ingest.started_at
     metadata = Metadata(
         benchmark=BENCHMARK,
         run_id=run_id,

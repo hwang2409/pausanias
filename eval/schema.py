@@ -180,6 +180,234 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _valid_number(value: object, *, minimum: float | None = None, maximum: float | None = None) -> bool:
+    if not _finite_number(value):
+        return False
+    number = float(value)
+    return (minimum is None or number >= minimum) and (maximum is None or number <= maximum)
+
+
+def retrieval_result_from_dict(value: object) -> RetrievalResult:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint contains invalid retrieval results")
+    required = {
+        "rank", "section_id", "source_path", "root_id", "project", "heading",
+        "line_start", "line_end", "excerpt", "content_hash", "score", "reason",
+    }
+    if set(value) != required:
+        raise ValueError("checkpoint contains invalid retrieval results")
+    if (
+        not isinstance(value["rank"], int) or isinstance(value["rank"], bool) or value["rank"] < 1
+        or not all(isinstance(value[key], str) for key in ("section_id", "source_path", "root_id", "project", "excerpt", "content_hash", "reason"))
+        or (value["heading"] is not None and not isinstance(value["heading"], str))
+        or not isinstance(value["line_start"], int) or isinstance(value["line_start"], bool) or value["line_start"] < 1
+        or not isinstance(value["line_end"], int) or isinstance(value["line_end"], bool) or value["line_end"] < value["line_start"]
+        or not _valid_number(value["score"])
+    ):
+        raise ValueError("checkpoint contains invalid retrieval results")
+    return RetrievalResult(**value)
+
+
+def _prompt_metadata_from_dict(value: object) -> PromptMetadata:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint contains invalid prompt metadata")
+    required = {
+        "prompt_version", "template_hash", "slot_names", "provider", "model",
+        "prompt_tokens", "completion_tokens",
+    }
+    if set(value) != required:
+        raise ValueError("checkpoint contains invalid prompt metadata")
+    if (
+        value["prompt_version"] is not None and not isinstance(value["prompt_version"], str)
+        or value["template_hash"] is not None and not isinstance(value["template_hash"], str)
+        or not isinstance(value["slot_names"], list) or not all(isinstance(slot, str) for slot in value["slot_names"])
+        or value["provider"] is not None and not isinstance(value["provider"], str)
+        or value["model"] is not None and not isinstance(value["model"], str)
+        or value["prompt_tokens"] is not None and (not isinstance(value["prompt_tokens"], int) or isinstance(value["prompt_tokens"], bool) or value["prompt_tokens"] < 0)
+        or value["completion_tokens"] is not None and (not isinstance(value["completion_tokens"], int) or isinstance(value["completion_tokens"], bool) or value["completion_tokens"] < 0)
+    ):
+        raise ValueError("checkpoint contains invalid prompt metadata")
+    return PromptMetadata(**{**value, "slot_names": tuple(value["slot_names"])})
+
+
+def _cutoff_outcome_from_dict(value: object) -> CutoffOutcome:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint contains invalid cutoff outcomes")
+    required = {
+        "retrieved_count", "relevant_count", "recall", "precision", "mrr",
+        "abstention_correct", "forbidden_sources", "score", "passed",
+        "generated_answer", "judgment", "reason", "model", "error", "prompt_metadata",
+    }
+    if set(value) != required:
+        raise ValueError("checkpoint contains invalid cutoff outcomes")
+    if (
+        not isinstance(value["retrieved_count"], int) or isinstance(value["retrieved_count"], bool) or value["retrieved_count"] < 0
+        or not isinstance(value["relevant_count"], int) or isinstance(value["relevant_count"], bool) or value["relevant_count"] < 0
+        or value["recall"] is not None and not _valid_number(value["recall"], minimum=0, maximum=1)
+        or value["precision"] is not None and not _valid_number(value["precision"], minimum=0, maximum=1)
+        or value["mrr"] is not None and not _valid_number(value["mrr"], minimum=0, maximum=1)
+        or value["abstention_correct"] is not None and not isinstance(value["abstention_correct"], bool)
+        or not isinstance(value["forbidden_sources"], int) or isinstance(value["forbidden_sources"], bool) or value["forbidden_sources"] < 0
+        or not _valid_number(value["score"], minimum=0, maximum=1)
+        or not isinstance(value["passed"], bool)
+        or value["generated_answer"] is not None and not isinstance(value["generated_answer"], str)
+        or value["judgment"] is not None and not isinstance(value["judgment"], str)
+        or value["reason"] is not None and not isinstance(value["reason"], str)
+        or value["model"] is not None and not isinstance(value["model"], str)
+        or value["error"] is not None and not isinstance(value["error"], str)
+        or not isinstance(value["prompt_metadata"], dict)
+    ):
+        raise ValueError("checkpoint contains invalid cutoff outcomes")
+    metadata = {str(name): _prompt_metadata_from_dict(details) for name, details in value["prompt_metadata"].items()}
+    return CutoffOutcome(**{**value, "prompt_metadata": metadata})
+
+
+def evaluation_from_dict(value: object) -> Evaluation:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint contains invalid evaluation output")
+    raw_outcomes = value.get("cutoff_outcomes")
+    raw_results = value.get("retrieval_results")
+    required = {
+        "case_id", "category", "query", "expected_sources", "ground_truth",
+        "retrieval_results", "search_latency_ms", "cutoff_outcomes", "score", "failure_reason",
+    }
+    if set(value) != required or not isinstance(raw_outcomes, dict) or not isinstance(raw_results, list):
+        raise ValueError("checkpoint contains invalid evaluation output")
+    if (
+        not isinstance(value["case_id"], str) or not value["case_id"]
+        or not isinstance(value["category"], str) or not value["category"]
+        or not isinstance(value["query"], str) or not value["query"]
+        or not isinstance(value["expected_sources"], list) or not all(isinstance(item, str) and item for item in value["expected_sources"])
+        or value["ground_truth"] is not None and not isinstance(value["ground_truth"], str)
+        or not _valid_number(value["search_latency_ms"], minimum=0)
+        or not _valid_number(value["score"], minimum=0, maximum=1)
+        or value["failure_reason"] is not None and not isinstance(value["failure_reason"], str)
+    ):
+        raise ValueError("checkpoint contains invalid evaluation output")
+    return Evaluation(
+        case_id=value["case_id"],
+        category=value["category"],
+        query=value["query"],
+        expected_sources=tuple(value["expected_sources"]),
+        ground_truth=value["ground_truth"],
+        retrieval_results=tuple(retrieval_result_from_dict(item) for item in raw_results),
+        search_latency_ms=float(value["search_latency_ms"]),
+        cutoff_outcomes={str(key): _cutoff_outcome_from_dict(item) for key, item in raw_outcomes.items()},
+        score=float(value["score"]),
+        failure_reason=value["failure_reason"],
+    )
+
+
+def checkpoint_from_dict(value: object) -> Checkpoint:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint must contain an object")
+    required = {
+        "checkpoint_version", "stage", "run_id", "case_id", "dataset_fingerprint",
+        "corpus_fingerprint", "index_generation", "config", "status", "started_at",
+        "finished_at", "output",
+    }
+    if set(value) != required:
+        raise ValueError("checkpoint contains invalid fields")
+    if (
+        value["checkpoint_version"] != CHECKPOINT_VERSION
+        or not isinstance(value["stage"], str)
+        or not isinstance(value["run_id"], str) or not value["run_id"]
+        or value["case_id"] is not None and (not isinstance(value["case_id"], str) or not value["case_id"])
+        or value["dataset_fingerprint"] is not None and not isinstance(value["dataset_fingerprint"], str)
+        or value["corpus_fingerprint"] is not None and not isinstance(value["corpus_fingerprint"], str)
+        or value["index_generation"] is not None and (not isinstance(value["index_generation"], int) or isinstance(value["index_generation"], bool) or value["index_generation"] < 1)
+        or not isinstance(value["config"], dict)
+        or not isinstance(value["status"], str)
+        or not isinstance(value["started_at"], str)
+        or value["finished_at"] is not None and not isinstance(value["finished_at"], str)
+        or not isinstance(value["output"], dict)
+    ):
+        raise ValueError("checkpoint contains invalid fields")
+    stage = value["stage"]
+    if stage not in {"ingest", "search", "evaluate"}:
+        raise ValueError("checkpoint contains invalid stage")
+    output = value["output"]
+    if stage == "ingest":
+        files = output.get("files")
+        if (
+            not isinstance(files, list)
+            or not all(isinstance(item, dict) for item in files)
+            or not isinstance(output.get("index_generation"), int)
+            or isinstance(output["index_generation"], bool)
+            or output["index_generation"] < 1
+        ):
+            raise ValueError("checkpoint contains invalid ingest output")
+    elif stage == "search":
+        if (
+            not isinstance(output.get("case_id"), str)
+            or not isinstance(output.get("query"), str) or not output["query"]
+            or not _valid_number(output.get("search_latency_ms"), minimum=0)
+            or not isinstance(output.get("retrieval_results"), list)
+            or not isinstance(output.get("retrieval_fingerprint"), str) or not output["retrieval_fingerprint"]
+        ):
+            raise ValueError("checkpoint contains invalid search output")
+        if value["case_id"] != output["case_id"]:
+            raise ValueError("checkpoint contains invalid search output")
+        for item in output["retrieval_results"]:
+            retrieval_result_from_dict(item)
+    elif stage == "evaluate":
+        evaluation = evaluation_from_dict(output)
+        if value["case_id"] != evaluation.case_id:
+            raise ValueError("checkpoint contains invalid evaluation output")
+    return Checkpoint(
+        stage=stage,
+        run_id=value["run_id"],
+        dataset_fingerprint=value["dataset_fingerprint"],
+        corpus_fingerprint=value["corpus_fingerprint"],
+        index_generation=value["index_generation"],
+        config=value["config"],
+        status=value["status"],
+        started_at=value["started_at"],
+        finished_at=value["finished_at"],
+        output=output,
+        case_id=value["case_id"],
+    )
+
+
+def read_checkpoint(
+    path: Path,
+    *,
+    stage: str,
+    run_id: str,
+    config: dict[str, Any] | None = None,
+    case_id: str | None = None,
+    dataset_fingerprint: str | None = None,
+    corpus_fingerprint: str | None = None,
+    index_generation: int | None = None,
+    cutoffs: tuple[int, ...] | None = None,
+) -> Checkpoint | None:
+    try:
+        checkpoint = checkpoint_from_dict(read_json(path))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        checkpoint.stage != stage
+        or checkpoint.run_id != run_id
+        or checkpoint.status != "complete"
+        or config is not None and checkpoint.config != config
+        or case_id is not None and checkpoint.case_id != case_id
+        or dataset_fingerprint is not None and checkpoint.dataset_fingerprint != dataset_fingerprint
+        or corpus_fingerprint is not None and checkpoint.corpus_fingerprint != corpus_fingerprint
+        or index_generation is not None and checkpoint.index_generation != index_generation
+    ):
+        return None
+    if cutoffs is not None:
+        output = checkpoint.output
+        outcomes = output.get("cutoff_outcomes")
+        if not isinstance(outcomes, dict) or {str(key) for key in outcomes} != {str(cutoff) for cutoff in cutoffs}:
+            return None
+    return checkpoint
+
+
 def nearest_rank(values: list[float], quantile: float) -> float:
     if not values:
         return 0.0

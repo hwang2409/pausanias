@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -31,9 +30,11 @@ from eval.schema import (
     PromptMetadata,
     RetrievalResult,
     UnifiedResult,
+    evaluation_from_dict,
     fingerprint,
     latency_summary,
-    read_json,
+    read_checkpoint,
+    retrieval_result_from_dict,
     utc_now,
 )
 from eval.vendor.mem0.benchmarks.locomo.prompts import (
@@ -521,171 +522,6 @@ def _index_generation(database: Path) -> int:
     return generation
 
 
-def _finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-
-
-def _valid_number(value: object, *, minimum: float | None = None, maximum: float | None = None) -> bool:
-    if not _finite_number(value):
-        return False
-    number = float(value)
-    return (minimum is None or number >= minimum) and (maximum is None or number <= maximum)
-
-
-def _retrieval_result_from_dict(value: object) -> RetrievalResult:
-    if not isinstance(value, dict):
-        raise LocomoError("evaluation checkpoint contains invalid retrieval results")
-    required = {
-        "rank", "section_id", "source_path", "root_id", "project", "heading",
-        "line_start", "line_end", "excerpt", "content_hash", "score", "reason",
-    }
-    if set(value) != required:
-        raise LocomoError("evaluation checkpoint contains invalid retrieval results")
-    if (
-        not isinstance(value["rank"], int) or isinstance(value["rank"], bool) or value["rank"] < 1
-        or not all(isinstance(value[key], str) for key in ("section_id", "source_path", "root_id", "project", "excerpt", "content_hash", "reason"))
-        or (value["heading"] is not None and not isinstance(value["heading"], str))
-        or not isinstance(value["line_start"], int) or isinstance(value["line_start"], bool) or value["line_start"] < 1
-        or not isinstance(value["line_end"], int) or isinstance(value["line_end"], bool) or value["line_end"] < value["line_start"]
-        or not _valid_number(value["score"])
-    ):
-        raise LocomoError("evaluation checkpoint contains invalid retrieval results")
-    return RetrievalResult(**value)
-
-
-def _prompt_metadata_from_dict(value: object) -> PromptMetadata:
-    if not isinstance(value, dict):
-        raise LocomoError("evaluation checkpoint contains invalid prompt metadata")
-    required = {
-        "prompt_version", "template_hash", "slot_names", "provider", "model",
-        "prompt_tokens", "completion_tokens",
-    }
-    if set(value) != required:
-        raise LocomoError("evaluation checkpoint contains invalid prompt metadata")
-    if (
-        value["prompt_version"] is not None and not isinstance(value["prompt_version"], str)
-        or value["template_hash"] is not None and not isinstance(value["template_hash"], str)
-        or not isinstance(value["slot_names"], list) or not all(isinstance(slot, str) for slot in value["slot_names"])
-        or value["provider"] is not None and not isinstance(value["provider"], str)
-        or value["model"] is not None and not isinstance(value["model"], str)
-        or value["prompt_tokens"] is not None and (not isinstance(value["prompt_tokens"], int) or isinstance(value["prompt_tokens"], bool) or value["prompt_tokens"] < 0)
-        or value["completion_tokens"] is not None and (not isinstance(value["completion_tokens"], int) or isinstance(value["completion_tokens"], bool) or value["completion_tokens"] < 0)
-    ):
-        raise LocomoError("evaluation checkpoint contains invalid prompt metadata")
-    return PromptMetadata(**{**value, "slot_names": tuple(value["slot_names"])})
-
-
-def _cutoff_outcome_from_dict(value: object) -> CutoffOutcome:
-    if not isinstance(value, dict):
-        raise LocomoError("evaluation checkpoint contains invalid cutoff outcomes")
-    required = {
-        "retrieved_count", "relevant_count", "recall", "precision", "mrr",
-        "abstention_correct", "forbidden_sources", "score", "passed",
-        "generated_answer", "judgment", "reason", "model", "error", "prompt_metadata",
-    }
-    if set(value) != required:
-        raise LocomoError("evaluation checkpoint contains invalid cutoff outcomes")
-    if (
-        not isinstance(value["retrieved_count"], int) or isinstance(value["retrieved_count"], bool) or value["retrieved_count"] < 0
-        or not isinstance(value["relevant_count"], int) or isinstance(value["relevant_count"], bool) or value["relevant_count"] < 0
-        or value["recall"] is not None and not _valid_number(value["recall"], minimum=0, maximum=1)
-        or value["precision"] is not None and not _valid_number(value["precision"], minimum=0, maximum=1)
-        or value["mrr"] is not None and not _valid_number(value["mrr"], minimum=0, maximum=1)
-        or value["abstention_correct"] is not None and not isinstance(value["abstention_correct"], bool)
-        or not isinstance(value["forbidden_sources"], int) or isinstance(value["forbidden_sources"], bool) or value["forbidden_sources"] < 0
-        or not _valid_number(value["score"], minimum=0, maximum=1)
-        or not isinstance(value["passed"], bool)
-        or value["generated_answer"] is not None and not isinstance(value["generated_answer"], str)
-        or value["judgment"] is not None and not isinstance(value["judgment"], str)
-        or value["reason"] is not None and not isinstance(value["reason"], str)
-        or value["model"] is not None and not isinstance(value["model"], str)
-        or value["error"] is not None and not isinstance(value["error"], str)
-        or not isinstance(value["prompt_metadata"], dict)
-    ):
-        raise LocomoError("evaluation checkpoint contains invalid cutoff outcomes")
-    metadata = {str(name): _prompt_metadata_from_dict(details) for name, details in value["prompt_metadata"].items()}
-    return CutoffOutcome(**{**value, "prompt_metadata": metadata})
-
-
-def _evaluation_from_dict(value: dict[str, object]) -> Evaluation:
-    raw_outcomes = value.get("cutoff_outcomes")
-    raw_results = value.get("retrieval_results")
-    if not isinstance(raw_outcomes, dict) or not isinstance(raw_results, list):
-        raise LocomoError("evaluation checkpoint is missing output fields")
-    required = {
-        "case_id", "category", "query", "expected_sources", "ground_truth",
-        "retrieval_results", "search_latency_ms", "cutoff_outcomes", "score", "failure_reason",
-    }
-    if set(value) != required:
-        raise LocomoError("evaluation checkpoint contains invalid output fields")
-    if (
-        not isinstance(value["case_id"], str) or not value["case_id"]
-        or not isinstance(value["category"], str) or not value["category"]
-        or not isinstance(value["query"], str) or not value["query"]
-        or not isinstance(value["expected_sources"], list) or not all(isinstance(item, str) and item for item in value["expected_sources"])
-        or value["ground_truth"] is not None and not isinstance(value["ground_truth"], str)
-        or not _valid_number(value["search_latency_ms"], minimum=0)
-        or not _valid_number(value["score"], minimum=0, maximum=1)
-        or value["failure_reason"] is not None and not isinstance(value["failure_reason"], str)
-    ):
-        raise LocomoError("evaluation checkpoint contains invalid output fields")
-    results = tuple(_retrieval_result_from_dict(item) for item in raw_results)
-    outcomes = {str(key): _cutoff_outcome_from_dict(item) for key, item in raw_outcomes.items()}
-    evaluation = Evaluation(
-        case_id=value["case_id"],
-        category=value["category"],
-        query=value["query"],
-        expected_sources=tuple(value["expected_sources"]),
-        ground_truth=value["ground_truth"],
-        retrieval_results=results,
-        search_latency_ms=float(value["search_latency_ms"]),
-        cutoff_outcomes=outcomes,
-        score=float(value["score"]),
-        failure_reason=value["failure_reason"],
-    )
-    return evaluation
-
-
-def _valid_evaluation_checkpoint(
-    path: Path,
-    run_id: str,
-    config: dict[str, object],
-    case_id: str,
-    dataset_fingerprint: str,
-    corpus_fingerprint: str | None,
-    index_generation: int,
-    cutoffs: tuple[int, ...],
-) -> dict[str, object] | None:
-    try:
-        value = read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if (
-        value.get("checkpoint_version") != "pausanias.eval.checkpoint.v1"
-        or value.get("stage") != "evaluate"
-        or value.get("run_id") != run_id
-        or value.get("case_id") != case_id
-        or value.get("config") != config
-        or value.get("dataset_fingerprint") != dataset_fingerprint
-        or value.get("corpus_fingerprint") != corpus_fingerprint
-        or value.get("index_generation") != index_generation
-        or value.get("status") != "complete"
-    ):
-        return None
-    output = value.get("output")
-    if not isinstance(output, dict):
-        return None
-    if output.get("case_id") != case_id or not isinstance(output.get("query"), str) or not output["query"] or not isinstance(output.get("retrieval_results"), list) or not isinstance(output.get("cutoff_outcomes"), dict):
-        return None
-    if {str(key) for key in output.get("cutoff_outcomes", {})} != {str(cutoff) for cutoff in cutoffs}:
-        return None
-    try:
-        _evaluation_from_dict(output)
-    except (KeyError, TypeError, ValueError, LocomoError):
-        return None
-    return value
-
-
 def _search_record(record: dict[str, object], config: Config, notes: Path, top_k: int) -> dict[str, object]:
     source_dates = {
         f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": _prompt_created_at(date)
@@ -701,6 +537,7 @@ def _search_record(record: dict[str, object], config: Config, notes: Path, top_k
     elapsed = (time.perf_counter() - start) * 1000
     return {
         **record,
+        "query": record["question"],
         "search_latency_ms": elapsed,
         "retrieval_fingerprint": fingerprint([candidate.section_id for candidate in candidates]),
         "retrieval_results": [asdict(_candidate_result(candidate, notes, rank)) for rank, candidate in enumerate(candidates, 1)],
@@ -708,33 +545,6 @@ def _search_record(record: dict[str, object], config: Config, notes: Path, top_k
         "source_dates": source_dates,
         "evidence_context": "\n".join(evidence_lines),
     }
-
-
-def _valid_checkpoint(path: Path, run_id: str, config: dict[str, object], case_id: str, dataset_fingerprint: str, corpus_fingerprint: str | None, index_generation: int) -> dict[str, object] | None:
-    try:
-        value = read_json(path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if value.get("checkpoint_version") != "pausanias.eval.checkpoint.v1" or value.get("stage") != "search" or value.get("run_id") != run_id or value.get("case_id") != case_id or value.get("config") != config or value.get("dataset_fingerprint") != dataset_fingerprint or value.get("corpus_fingerprint") != corpus_fingerprint or value.get("index_generation") != index_generation or value.get("status") != "complete":
-        return None
-    output = value.get("output")
-    if (
-        not isinstance(output, dict)
-        or output.get("case_id") != case_id
-        or not isinstance(output.get("question"), str)
-        or not output["question"]
-        or not _valid_number(output.get("search_latency_ms"), minimum=0)
-        or not isinstance(output.get("retrieval_results"), list)
-        or not isinstance(output.get("retrieval_fingerprint"), str)
-        or not output["retrieval_fingerprint"]
-    ):
-        return None
-    try:
-        for item in output["retrieval_results"]:
-            _retrieval_result_from_dict(item)
-    except (LocomoError, TypeError, ValueError):
-        return None
-    return value
 
 
 def _common_cutoff(
@@ -855,34 +665,38 @@ def run_locomo(
     records = _question_records(entries, rendered)
     corpus_hash = fingerprint([{ "path": path.relative_to(notes).as_posix(), "sha256": _sha256(path.read_bytes()) } for path in sorted(notes.glob("*.md"))]) if notes.exists() else None
     retrieval_config = {"retrieval_mode": "lexical", "top_k": top_k, "cutoffs": list(cutoffs), "conversations": sorted(selected)}
-    model_config = {"prompt_mode": f"answerer-{'profile' if user_profile else 'no-profile'}+judge-{'with-evidence' if with_evidence else 'without-evidence'}", "prompt_fixture_version": PROMPT_FIXTURE_VERSION, "answerer_model": answerer_model, "answerer_provider": provider, "judge_model": judge_model, "judge_provider": judge_provider or provider}
+    model_config = {
+        "prompt_mode": f"answerer-{'profile' if user_profile else 'no-profile'}+judge-{'with-evidence' if with_evidence else 'without-evidence'}",
+        "prompt_version": PROMPT_VERSION,
+        "prompt_fixture_version": PROMPT_FIXTURE_VERSION,
+        "profile_fingerprint": fingerprint(user_profile) if user_profile is not None else None,
+        "answerer_model": answerer_model,
+        "answerer_provider": provider,
+        "judge_model": judge_model,
+        "judge_provider": judge_provider or provider,
+    }
     config_values = {**retrieval_config, **model_config, "retrieval_config": retrieval_config, "model_config": model_config}
     checkpoint_config = config_values
-    candidate: dict[str, object] | None = None
+    candidate = None
     existing_ingest = None
     if resume or evaluate_only:
-        try:
-            candidate = read_json(ingest_path)
-        except (OSError, ValueError, json.JSONDecodeError):
-            candidate = None
-        candidate_config = candidate.get("config") if isinstance(candidate, dict) else None
-        candidate_retrieval_config = candidate_config.get("retrieval_config") if isinstance(candidate_config, dict) else None
-        candidate_model_config = candidate_config.get("model_config") if isinstance(candidate_config, dict) else None
-        prompt_config_matches = isinstance(candidate_model_config, dict) and candidate_model_config.get("prompt_mode") == model_config["prompt_mode"] and candidate_model_config.get("prompt_fixture_version") == model_config["prompt_fixture_version"]
+        candidate = read_checkpoint(ingest_path, stage="ingest", run_id=run_id, dataset_fingerprint=dataset["fingerprint"], corpus_fingerprint=corpus_hash)
+        candidate_config = candidate.config if candidate is not None else None
+        candidate_retrieval_config = candidate_config.get("retrieval_config") if candidate_config is not None else None
+        candidate_model_config = candidate_config.get("model_config") if candidate_config is not None else None
+        prompt_config_matches = (
+            isinstance(candidate_model_config, dict)
+            and candidate_model_config.get("prompt_mode") == model_config["prompt_mode"]
+            and candidate_model_config.get("prompt_version") == model_config["prompt_version"]
+            and candidate_model_config.get("prompt_fixture_version") == model_config["prompt_fixture_version"]
+            and candidate_model_config.get("profile_fingerprint") == model_config["profile_fingerprint"]
+        )
         retrieval_config_matches = candidate_retrieval_config == retrieval_config
         config_matches = retrieval_config_matches and (candidate_config == config_values or ((evaluate_only or resume) and transport is not None and prompt_config_matches))
-        if isinstance(candidate, dict) and candidate.get("checkpoint_version") == "pausanias.eval.checkpoint.v1" and candidate.get("stage") == "ingest" and candidate.get("run_id") == run_id and candidate.get("status") == "complete" and config_matches and candidate.get("dataset_fingerprint") == dataset["fingerprint"] and candidate.get("corpus_fingerprint") == corpus_hash:
+        if candidate is not None and config_matches:
             existing_ingest = candidate
             checkpoint_config = candidate_config
-    candidate_is_complete = (
-        isinstance(candidate, dict)
-        and candidate.get("checkpoint_version") == "pausanias.eval.checkpoint.v1"
-        and candidate.get("stage") == "ingest"
-        and candidate.get("run_id") == run_id
-        and candidate.get("status") == "complete"
-        and candidate.get("dataset_fingerprint") == dataset["fingerprint"]
-        and candidate.get("corpus_fingerprint") == corpus_hash
-    )
+    candidate_is_complete = candidate is not None
     if existing_ingest is None and evaluate_only and not candidate_is_complete:
         raise LocomoError("evaluation requires a complete ingest checkpoint")
     scope_configs = {
@@ -903,6 +717,7 @@ def run_locomo(
             {
                 "files": [{"path": path.name, "sha256": _sha256(path.read_bytes())} for path in sorted(notes.glob("*.md"))],
                 "scope_indexes": {str(index): metadata for index, metadata in scope_indexes.items()},
+                "index_generation": ingest_generation,
             },
         )
         ingest.write(ingest_path)
@@ -914,7 +729,7 @@ def run_locomo(
                 "corpus_fingerprint": _scope_corpus_fingerprint(scope),
                 "index_generation": _index_generation(scope_config.database),
             }
-        ingest = Checkpoint(**existing_ingest)
+        ingest = existing_ingest
     generation = int(ingest.index_generation or 0)
     if records:
         first_scope = scope_configs[int(records[0]["conversation_index"])]
@@ -926,20 +741,39 @@ def run_locomo(
         scope_corpus_hash = str(scope_metadata["corpus_fingerprint"])
         scope_generation = int(scope_metadata["index_generation"])
         checkpoint_path = search_dir / f"{record['case_id']}.json"
-        checkpoint = _valid_checkpoint(checkpoint_path, run_id, checkpoint_config, str(record["case_id"]), str(dataset["fingerprint"]), scope_corpus_hash, scope_generation) if (resume or evaluate_only) else None
+        checkpoint = read_checkpoint(
+            checkpoint_path,
+            stage="search",
+            run_id=run_id,
+            config=checkpoint_config,
+            case_id=str(record["case_id"]),
+            dataset_fingerprint=str(dataset["fingerprint"]),
+            corpus_fingerprint=scope_corpus_hash,
+            index_generation=scope_generation,
+        ) if (resume or evaluate_only) else None
         if checkpoint is None:
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
             raw = _search_record(record, scope_config, scope_notes, top_k)
             Checkpoint("search", run_id, dataset["fingerprint"], scope_corpus_hash, scope_generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
-            raw = checkpoint["output"]
-        retrieval = tuple(RetrievalResult(**item) for item in raw["retrieval_results"])
+            raw = checkpoint.output
+        retrieval = tuple(retrieval_result_from_dict(item) for item in raw["retrieval_results"])
         evaluation_path = evaluate_dir / f"{record['case_id']}.json"
         if not predict_only:
-            evaluation_checkpoint = _valid_evaluation_checkpoint(evaluation_path, run_id, config_values, str(record["case_id"]), str(dataset["fingerprint"]), scope_corpus_hash, scope_generation, cutoffs) if (resume or evaluate_only) else None
+            evaluation_checkpoint = read_checkpoint(
+                evaluation_path,
+                stage="evaluate",
+                run_id=run_id,
+                config=config_values,
+                case_id=str(record["case_id"]),
+                dataset_fingerprint=str(dataset["fingerprint"]),
+                corpus_fingerprint=scope_corpus_hash,
+                index_generation=scope_generation,
+                cutoffs=cutoffs,
+            ) if (resume or evaluate_only) else None
             if evaluation_checkpoint is not None:
-                evaluations.append(_evaluation_from_dict(evaluation_checkpoint["output"]))
+                evaluations.append(evaluation_from_dict(evaluation_checkpoint.output))
                 continue
         outcomes: dict[str, CutoffOutcome] = {}
         if predict_only:

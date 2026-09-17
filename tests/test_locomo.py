@@ -46,7 +46,7 @@ def test_golden_prompt_fixtures_match_vendored_entry_points():
     for name in ("judge-without-evidence", "judge-with-evidence"):
         payload = json.loads((FIXTURES / f"{name}.json").read_text())
         actual = build_judge_prompt(payload["category"], payload["question"], payload["answer"], payload["response"], payload.get("evidence_context"))
-    assert actual == (FIXTURES / f"{name}.txt").read_text().rstrip("\n")
+        assert actual == (FIXTURES / f"{name}.txt").read_text().rstrip("\n")
 
 
 def test_locomo_runner_prompt_matches_vendored_date_fixture(tmp_path: Path):
@@ -224,6 +224,42 @@ def test_locomo_evaluation_checkpoints_skip_completed_llm_calls(tmp_path: Path):
 
     assert result is not None
     assert second_transport.calls == []
+
+
+def test_locomo_profile_change_recomputes_evaluation_checkpoint(tmp_path: Path):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    alice = {"name": "Alice"}
+    bob = {"name": "Bob"}
+    run_locomo(run_id="profile", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1,), predict_only=True)
+
+    run_locomo(
+        run_id="profile",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1,),
+        provider="stub",
+        judge_provider="stub",
+        user_profile=alice,
+        transport=StubTransport(["ANSWER: Alice", {"label": "CORRECT", "reasoning": "Alice"}] * 2),
+    )
+    second_transport = StubTransport(["ANSWER: Bob", {"label": "CORRECT", "reasoning": "Bob"}] * 2)
+    result = run_locomo(
+        run_id="profile",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1,),
+        provider="stub",
+        judge_provider="stub",
+        user_profile=bob,
+        resume=True,
+        transport=second_transport,
+    )
+
+    assert result is not None
+    assert second_transport.calls
+    assert "Bob" in second_transport.calls[0]["user"]
 
 
 def test_invalid_judge_json_is_retried(tmp_path: Path):
