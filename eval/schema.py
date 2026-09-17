@@ -134,6 +134,7 @@ class Metrics:
     by_cutoff: dict[str, Any]
     latency_ms: dict[str, Any]
     deterministic_gates: dict[str, Any] = field(default_factory=dict)
+    baselines: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

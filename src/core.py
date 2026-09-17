@@ -42,7 +42,18 @@ from .vectors import encoder_vectors as _encoder_vectors
 MAX_QUERY_TERMS = 64
 MAX_CANDIDATES = 200
 SEMANTIC_SCORE_FLOOR = 0.30
+SEMANTIC_SCORE_FLOOR_RATIONALE = (
+    "reject weak cosine matches that add noise while retaining the observed semantic lift"
+)
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
+
+FUSION_DIAGNOSTICS = {
+    "algorithm": "rrf",
+    "semantic_score_floor": {
+        "value": SEMANTIC_SCORE_FLOOR,
+        "rationale": SEMANTIC_SCORE_FLOOR_RATIONALE,
+    },
+}
 
 
 def _semantic_backend_reason(config: Config) -> str | None:
@@ -338,7 +349,8 @@ def index(
                      json.dumps(explicit_links(content))),
                 )
                 connection.execute("INSERT INTO sections_fts(section_id, heading, text) VALUES (?, ?, ?)",
-                                   (section.section_id, section.heading or "", section.text))
+                                   (section.section_id, _normalize_guard_text(section.heading or ""),
+                                    _normalize_guard_text(section.text)))
             connection.execute("INSERT INTO files VALUES (?, ?, ?, ?)", (canonical, root.id, stat.st_mtime_ns, document.content_hash))
         current = set(found)
         for canonical in set(existing) - current:
@@ -565,15 +577,15 @@ def _lexical_candidates(
     candidate_limit: int,
     refresh: set[str] | None = None,
     timings: dict[str, float] | None = None,
-) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool]:
+) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool, bool]:
     if not config.database.exists():
-        return [], {}, {}, bool(_guard_atoms(query))
+        return [], {}, {}, bool(_guard_atoms(query)), False
     scope_root_ids, global_paths, effective_project = _scope_parts(config, project, root_id, all_projects)
     if root_id and not any(root.id == root_id for root in config.roots):
-        return [], {}, {}, bool(_guard_atoms(query))
-    fts, tokens = _fts_query(query)
+        return [], {}, {}, bool(_guard_atoms(query)), False
+    fts, tokens = _fts_query(_normalize_guard_text(query))
     if not fts:
-        return [], {}, {}, bool(_guard_atoms(query))
+        return [], {}, {}, bool(_guard_atoms(query)), False
     scope_condition, scope_params = _scope_conditions(scope_root_ids, global_paths)
     conditions = ["sections_fts MATCH ?", scope_condition]
     rows_by_id: dict[str, sqlite3.Row] = {}
@@ -623,12 +635,14 @@ def _lexical_candidates(
     hash_cache: dict[str, str | None] = {}
     lower_tokens = {token.casefold() for token in tokens}
     results: list[Candidate] = []
+    stale_source = False
     for row in rows_by_id.values():
         canonical = row["canonical_path"]
         if canonical not in source_cache:
             source_cache[canonical] = _safe_source(config, canonical)
         source = source_cache[canonical]
         if source is None:
+            stale_source = True
             if refresh is not None:
                 refresh.add(canonical)
             continue
@@ -649,6 +663,7 @@ def _lexical_candidates(
                 hash_cache[canonical] = None
         current_hash = hash_cache[canonical]
         if current_hash is None or current_hash != row["content_hash"]:
+            stale_source = True
             if refresh is not None:
                 refresh.add(canonical)
             continue
@@ -681,7 +696,7 @@ def _lexical_candidates(
         ))
     results.sort(key=lambda item: (-item.score, item.section_id))
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
-    return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
+    return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query)), stale_source
 
 
 def _fuse_candidates(
@@ -692,11 +707,26 @@ def _fuse_candidates(
     guarded: bool,
     limit: int,
     timings: dict[str, float] | None = None,
+    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR,
 ) -> list[Candidate]:
     started = time.perf_counter()
     candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
     admitted: dict[str, Candidate] = {}
-    for candidate in (*lexical, *(item for item in vector if (item.vector_score or 0.0) >= SEMANTIC_SCORE_FLOOR)):
+    semantic_candidates = [
+        item for item in vector
+        if semantic_score_floor is None or (item.vector_score or 0.0) >= semantic_score_floor
+    ]
+    admission: list[Candidate] = []
+    if guarded:
+        admission.extend(lexical)
+        admission.extend(semantic_candidates)
+    else:
+        for ordinal in range(max(len(lexical), len(semantic_candidates))):
+            if ordinal < len(lexical):
+                admission.append(lexical[ordinal])
+            if ordinal < len(semantic_candidates):
+                admission.append(semantic_candidates[ordinal])
+    for candidate in admission:
         if candidate.section_id in admitted:
             previous = admitted[candidate.section_id]
             if candidate.vector_rank is not None:
@@ -715,7 +745,10 @@ def _fuse_candidates(
             protected[candidate.section_id] = (primary_rank[candidate.section_id], min(ordinal_values))
     protected_order = sorted(
         ((key, rank, ordinal) for key, (rank, ordinal) in protected.items()),
-        key=lambda item: (item[1], item[2], item[0]),
+        key=lambda protected_item: (
+            next(candidate.lexical_rank for candidate in lexical if candidate.section_id == protected_item[0]),
+            protected_item[1], protected_item[2], protected_item[0],
+        ),
     )
     guard_status = (
         "protected" if protected_order else ("bypassed:no-protected-hit" if guarded else "not-applicable")
@@ -745,10 +778,20 @@ def _fuse_candidates(
     protected_results = [next(item for item in fused if item.section_id == section_id) for section_id, _, _ in protected_order]
     reserved_ids = {item.section_id for item in protected_results}
     remaining = [item for item in fused if item.section_id not in reserved_ids]
-    remaining.sort(key=lambda item: (
-        -(item.fused_score or 0.0), item.lexical_rank if item.lexical_rank is not None else MAX_CANDIDATES + 1,
-        item.vector_rank if item.vector_rank is not None else MAX_CANDIDATES + 1, item.section_id,
-    ))
+    if guarded:
+        remaining.sort(key=lambda item: (
+            item.lexical_rank is None,
+            item.lexical_rank if item.lexical_rank is not None else MAX_CANDIDATES + 1,
+            item.vector_rank if item.vector_rank is not None else MAX_CANDIDATES + 1,
+            item.section_id,
+        ))
+    else:
+        remaining.sort(key=lambda item: (
+            -(item.fused_score or 0.0),
+            item.lexical_rank if item.lexical_rank is not None else MAX_CANDIDATES + 1,
+            item.vector_rank if item.vector_rank is not None else MAX_CANDIDATES + 1,
+            item.section_id,
+        ))
     if timings is not None:
         timings["hybrid_overhead_ms"] = max((time.perf_counter() - started) * 1000.0, 0.000001)
     return [*protected_results, *remaining][:limit]
@@ -757,19 +800,25 @@ def _fuse_candidates(
 def semantic_search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
                     all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
                     encoder: object | None = None, matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] | None = None,
-                    timings: dict[str, float] | None = None) -> list[Candidate]:
+                    timings: dict[str, float] | None = None,
+                    semantic_score_floor: float | None = SEMANTIC_SCORE_FLOOR) -> list[Candidate]:
     """Fuse bounded lexical and semantic lanes, with lexical fallback on failure."""
     if limit < 1:
         raise ValueError("limit must be positive")
     candidate_limit = min(MAX_CANDIDATES, max(limit * 5, 50))
-    lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
-        config, query, project, root_id, all_projects, candidate_limit, refresh, timings,
+    validation_refresh: set[str] = set()
+    lexical, primary_rank, atom_matches, guarded, stale_source = _lexical_candidates(
+        config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
     )
     if timings is not None:
         timings.setdefault("semantic_available", 0.0)
     semantic = vector_candidates(
-        config, query, project, root_id, all_projects, candidate_limit, refresh, encoder, matrix_cache, timings,
+        config, query, project, root_id, all_projects, candidate_limit, validation_refresh, encoder, matrix_cache, timings,
     )
+    if refresh is not None:
+        refresh.update(validation_refresh)
+    if stale_source or validation_refresh:
+        return []
     if timings is not None and not timings.get("semantic_available"):
         return lexical[:limit]
     if refresh and not lexical:
@@ -792,13 +841,16 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
         if candidate.section_id in lexical_ids and candidate.vector_score is not None
     ]
     if lexical_vector_scores:
-        semantic_floor = max(SEMANTIC_SCORE_FLOOR, max(lexical_vector_scores) * 0.70)
-        semantic = [
-            candidate for candidate in semantic
-            if (candidate.vector_score or 0.0) >= semantic_floor
-            or candidate.section_id in lexical_ids
-        ]
-    return _fuse_candidates(lexical, semantic, primary_rank, atom_matches, guarded, limit, timings)
+        if semantic_score_floor is not None:
+            semantic_floor = max(semantic_score_floor, max(lexical_vector_scores) * 0.70)
+            semantic = [
+                candidate for candidate in semantic
+                if (candidate.vector_score or 0.0) >= semantic_floor
+                or candidate.section_id in lexical_ids
+            ]
+    return _fuse_candidates(
+        lexical, semantic, primary_rank, atom_matches, guarded, limit, timings, semantic_score_floor,
+    )
 
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
@@ -808,9 +860,14 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
         return semantic_search(config, query, project, root_id, all_projects, limit, refresh)
     if limit < 1:
         raise ValueError("limit must be positive")
-    return _lexical_candidates(
-        config, query, project, root_id, all_projects, min(MAX_CANDIDATES, max(limit * 5, 50)), refresh,
-    )[0][:limit]
+    validation_refresh: set[str] = set()
+    results, _, _, _, stale_source = _lexical_candidates(
+        config, query, project, root_id, all_projects, min(MAX_CANDIDATES, max(limit * 5, 50)),
+        validation_refresh,
+    )
+    if refresh is not None:
+        refresh.update(validation_refresh)
+    return [] if stale_source or validation_refresh else results[:limit]
 
 
 def excerpt(text: str, max_chars: int = 500) -> str:

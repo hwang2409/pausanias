@@ -108,6 +108,21 @@ def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
         stop_worker(config.database)
 
 
+def test_worker_abstains_when_a_matching_source_is_deleted(tmp_path: Path):
+    pytest.importorskip("numpy")
+    config_path, config = make_config(tmp_path)
+    core.index(config, encoder=FakeEncoder())
+    note = config.roots[0].path / "note.md"
+    worker = PersistentWorker(config, encoder=FakeEncoder())
+    original = note.read_bytes()
+    try:
+        note.unlink()
+        response = worker._query({"query": "alpha memory", "project": "p"})
+        assert response["items"] == []
+    finally:
+        note.write_bytes(original)
+
+
 def test_concurrent_startup_launches_one_real_worker(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config)

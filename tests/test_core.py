@@ -543,7 +543,11 @@ def test_cli_json_output(tmp_path: Path, capsys):
     config_path = tmp_path / "config.toml"
     assert main(["--config", str(config_path), "index"]) == 0
     assert main(["--config", str(config_path), "search", "sqlite", "--project", "p", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out.splitlines()[-1])[0]["excerpt"] == "Use sqlite."
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])[0]
+    assert result["excerpt"] == "Use sqlite."
+    assert set(result) == {
+        "excerpt", "path", "heading", "line_range", "dates", "score", "reason", "content_hash",
+    }
 
 
 def test_config_rejects_missing_root(tmp_path: Path):

@@ -39,7 +39,7 @@ forbidden_violations = 0
 
 [thresholds.fused_categories.verbatim]
 recall_at_4 = 1.0
-precision_at_4 = 0.9274193548
+precision_at_4 = 0.9274193548387096
 mrr = 1.0
 abstention_accuracy = 1.0
 forbidden_violations = 0
@@ -47,7 +47,7 @@ forbidden_violations = 0
 [thresholds.fused_categories.paraphrase]
 recall_at_4 = 1.0
 precision_at_4 = 0.6875
-mrr = 0.9583333333
+mrr = 0.9583333333333334
 abstention_accuracy = 1.0
 forbidden_violations = 0
 
