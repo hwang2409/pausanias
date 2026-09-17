@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import eval.benchmarks.locomo.run as locomo_runner
 from eval.benchmarks.locomo.run import (
     StubTransport,
     _reference_date,
@@ -196,6 +197,48 @@ def test_locomo_retrieval_config_mismatch_recomputes_search(tmp_path: Path):
         "cutoffs": [1, 8],
         "conversations": [0],
     }
+
+
+def test_locomo_fused_and_lexical_smoke_modes(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    fused_calls = []
+    real_run_hook = locomo_runner.run_hook
+
+    def recording_run_hook(*args, **kwargs):
+        fused_calls.append((args[1], args[2]))
+        return real_run_hook(*args, **kwargs)
+
+    monkeypatch.setattr(locomo_runner, "run_hook", recording_run_hook)
+    run_locomo(
+        run_id="fused-smoke",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1,),
+        predict_only=True,
+        retrieval_mode="fused",
+    )
+    fused_checkpoint = json.loads(
+        (tmp_path / "locomo/fused-smoke/checkpoints/search/conv0_q0.json").read_text()
+    )
+    assert fused_checkpoint["config"]["retrieval_mode"] == "fused"
+    assert fused_checkpoint["config"]["retrieval_config"]["retrieval_mode"] == "fused"
+    assert fused_calls
+
+    run_locomo(
+        run_id="lexical-smoke",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1,),
+        predict_only=True,
+        retrieval_mode="lexical",
+    )
+    lexical_checkpoint = json.loads(
+        (tmp_path / "locomo/lexical-smoke/checkpoints/search/conv0_q0.json").read_text()
+    )
+    assert lexical_checkpoint["config"]["retrieval_mode"] == "lexical"
+    assert lexical_checkpoint["config"]["retrieval_config"]["retrieval_mode"] == "lexical"
 
 
 def test_locomo_corrupt_score_checkpoint_is_recomputed(tmp_path: Path):
