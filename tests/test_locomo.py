@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import eval.benchmarks.locomo.run as locomo_runner
 from eval.benchmarks.locomo.run import (
     StubTransport,
@@ -106,6 +108,76 @@ def test_locomo_search_and_stub_evaluate_are_resumable(tmp_path: Path):
     assert result.metrics.total == 2
     assert result.metrics.errors == 0
     assert result.metadata.prompt_fixture_version == "golden-prompts-v1"
+
+
+def test_predict_only_writes_retrieval_summary(tmp_path: Path):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    result = run_locomo(
+        run_id="predict-summary",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 2, 4, 8),
+        predict_only=True,
+    )
+
+    assert result is not None
+    artifact = json.loads((tmp_path / "locomo/predict-summary/run.json").read_text())
+    assert artifact["metadata"]["corpus_fingerprint"]
+    assert artifact["metadata"]["dataset"]["fingerprint"]
+    assert artifact["metadata"]["config"]["retrieval_mode"] == "lexical"
+    assert artifact["metadata"]["config"]["answerer_model"] is None
+    assert artifact["metadata"]["config"]["answerer_provider"] is None
+    assert artifact["metadata"]["config"]["judge_model"] is None
+    assert artifact["metadata"]["config"]["judge_provider"] is None
+    assert artifact["metadata"]["answerer_prompt_hash"] is None
+    assert artifact["metadata"]["judge_prompt_hash"] is None
+    assert artifact["metadata"]["prompt_version"] is None
+    assert artifact["metadata"]["prompt_fixture_version"] is None
+
+    for cutoff in (1, 2, 4, 8):
+        outcomes = [item.cutoff_outcomes[str(cutoff)] for item in result.evaluations]
+        summary = result.metrics.by_cutoff[str(cutoff)]["overall"]
+        assert summary["total"] == len(outcomes)
+        assert summary["relevant_count"] == sum(item.relevant_count for item in outcomes)
+        assert summary["recall"] == pytest.approx(sum(item.recall for item in outcomes) / len(outcomes))
+        assert summary["precision"] == pytest.approx(sum(item.precision for item in outcomes) / len(outcomes))
+        assert summary["mrr"] == pytest.approx(sum(item.mrr for item in outcomes) / len(outcomes))
+
+    assert result.metrics.latency_ms["overall"]["max_ms"] >= result.metrics.latency_ms["overall"]["p95_ms"]
+    assert all(
+        outcome.generated_answer is None
+        and outcome.judgment is None
+        and outcome.model is None
+        and outcome.prompt_metadata == {}
+        for evaluation in result.evaluations
+        for outcome in evaluation.cutoff_outcomes.values()
+    )
+
+
+def test_predict_only_resume_reuses_search_checkpoints(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(run_id="predict-resume", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1, 8), predict_only=True)
+    checkpoint_path = tmp_path / "locomo/predict-resume/checkpoints/search/conv0_q0.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    def fail_if_recomputed(*args, **kwargs):
+        raise AssertionError("resume recomputed a search checkpoint")
+
+    monkeypatch.setattr(locomo_runner, "_search_record", fail_if_recomputed)
+    result = run_locomo(
+        run_id="predict-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        resume=True,
+    )
+
+    assert result is not None
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert (tmp_path / "locomo/predict-resume/run.json").exists()
 
 
 def test_stub_failures_keep_mem0_error_semantics(tmp_path: Path):
