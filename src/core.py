@@ -148,6 +148,28 @@ def fusion_diagnostics(
     }
 
 
+def semantic_index_state(config: Config) -> tuple[str, str | None]:
+    """Return the committed semantic state and its reason for a readable index."""
+    if not config.database.exists():
+        return "disabled", "INDEX_MISSING"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = connect(config.database, initialize=False, readonly=True)
+        state = dict(connection.execute(
+            "SELECT key, value FROM metadata WHERE key IN ('semantic_state', 'semantic_reason')"
+        ).fetchall())
+    except (OSError, sqlite3.DatabaseError, ValueError):
+        return "disabled", "INDEX_UNAVAILABLE"
+    finally:
+        if connection is not None:
+            connection.close()
+    semantic_state = state.get("semantic_state")
+    if not isinstance(semantic_state, str):
+        return "disabled", "INDEX_UNAVAILABLE"
+    semantic_reason = state.get("semantic_reason")
+    return semantic_state, semantic_reason if isinstance(semantic_reason, str) and semantic_reason else None
+
+
 def _semantic_backend_reason(config: Config) -> str | None:
     return semantic_backend_reason(config, version_checker=package_version)
 
@@ -989,10 +1011,12 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
-           semantic: bool = False, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
+           semantic: bool = True, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
     if semantic:
+        timings: dict[str, float] = {}
         return semantic_search(
             config, query, project, root_id, all_projects, limit, refresh,
+            timings=timings,
             synonym_expansion=synonym_expansion,
         )
     if limit < 1:

@@ -75,6 +75,33 @@ def test_runner_executes_three_case_mini_slice(tmp_path: Path):
     assert aggregate["forbidden_violations"] == 0
 
 
+def test_legacy_runner_uses_lexical_search(monkeypatch, tmp_path: Path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "alpha.md").write_text("# Alpha\nalpha evidence\n")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'database = "./index.sqlite3"\n\n'
+        '[[roots]]\n'
+        'id = "mini"\n'
+        'project = "mini"\n'
+        'path = "corpus"\n'
+    )
+    modes = []
+    real_search = eval_run.search
+
+    def recording_search(*args, **kwargs):
+        modes.append(kwargs.get("semantic"))
+        return real_search(*args, **kwargs)
+
+    monkeypatch.setattr(eval_run, "search", recording_search)
+    run_cases([
+        Case("alpha", "alpha evidence", {"project": "mini"}, ("alpha.md",), (), False, "hit"),
+    ], corpus, config_path)
+
+    assert modes == [False]
+
+
 def test_abstention_gate_uses_only_abstention_cases(tmp_path: Path):
     runtime_corpus = tmp_path / "corpus"
     runtime_corpus.mkdir()

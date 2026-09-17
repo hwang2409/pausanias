@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
-from .core import excerpt, fusion_diagnostics, index, read_source, search
+from .core import excerpt, fusion_diagnostics, index, read_source
 from .hook import run_hook
 from .model_bundle import (
     MODEL_BUNDLE_MANIFEST,
@@ -19,6 +19,7 @@ from .model_bundle import (
     package_version,
     verify_bundle,
 )
+from .vectors import semantic_backend_reason
 
 
 def parser() -> argparse.ArgumentParser:
@@ -35,7 +36,14 @@ def parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--root")
     search_parser.add_argument("--all-projects", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
-    search_parser.add_argument("--semantic", action="store_true", help="use semantic candidates with lexical fallback")
+    search_parser.add_argument(
+        "--retrieval-mode", choices=("lexical", "fused"),
+        help="select lexical or fused retrieval; default activates fused when ready",
+    )
+    search_parser.add_argument(
+        "--semantic", dest="retrieval_mode", action="store_const", const="fused",
+        help="deprecated alias for --retrieval-mode fused",
+    )
     search_parser.add_argument("--diagnostics", action="store_true", help="include retrieval diagnostics in JSON output")
     search_parser.add_argument("--json", action="store_true")
     hook_parser = commands.add_parser("hook", help="run one request through the semantic hook path")
@@ -46,6 +54,10 @@ def parser() -> argparse.ArgumentParser:
     hook_parser.add_argument("--all-projects", action="store_true")
     hook_parser.add_argument("--limit", type=int, default=20)
     hook_parser.add_argument("--deadline-ms", type=float, default=750.0)
+    hook_parser.add_argument(
+        "--retrieval-mode", choices=("lexical", "fused"),
+        help="select lexical or fused retrieval; default activates fused when ready",
+    )
     hook_parser.add_argument("--json", action="store_true")
     read_parser = commands.add_parser("read")
     read_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
@@ -83,7 +95,8 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _result(candidate, diagnostics: bool = False, config=None) -> dict:
+def _result(candidate, diagnostics: bool = False, config=None,
+            retrieval_mode: str | None = None) -> dict:
     result = {
         "excerpt": excerpt(candidate.text),
         "path": candidate.canonical_path,
@@ -104,6 +117,9 @@ def _result(candidate, diagnostics: bool = False, config=None) -> dict:
             "fused_score": candidate.fused_score,
             "guard_reason": candidate.guard_reason,
             "fusion_policies": fusion_diagnostics(config),
+            "retrieval_mode": retrieval_mode or (
+                "fused" if candidate.fused_score is not None else "lexical"
+            ),
         })
     return result
 
@@ -144,6 +160,20 @@ def _configured_bundle(args) -> Path:
     if args.bundle_dir is not None:
         return Path(args.bundle_dir)
     return load_config(args.config).bundle_dir
+
+
+def _search_diagnostics(requested_mode: str, metrics) -> dict[str, object]:
+    return {
+        "requested_mode": requested_mode,
+        "retrieval_mode": metrics.retrieval_mode,
+        "semantic_state": metrics.semantic_state,
+        "semantic_reason": metrics.failure_reason or metrics.disabled_reason,
+        "fallback": metrics.fallback,
+    }
+
+
+def _include_search_diagnostics(config: Config, requested_mode: str, explicit: bool) -> bool:
+    return explicit or (requested_mode == "fused" and semantic_backend_reason(config) is None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,8 +221,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.all_projects,
                 args.limit,
                 args.deadline_ms,
+                retrieval_mode=args.retrieval_mode or "auto",
             )
-            items = [_result(item, diagnostics=True, config=config) for item in response.candidates]
+            items = [
+                _result(item, diagnostics=True, config=config,
+                        retrieval_mode=response.metrics.retrieval_mode)
+                for item in response.candidates
+            ]
             if args.json:
                 print(json.dumps({"items": items, "metrics": response.metrics.__dict__}, ensure_ascii=False))
             else:
@@ -226,16 +261,34 @@ def main(argv: list[str] | None = None) -> int:
             print(read_source(config, args.path, args.heading, args.max_bytes))
         else:
             config = load_config(args.config)
-            if args.semantic:
-                results = [_result(item, diagnostics=True, config=config) for item in run_hook(
-                    config, args.config, args.query, args.project, args.root, args.all_projects, args.limit,
-                ).candidates]
-            else:
-                results = [_result(item, diagnostics=args.diagnostics, config=config) for item in search(
-                    config, args.query, args.project, args.root, args.all_projects, args.limit,
-                )]
+            selected_mode = args.retrieval_mode or "fused"
+            response = run_hook(
+                config,
+                args.config,
+                args.query,
+                args.project,
+                args.root,
+                args.all_projects,
+                args.limit,
+                retrieval_mode=selected_mode,
+            )
+            results = [
+                _result(
+                    item,
+                    diagnostics=args.diagnostics,
+                    config=config,
+                    retrieval_mode=response.metrics.retrieval_mode,
+                )
+                for item in response.candidates
+            ]
             if args.json:
-                print(json.dumps(results, ensure_ascii=False))
+                payload: object = results
+                if _include_search_diagnostics(config, selected_mode, args.diagnostics):
+                    payload = {
+                        "items": results,
+                        "diagnostics": _search_diagnostics(selected_mode, response.metrics),
+                    }
+                print(json.dumps(payload, ensure_ascii=False))
             else:
                 for item in results:
                     print(f"{item['path']}:{item['line_range'][0]}-{item['line_range'][1]} {item['heading']}")

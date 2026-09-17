@@ -485,7 +485,13 @@ def scan_vectors(
     try:
         connection.execute("BEGIN")
         require_schema_version(connection)
-        state = dict(connection.execute("SELECT key, value FROM metadata WHERE key IN ('generation', 'semantic_state', 'semantic_generation')").fetchall())
+        state = dict(connection.execute(
+            "SELECT key, value FROM metadata "
+            "WHERE key IN ('generation', 'semantic_state', 'semantic_generation', 'semantic_reason')"
+        ).fetchall())
+        if timings is not None:
+            timings["semantic_state"] = state.get("semantic_state", "unknown")
+            timings["semantic_reason"] = state.get("semantic_reason")
         if state.get("semantic_state") != SEMANTIC_STATE_READY or state.get("generation") != state.get("semantic_generation"):
             return []
         generation = int(state["generation"])

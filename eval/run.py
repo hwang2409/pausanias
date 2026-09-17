@@ -309,7 +309,10 @@ def run_cases(
                     root_id=case.scope.get("root"),
                     all_projects=bool(case.scope.get("all_projects", False)),
                     limit=K,
+                    semantic=False,
                 )
+                if any(result.fused_score is not None for result in results):
+                    raise AssertionError("lexical evaluation returned fused candidates")
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 scores.append(score_case(case, results, runtime_corpus, elapsed_ms))
         return scores, _aggregate(scores)

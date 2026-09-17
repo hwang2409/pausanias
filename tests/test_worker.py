@@ -94,6 +94,7 @@ def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
         first = client.query({"query": "alpha paraphrase", "project": "p", "limit": 20}, deadline)
         second = client.query({"query": "alpha paraphrase", "project": "p", "limit": 20}, deadline)
         assert first["items"][0]["heading"] == "Note"
+        assert first["metrics"]["retrieval_mode"] == "fused"
         assert second["metrics"]["matrix_load_ms"] < first["metrics"]["matrix_load_ms"]
         assert second["metrics"]["model_load_ms"] <= first["metrics"]["model_load_ms"]
     finally:
@@ -155,10 +156,54 @@ def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
         response = run_hook(config, config_path, "alpha memory", project="p")
         assert [item.heading for item in response.candidates] == ["Note"]
         assert response.metrics.fallback is True
+        assert response.metrics.retrieval_mode == "lexical"
         expected_reason = "MODEL_MISSING" if semantic_extra_available() else "EXTRA_MISSING"
         assert response.metrics.disabled_reason == expected_reason
+        assert response.metrics.semantic_state == "disabled"
+        assert response.metrics.failure_reason == expected_reason
+        assert response.metrics.status == "semantic_disabled"
     finally:
         stop_worker(config.database)
+
+
+def test_hook_explicit_lexical_mode_skips_semantic_worker(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    core.index(config)
+
+    response = run_hook(config, config_path, "alpha memory", project="p", retrieval_mode="lexical")
+
+    assert [item.heading for item in response.candidates] == ["Note"]
+    assert response.metrics.fallback is False
+    assert response.metrics.cache_state == "lexical"
+    assert response.metrics.retrieval_mode == "lexical"
+
+
+def test_hook_surfaces_stale_state_and_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    config_path, config = make_config(tmp_path)
+    core.index(config, encoder=FakeEncoder())
+    note = config.roots[0].path / "note.md"
+    note.write_text("# Note\nnew alpha\n")
+
+    class FailingEncoder:
+        def encode(self, texts: list[str]):
+            raise RuntimeError("refresh failed")
+
+    core.index(config, encoder=FailingEncoder())
+    paths = worker_paths(config.database)
+    worker = PersistentWorker(config, paths, idle_seconds=2, encoder=FakeEncoder())
+    thread = threading.Thread(target=worker.serve)
+    thread.start()
+    monkeypatch.setattr(hook, "ensure_worker", lambda *args: (paths, 0.1))
+    try:
+        wait_for_socket(paths.socket)
+        response = run_hook(config, config_path, "new alpha", project="p")
+        assert response.metrics.semantic_state == "stale"
+        assert response.metrics.failure_reason == "REFRESH_FAILED"
+        assert response.metrics.status == "semantic_failure"
+        assert response.metrics.fallback is True
+    finally:
+        worker._stopping.set()
+        thread.join(timeout=2)
 
 
 def test_worker_abstains_when_a_matching_source_is_deleted(tmp_path: Path):

@@ -26,13 +26,17 @@ Run the indexer and search a project:
 ```bash
 python -m pausanias --config ./config.toml index
 python -m pausanias --config ./config.toml search "sandbox image" --project phoebe
-python -m pausanias --config ./config.toml search "sandbox image" --project phoebe --semantic
+python -m pausanias --config ./config.toml search "sandbox image" --project phoebe --retrieval-mode lexical
 python -m pausanias --config ./config.toml read ./vault/decision.md --heading "Decision"
 ```
 
 Use `--rebuild` to recreate the derived database. Use `--all-projects`
-only when cross-project search is intentional. Semantic search is opt-in and falls
-back to lexical results when its model or vector store is unavailable.
+only when cross-project search is intentional. Search uses fused retrieval when the
+semantic extra is installed and the index is ready. Use `--retrieval-mode lexical` to
+force lexical retrieval. Fused retrieval falls back to lexical results when its model,
+index, or runtime is unavailable. With `--diagnostics --json`, search returns an
+`items` array and a sibling `diagnostics` object, including state and reason for empty
+results. A default base-install lexical search keeps its legacy JSON array shape.
 
 The optional synonym table is local and operator-maintained:
 
