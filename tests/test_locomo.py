@@ -81,6 +81,11 @@ def test_locomo_runner_prompt_matches_vendored_date_fixture(tmp_path: Path):
     assert "(Monday, May 01, 2023)" in transport.calls[0]["user"]
 
 
+def test_locomo_rejects_predict_and_evaluate_only_together():
+    with pytest.raises(ValueError, match="--predict-only and --evaluate-only cannot be combined"):
+        run_locomo(run_id="invalid-flags", predict_only=True, evaluate_only=True)
+
+
 def test_locomo_search_and_stub_evaluate_are_resumable(tmp_path: Path):
     dataset = Path(__file__).parent / "fixtures/locomo/small.json"
     run_locomo(

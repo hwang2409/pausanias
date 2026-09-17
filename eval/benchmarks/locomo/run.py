@@ -690,6 +690,8 @@ def run_locomo(
     transport: object | None = None,
     retrieval_mode: str = "lexical",
 ) -> UnifiedResult | None:
+    if predict_only and evaluate_only:
+        raise ValueError("--predict-only and --evaluate-only cannot be combined")
     if top_k < max(cutoffs) or not cutoffs:
         raise ValueError("top-k must include all cutoffs")
     if retrieval_mode not in {"lexical", "fused"}:
