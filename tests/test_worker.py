@@ -62,6 +62,18 @@ def wait_for_socket(path: Path) -> None:
     assert socket_ready(path)
 
 
+def worker_pids(config_path: Path) -> list[int]:
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=True,
+    )
+    pids = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and "-m pausanias.worker" in fields[1] and str(config_path) in fields[1]:
+            pids.append(int(fields[0]))
+    return pids
+
+
 def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
     pytest.importorskip("numpy")
     config_path, config = make_config(tmp_path)
@@ -100,12 +112,26 @@ def test_concurrent_startup_launches_one_real_worker(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config)
     script = """
-import sys, time
+import os, sys, time
 from pathlib import Path
 from pausanias.config import load_config
+import pausanias.worker as worker_module
 from pausanias.worker import ensure_worker
 config_path = Path(sys.argv[1])
 config = load_config(config_path)
+write_record = worker_module._write_record
+barrier_prefix = config_path.with_name(config_path.name + ".launch-barrier.")
+def synchronized_write(path, record):
+    write_record(path, record)
+    if record.get("pid") == 0:
+        marker = Path(str(barrier_prefix) + str(os.getpid()))
+        marker.write_text("ready")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if len(list(barrier_prefix.parent.glob(barrier_prefix.name + "*"))) >= 4:
+                break
+            time.sleep(0.001)
+worker_module._write_record = synchronized_write
 result = ensure_worker(config, config_path, time.perf_counter() + 2)
 print(result is not None, flush=True)
 """
@@ -115,15 +141,22 @@ print(result is not None, flush=True)
     processes = [subprocess.Popen(
         [sys.executable, "-c", script, str(config_path)],
         cwd=repository, env=environment, stdout=subprocess.PIPE, text=True,
-    ) for _ in range(2)]
+    ) for _ in range(4)]
     try:
         outputs = [process.communicate(timeout=4)[0].strip() for process in processes]
-        assert outputs == ["True", "True"]
-        record = _read_record(worker_paths(config.database).lock)
-        assert isinstance(record.get("pid"), int)
-        assert pid_alive(record["pid"])
+        assert outputs == ["True"] * 4
+        paths = worker_paths(config.database)
+        pids = worker_pids(config_path)
+        assert len(pids) == 1
+        assert all(pid_alive(pid) for pid in pids)
+        assert socket_ready(paths.socket)
     finally:
         stop_worker(config.database)
+        for pid in worker_pids(config_path):
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
 
 
 def test_waiter_timeout_returns_lexical_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -264,3 +297,14 @@ def test_deadline_cancels_worker_and_returns_before_deadline(tmp_path: Path, mon
     finally:
         worker._stopping.set()
         thread.join(timeout=2)
+
+
+def test_cancel_before_registration_is_retained(tmp_path: Path):
+    _, config = make_config(tmp_path)
+    worker = PersistentWorker(config)
+
+    assert worker._cancel_request("request-before-registration") is False
+    event = worker._register_request("request-before-registration")
+
+    assert event.is_set()
+    assert worker._cancellation_tombstones == {}

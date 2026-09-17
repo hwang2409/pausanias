@@ -21,7 +21,7 @@ from .core import index, search
 from .worker import stop_worker
 from .splitter import split_markdown
 from .synth import generate_corpus
-from .model_bundle import MODEL_BUNDLE_MANIFEST
+from .model_bundle import BundleError, _resolve_active_bundle, manifest_fingerprint, verify_bundle
 
 
 IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
@@ -372,11 +372,12 @@ def run_benchmark(
         queries = _make_queries(documents, query_count, seed)
 
         started = time.perf_counter()
-        index(config, rebuild=True)
+        encoding_metrics = {"section_count": 0.0, "elapsed_ms": 0.0}
+        index(config, rebuild=True, encoding_metrics=encoding_metrics)
         index_build_ms = _positive_milliseconds(time.perf_counter() - started)
 
         started = time.perf_counter()
-        index(config)
+        index(config, encoding_metrics=encoding_metrics)
         refresh_ms = _positive_milliseconds(time.perf_counter() - started)
 
         first_query = queries[0]
@@ -468,7 +469,9 @@ def run_benchmark(
             },
         }
         if hook_path:
-            report["hook_path"] = _run_hook_benchmark(config_path, config, queries, query_count)
+            report["hook_path"] = _run_hook_benchmark(
+                config_path, config, queries, query_count, encoding_metrics,
+            )
         return report
 
 
@@ -523,14 +526,35 @@ def _phase_report(samples: list[dict], corpus_section_count: int = 0) -> dict[st
         "corpus_section_count": corpus_section_count,
         "throughput": {
             "queries_per_second": len(samples) / max(sum(float(sample.get("hook_total_ms", 0.000001)) for sample in samples) / 1000.0, 0.000001),
-            "encoded_sections_per_second": corpus_section_count / max(sum(float(sample.get("encode_ms", 0.000001)) for sample in samples) / 1000.0, 0.000001),
         },
         "samples": len(samples),
         "cache_states": sorted({str(sample.get("cache_state", "unknown")) for sample in samples}),
     }
 
 
-def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySpec], query_count: int) -> dict[str, object]:
+def _read_verified_bundle_manifest(bundle_dir: Path) -> dict[str, object] | None:
+    try:
+        root = _resolve_active_bundle(bundle_dir)
+        manifest_path = root / "manifest.json"
+        stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict):
+            raise BundleError("bundle manifest must be an object")
+        verify_bundle(bundle_dir)
+        fingerprint = stored.get("manifest_fingerprint")
+        if not isinstance(fingerprint, str) or manifest_fingerprint(stored) != fingerprint:
+            raise BundleError("bundle manifest fingerprint is invalid")
+        return stored
+    except (BundleError, OSError, ValueError, TypeError):
+        return None
+
+
+def _run_hook_benchmark(
+    config_path: Path,
+    config: Config,
+    queries: list[QuerySpec],
+    query_count: int,
+    encoding_metrics: dict[str, float] | None = None,
+) -> dict[str, object]:
     _hook_process(config_path, queries[0])
     warm_samples = [_hook_process(config_path, query)["metrics"] for query in queries]
     cold_samples: list[dict] = []
@@ -541,6 +565,14 @@ def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySp
         corpus_section_count = int(connection.execute("SELECT count(*) FROM sections").fetchone()[0])
     warm = _phase_report(warm_samples, corpus_section_count)
     cold = _phase_report(cold_samples, corpus_section_count)
+    encoded_sections = int((encoding_metrics or {}).get("section_count", 0.0))
+    encoded_ms = float((encoding_metrics or {}).get("elapsed_ms", 0.0))
+    encoded_throughput = (
+        encoded_sections / max(encoded_ms / 1000.0, 0.000001)
+        if encoded_sections else None
+    )
+    bundle_manifest = _read_verified_bundle_manifest(config.bundle_dir)
+    runtime = bundle_manifest.get("runtime") if bundle_manifest is not None else None
     semantic_enabled = any(not bool(sample.get("fallback", False)) for sample in warm_samples + cold_samples)
     if not semantic_enabled:
         reason = "semantic backend unavailable; lexical gate remains active"
@@ -564,17 +596,21 @@ def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySp
         "throughput": {
             "warm_queries_per_second": warm["throughput"]["queries_per_second"],
             "cold_queries_per_second": cold["throughput"]["queries_per_second"],
-            "warm_encoded_sections_per_second": warm["throughput"]["encoded_sections_per_second"],
-            "cold_encoded_sections_per_second": cold["throughput"]["encoded_sections_per_second"],
+            "encoded_sections_per_second": encoded_throughput,
         },
+        "encoded_section_count": encoded_sections,
+        "encoded_section_ms": encoded_ms if encoded_sections else None,
         "candidate_count": warm["candidate_count"] + cold["candidate_count"],
         "corpus_size": {
             "files": sum(len(_markdown_files(root.path)) for root in config.roots),
             "sections": corpus_section_count,
         },
         "platform": platform.platform(),
-        "provider": MODEL_BUNDLE_MANIFEST["runtime"]["provider"],
-        "model_manifest": MODEL_BUNDLE_MANIFEST,
+        "provider": runtime.get("provider") if isinstance(runtime, dict) else None,
+        "model_manifest": bundle_manifest,
+        "model_manifest_fingerprint": (
+            bundle_manifest.get("manifest_fingerprint") if bundle_manifest is not None else None
+        ),
         "warm": {**warm, "gate": warm_gate},
         "cold": {**cold, "gate": cold_gate},
         "gates": {"warm_scan_path": warm_gate, "cold_scan_path": cold_gate},
@@ -631,6 +667,7 @@ def format_report(report: dict) -> str:
             "",
             f"hook corpus: {corpus['files']} files, {corpus['sections']} sections; candidates={hook['candidate_count']}",
             f"hook platform: {hook['platform']}; provider: {hook['provider']}",
+            f"encoded sections/s: {hook['throughput']['encoded_sections_per_second'] or 'n/a'}",
             "hook-path stage metrics (p50 / p95 / max ms)",
         ]
         for phase_name in ("warm", "cold"):

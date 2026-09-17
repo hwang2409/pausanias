@@ -115,6 +115,52 @@ def test_hook_gate_fails_when_parent_budget_is_exceeded(tmp_path: Path, monkeypa
     assert result["warm"]["gate"]["passed"] is False
 
 
+def test_hook_report_uses_index_encoding_throughput(tmp_path: Path, monkeypatch):
+    config_path, config = _benchmark_config(tmp_path)
+    queries = [QuerySpec("alpha", project="real")]
+    metrics = {
+        "hook_total_ms": 1.0,
+        "worker_startup_ms": 1.0,
+        "model_load_ms": 1.0,
+        "matrix_load_ms": 1.0,
+        "encode_ms": 1.0,
+        "scan_ms": 1.0,
+        "fallback_ms": 1.0,
+        "fts_search_ms": 1.0,
+        "hybrid_overhead_ms": 1.0,
+        "fallback": False,
+        "cache_state": "warm",
+    }
+    monkeypatch.setattr(bench, "_hook_process", lambda *args: {"metrics": dict(metrics), "items": []})
+    monkeypatch.setattr(bench, "stop_worker", lambda *args: None)
+    monkeypatch.setattr(
+        bench,
+        "_read_verified_bundle_manifest",
+        lambda *args: {"manifest_fingerprint": "from-bundle", "runtime": {"provider": "test"}},
+    )
+
+    result = _run_hook_benchmark(
+        config_path, config, queries, 1, {"section_count": 4.0, "elapsed_ms": 200.0},
+    )
+
+    assert result["throughput"]["encoded_sections_per_second"] == 20.0
+    assert result["model_manifest_fingerprint"] == "from-bundle"
+    assert "encoded_sections_per_second" not in result["warm"]["throughput"]
+    assert "encoded_sections_per_second" not in result["cold"]["throughput"]
+
+
+def test_bundle_fingerprint_is_read_from_verified_manifest(tmp_path: Path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    manifest = {"format_version": 1, "model_id": "test"}
+    stored = {**manifest, "manifest_fingerprint": bench.manifest_fingerprint(manifest)}
+    (bundle / "manifest.json").write_text(json.dumps(stored))
+    monkeypatch.setattr(bench, "_resolve_active_bundle", lambda path: bundle)
+    monkeypatch.setattr(bench, "verify_bundle", lambda path: None)
+
+    assert bench._read_verified_bundle_manifest(tmp_path / "pointer") == stored
+
+
 def _benchmark_config(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()

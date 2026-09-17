@@ -27,6 +27,7 @@ from .vectors import Candidate, OnnxEncoder, SemanticError, encoder_vectors, sca
 ADAPTER_DEADLINE_MS = 750.0
 DEFAULT_IDLE_SECONDS = 30 * 60
 SOCKET_TIMEOUT_SECONDS = 0.05
+CANCELLATION_TOMBSTONE_SECONDS = 5.0
 
 
 class WorkerError(RuntimeError):
@@ -167,6 +168,7 @@ class PersistentWorker:
         self._matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] = {}
         self._matrix_lock = threading.Lock()
         self._requests: dict[str, threading.Event] = {}
+        self._cancellation_tombstones: dict[str, float] = {}
         self._requests_lock = threading.Lock()
         self._started = time.perf_counter()
         self._stopping = threading.Event()
@@ -374,9 +376,7 @@ class PersistentWorker:
                 response = {"cancelled": cancelled_request}
             else:
                 request_id = request.get("request_id") if isinstance(request.get("request_id"), str) else uuid.uuid4().hex
-                cancelled = threading.Event()
-                with self._requests_lock:
-                    self._requests[request_id] = cancelled
+                cancelled = self._register_request(request_id)
                 response = self._query(request, cancelled)
         except RequestCancelled:
             response = {"cancelled": True}
@@ -417,6 +417,7 @@ class PersistentWorker:
                 try:
                     connection, _ = server.accept()
                 except TimeoutError:
+                    self._prune_cancellation_tombstones()
                     continue
                 last_request = time.monotonic()
                 threading.Thread(target=self._serve_connection, args=(connection,), daemon=True).start()
@@ -434,11 +435,37 @@ class PersistentWorker:
         if not isinstance(request_id, str):
             return False
         with self._requests_lock:
+            self._prune_cancellation_tombstones_locked(time.monotonic())
             event = self._requests.get(request_id)
-        if event is None:
-            return False
-        event.set()
+            if event is None:
+                self._cancellation_tombstones[request_id] = time.monotonic()
+                return False
+            event.set()
         return True
+
+    def _register_request(self, request_id: str) -> threading.Event:
+        event = threading.Event()
+        with self._requests_lock:
+            now = time.monotonic()
+            self._prune_cancellation_tombstones_locked(now)
+            if request_id in self._cancellation_tombstones:
+                event.set()
+                del self._cancellation_tombstones[request_id]
+            self._requests[request_id] = event
+        return event
+
+    def _prune_cancellation_tombstones(self) -> None:
+        with self._requests_lock:
+            self._prune_cancellation_tombstones_locked(time.monotonic())
+
+    def _prune_cancellation_tombstones_locked(self, now: float) -> None:
+        expired = [
+            request_id
+            for request_id, cancelled_at in self._cancellation_tombstones.items()
+            if now - cancelled_at >= CANCELLATION_TOMBSTONE_SECONDS
+        ]
+        for request_id in expired:
+            del self._cancellation_tombstones[request_id]
 
 
 def _acquire_lock(path: Path) -> int | None:
