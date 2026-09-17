@@ -1,0 +1,7 @@
+{
+  "category": 4,
+  "question": "What color was the bicycle?",
+  "answer": "blue",
+  "response": "The bicycle was blue.",
+  "evidence_context": "[conversation-00--session-01.md#00000005-00000007] Alex: blue bicycle"
+}

@@ -1,0 +1,691 @@
+"""Offline-first LOCOMO ingest, search, and evaluation runner."""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+import unicodedata
+from urllib.request import Request, urlopen
+
+from pausanias.config import Config, Root
+from pausanias.core import Candidate, index, search
+
+from eval.schema import (
+    Checkpoint,
+    CutoffOutcome,
+    Evaluation,
+    Metadata,
+    Metrics,
+    PromptMetadata,
+    RetrievalResult,
+    UnifiedResult,
+    atomic_write_json,
+    fingerprint,
+    latency_summary,
+    read_json,
+    utc_now,
+)
+from eval.vendor.mem0.benchmarks.locomo.prompts import (
+    CATEGORIES_TO_EVALUATE,
+    CATEGORY_NAMES,
+    JUDGE_SYSTEM_PROMPT,
+    get_answer_generation_prompt,
+    get_judge_prompt,
+    get_judge_prompt_with_evidence,
+    preprocess_answer,
+)
+
+
+DATASET_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
+DATASET_COMMIT = "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376"
+DATASET_SOURCE_COMMIT = DATASET_COMMIT
+DATASET_SHA256 = "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
+DATASET_DIR = Path("datasets/locomo")
+DATASET_PATH = DATASET_DIR / "locomo10.json"
+PROMPT_VERSION = "mem0-locomo-4b61c5d"
+PROMPT_FIXTURE_VERSION = "golden-prompts-v1"
+DEFAULT_CUTOFFS = (10, 20, 50, 200)
+DEFAULT_TOP_K = 200
+COMPARABLE_CATEGORIES = ("single-hop", "multi-hop", "temporal", "open-domain")
+
+
+class LocomoError(RuntimeError):
+    """Raised for invalid benchmark input or a failed stage."""
+
+
+@dataclass(frozen=True)
+class RenderedSession:
+    path: str
+    text: str
+    turn_ranges: dict[str, tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class LLMReply:
+    text: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+
+class StubTransport:
+    """Deterministic transport for tests. It never performs network I/O."""
+
+    def __init__(self, responses: list[str | dict[str, object]]):
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, *, provider: str, model: str, system: str, user: str, structured: bool = False) -> LLMReply:
+        self.calls.append({"provider": provider, "model": model, "system": system, "user": user, "structured": structured})
+        if not self.responses:
+            raise LocomoError("stub transport has no response")
+        response = self.responses.pop(0)
+        if isinstance(response, dict):
+            return LLMReply(json.dumps(response))
+        return LLMReply(response)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _normalize(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _session_number(key: str) -> int:
+    match = re.fullmatch(r"session_(\d+)", key)
+    if match is None:
+        raise LocomoError(f"invalid session key: {key}")
+    return int(match.group(1))
+
+
+def _date_key(value: str) -> tuple[int, object]:
+    for fmt in ("%I:%M %p on %d %B, %Y", "%I:%M %p on %d %b, %Y"):
+        try:
+            return (0, datetime.strptime(value, fmt))
+        except ValueError:
+            pass
+    return (1, value)
+
+
+def sorted_sessions(conversation: dict[str, object]) -> list[tuple[str, str, list[dict[str, object]]]]:
+    sessions = []
+    for key, turns in conversation.items():
+        if not re.fullmatch(r"session_\d+", key):
+            continue
+        if not isinstance(turns, list) or not all(isinstance(turn, dict) for turn in turns):
+            raise LocomoError(f"{key} must contain turn objects")
+        date = _normalize(conversation.get(f"{key}_date_time"))
+        sessions.append((key, date, turns))
+    return sorted(sessions, key=lambda item: (_date_key(item[1]), _session_number(item[0])))
+
+
+get_sorted_sessions = sorted_sessions
+
+
+def render_session(conversation_index: int, session_key: str, session_date: str, turns: list[dict[str, object]]) -> RenderedSession:
+    session_number = _session_number(session_key)
+    blocks = [
+        f"# conversation {conversation_index:02d}",
+        f"## session {session_number:02d} | timestamp: {_normalize(session_date)}",
+    ]
+    ranges: dict[str, tuple[int, int]] = {}
+    for turn in turns:
+        dia_id = _normalize(turn.get("dia_id"))
+        speaker = _normalize(turn.get("speaker"))
+        turn_date = _normalize(turn.get("session_date_time")) or _normalize(session_date)
+        text = _normalize(turn.get("text"))
+        query = _normalize(turn.get("query"))
+        caption = _normalize(turn.get("blip_caption"))
+        if query or caption:
+            metadata = f"[image query: {query}; caption: {caption}]"
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += metadata
+        heading = f"### turn {dia_id} | speaker: {speaker} | timestamp: {turn_date}"
+        blocks.append(f"{heading}\n\n{text}")
+        start = sum(len(block.split("\n")) for block in blocks[:-1]) + len(blocks[:-1]) + 1
+        end = start + 1 + len(text.split("\n"))
+        ranges[dia_id] = (start, end)
+    content = "\n\n".join(blocks) + "\n"
+    path = f"conversation-{conversation_index:02d}--session-{session_number:02d}.md"
+    return RenderedSession(path, content, ranges)
+
+
+def evidence_id(path: str, line_start: int, line_end: int) -> str:
+    normalized = unicodedata.normalize("NFC", path).replace("\\", "/")
+    pure = Path(normalized)
+    if pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
+        raise LocomoError("evidence path must be repository-relative")
+    return f"{normalized}#{line_start:08d}-{line_end:08d}"
+
+
+def _dataset_fingerprint(path: Path) -> str:
+    return _sha256(path.read_bytes())
+
+
+def _validate_dataset(data: object, *, pinned: bool) -> list[dict[str, object]]:
+    if not isinstance(data, list) or (pinned and len(data) != 10):
+        raise LocomoError("LOCOMO dataset must contain ten conversations")
+    conversations: list[dict[str, object]] = []
+    counts: defaultdict[int, int] = defaultdict(int)
+    for entry in data:
+        if not isinstance(entry, dict) or not isinstance(entry.get("conversation"), dict):
+            raise LocomoError("each LOCOMO entry must contain a conversation")
+        conversations.append(entry)
+        for question in entry.get("qa", []):
+            if isinstance(question, dict) and isinstance(question.get("category"), int):
+                counts[question["category"]] += 1
+    if pinned and counts != {1: 282, 2: 321, 3: 96, 4: 841, 5: 446}:
+        raise LocomoError(f"unexpected LOCOMO category counts: {dict(counts)}")
+    return conversations
+
+
+def fetch_dataset(path: Path = DATASET_PATH) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        data = path.read_bytes()
+        if _sha256(data) != DATASET_SHA256:
+            raise LocomoError(f"cached LOCOMO dataset hash mismatch: {path}")
+        _validate_dataset(json.loads(data), pinned=True)
+        return path
+    request = Request(DATASET_URL, headers={"User-Agent": "pausanias-locomo/1"})
+    data = urlopen(request, timeout=30).read()
+    if _sha256(data) != DATASET_SHA256:
+        raise LocomoError("downloaded LOCOMO dataset hash mismatch")
+    _validate_dataset(json.loads(data), pinned=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(data)
+    os.replace(temporary, path)
+    return path
+
+
+def load_dataset(path: Path | None = None) -> tuple[list[dict[str, object]], dict[str, object]]:
+    selected = fetch_dataset() if path is None else path
+    data = selected.read_bytes()
+    entries = _validate_dataset(json.loads(data), pinned=path is None)
+    return entries, {
+        "name": "locomo10",
+        "version": DATASET_COMMIT if path is None else "fixture",
+        "url": DATASET_URL if path is None else None,
+        "sha256": _sha256(data),
+        "fingerprint": _sha256(data),
+    }
+
+
+def _render_entries(entries: list[dict[str, object]], notes: Path) -> dict[tuple[int, str], RenderedSession]:
+    rendered: dict[tuple[int, str], RenderedSession] = {}
+    for fallback_index, entry in enumerate(entries):
+        conversation_index = int(entry.get("_conversation_index", fallback_index))
+        conversation = entry["conversation"]
+        if not isinstance(conversation, dict):
+            raise LocomoError("conversation must be an object")
+        for key, date, turns in sorted_sessions(conversation):
+            rendered_session = render_session(conversation_index, key, date, turns)
+            path = notes / rendered_session.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(rendered_session.text, encoding="utf-8", newline="\n")
+            os.replace(temporary, path)
+            rendered[(conversation_index, key)] = rendered_session
+    return rendered
+
+
+def _evidence_targets(entry: dict[str, object], conversation_index: int, rendered: dict[tuple[int, str], RenderedSession]) -> dict[str, list[dict[str, object]]]:
+    conversation = entry["conversation"]
+    if not isinstance(conversation, dict):
+        raise LocomoError("conversation must be an object")
+    by_dia: dict[str, tuple[str, tuple[int, int]]] = {}
+    for session_key, _, turns in sorted_sessions(conversation):
+        session = rendered[(conversation_index, session_key)]
+        for turn in turns:
+            dia_id = _normalize(turn.get("dia_id"))
+            if dia_id in session.turn_ranges:
+                by_dia[dia_id] = (session.path, session.turn_ranges[dia_id])
+    result: dict[str, list[dict[str, object]]] = {}
+    for question in entry.get("qa", []):
+        if not isinstance(question, dict) or question.get("category") not in CATEGORIES_TO_EVALUATE:
+            continue
+        targets = []
+        for reference in question.get("evidence", []):
+            if reference not in by_dia:
+                continue
+            path, (start, end) = by_dia[reference]
+            targets.append({"evidence_id": evidence_id(path, start, end), "path": path, "line_start": start, "line_end": end})
+        result[str(question.get("question"))] = sorted(targets, key=lambda item: item["evidence_id"].encode("utf-8"))
+    return result
+
+
+def _candidate_result(candidate: Candidate, notes: Path, rank: int) -> RetrievalResult:
+    return RetrievalResult(
+        rank=rank,
+        section_id=candidate.section_id,
+        source_path=Path(candidate.canonical_path).resolve().relative_to(notes.resolve()).as_posix(),
+        root_id=candidate.root_id,
+        project=candidate.project_scope,
+        heading=candidate.heading,
+        line_start=candidate.line_start,
+        line_end=candidate.line_end,
+        excerpt=candidate.text,
+        content_hash=candidate.content_hash,
+        score=candidate.score,
+        reason=candidate.reason,
+    )
+
+
+def _target_matches(result: RetrievalResult, target: dict[str, object]) -> bool:
+    return result.source_path == target["path"] and result.line_start <= int(target["line_start"]) and result.line_end >= int(target["line_end"])
+
+
+def retrieval_outcome(results: tuple[RetrievalResult, ...], targets: list[dict[str, object]], cutoff: int) -> tuple[int, float, float, float]:
+    selected = results[:cutoff]
+    matched_targets = {target["evidence_id"] for target in targets if any(_target_matches(result, target) for result in selected)}
+    matched_results = {result.section_id for result in selected if any(_target_matches(result, target) for target in targets)}
+    relevant = len(matched_targets)
+    recall = relevant / len(targets) if targets else 0.0
+    precision = len(matched_results) / len(selected) if selected else 0.0
+    mrr = 1.0 / next((result.rank for result in selected if result.section_id in matched_results), 1_000_000)
+    if not matched_results:
+        mrr = 0.0
+    return relevant, recall, precision, mrr
+
+
+def _prompt_metadata(prompt: str, provider: str, model: str, reply: LLMReply | None, slots: tuple[str, ...]) -> PromptMetadata:
+    return PromptMetadata(
+        prompt_version=PROMPT_VERSION,
+        template_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        slot_names=slots,
+        provider=provider,
+        model=model,
+        prompt_tokens=reply.prompt_tokens if reply else None,
+        completion_tokens=reply.completion_tokens if reply else None,
+    )
+
+
+def build_answer_prompt(question: str, results: list[dict[str, object]], reference_date: str | None, user_profile: dict[str, object] | None) -> str:
+    return get_answer_generation_prompt(question, results, reference_date=reference_date, user_profile=user_profile)
+
+
+def build_judge_prompt(category: int, question: str, answer: str, response: str, evidence_context: str | None = None) -> str:
+    if evidence_context:
+        return get_judge_prompt_with_evidence(category, question, answer, response, evidence_context)
+    return get_judge_prompt(category, question, answer, response)
+
+
+def _extract_answer(text: str) -> str:
+    return text.rsplit("ANSWER:", 1)[-1].strip() if "ANSWER:" in text else text
+
+
+def _call_transport(transport: object, *, provider: str, model: str, system: str, user: str, structured: bool = False) -> LLMReply:
+    reply = transport(provider=provider, model=model, system=system, user=user, structured=structured)
+    if isinstance(reply, LLMReply):
+        return reply
+    if isinstance(reply, str):
+        return LLMReply(reply)
+    raise LocomoError("LLM transport returned an invalid response")
+
+
+def _required_key(provider: str) -> bool:
+    if provider == "azure":
+        return bool(os.environ.get("AZURE_OPENAI_API_KEY") and os.environ.get("AZURE_OPENAI_ENDPOINT"))
+    return bool(os.environ.get({"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}.get(provider, "")))
+
+
+def _http_transport(*, provider: str, model: str, system: str, user: str, structured: bool = False) -> LLMReply:
+    body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if provider == "openai":
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"}
+    elif provider == "anthropic":
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {"x-api-key": os.environ["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"}
+        body = {"model": model, "max_tokens": 4096, "system": system, "messages": [{"role": "user", "content": user}]}
+    elif provider == "azure":
+        endpoint = os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/")
+        url = f"{endpoint}/openai/deployments/{model}/chat/completions?api-version=2024-02-15-preview"
+        headers = {"api-key": os.environ["AZURE_OPENAI_API_KEY"]}
+    else:
+        raise LocomoError(f"real provider adapter is not configured for {provider}")
+    request = Request(url, data=json.dumps(body).encode(), headers={**headers, "Content-Type": "application/json"}, method="POST")
+    response = json.loads(urlopen(request, timeout=120).read())
+    if provider == "anthropic":
+        choice = response["content"][0]["text"]
+        usage = response.get("usage", {})
+        return LLMReply(choice, usage.get("input_tokens"), usage.get("output_tokens"))
+    choice = response["choices"][0]["message"]["content"]
+    usage = response.get("usage", {})
+    return LLMReply(choice, usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+
+def _call_with_retries(transport: object, **kwargs: object) -> LLMReply:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            return _call_transport(transport, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4 and not isinstance(transport, StubTransport):
+                time.sleep((attempt + 1) * 2)
+    if last_error is None:
+        raise LocomoError("LLM call failed without an error")
+    raise last_error
+
+
+def _question_records(entries: list[dict[str, object]], rendered: dict[tuple[int, str], RenderedSession]) -> list[dict[str, object]]:
+    records = []
+    for fallback_index, entry in enumerate(entries):
+        conversation_index = int(entry.get("_conversation_index", fallback_index))
+        targets = _evidence_targets(entry, conversation_index, rendered)
+        for question_index, question in enumerate(entry.get("qa", [])):
+            if not isinstance(question, dict) or question.get("category") not in CATEGORIES_TO_EVALUATE:
+                continue
+            records.append({
+                "case_id": f"conv{conversation_index}_q{question_index}",
+                "conversation_index": conversation_index,
+                "question_index": question_index,
+                "question": _normalize(question.get("question")),
+                "category": CATEGORY_NAMES[int(question["category"])],
+                "category_number": int(question["category"]),
+                "ground_truth": _normalize(question.get("answer")),
+                "targets": targets.get(_normalize(question.get("question")), []),
+                "evidence": question.get("evidence", []),
+            })
+    return records
+
+
+def _reference_date(entry: dict[str, object]) -> str | None:
+    conversation = entry["conversation"]
+    if not isinstance(conversation, dict):
+        raise LocomoError("conversation must be an object")
+    sessions = sorted_sessions(conversation)
+    return sessions[-1][1] if sessions else None
+
+
+def _search_config(notes: Path, database: Path) -> Config:
+    return Config((Root("locomo", notes.resolve(), "locomo", ()),), frozenset(), (), database.resolve(), 12000)
+
+
+def _search_record(record: dict[str, object], entries: list[dict[str, object]], config: Config, notes: Path, top_k: int) -> dict[str, object]:
+    entry = next(entry for entry in entries if int(entry.get("_conversation_index", -1)) == int(record["conversation_index"]))
+    source_dates = {
+        f"conversation-{int(record['conversation_index']):02d}--session-{_session_number(session_key):02d}.md": date
+        for session_key, date, _ in sorted_sessions(entry["conversation"])
+    }
+    evidence_lines = []
+    for target in record["targets"]:
+        lines = notes.joinpath(str(target["path"])).read_text(encoding="utf-8").splitlines()
+        excerpt = "\n".join(lines[int(target["line_start"]) - 1:int(target["line_end"])])
+        evidence_lines.append(f"[{target['evidence_id']}] {excerpt}")
+    start = time.perf_counter()
+    candidates = search(config, str(record["question"]), project="locomo", limit=top_k)
+    elapsed = (time.perf_counter() - start) * 1000
+    return {
+        **record,
+        "search_latency_ms": elapsed,
+        "retrieval_fingerprint": fingerprint([candidate.section_id for candidate in candidates]),
+        "retrieval_results": [asdict(_candidate_result(candidate, notes, rank)) for rank, candidate in enumerate(candidates, 1)],
+        "reference_date": _reference_date(entry),
+        "source_dates": source_dates,
+        "evidence_context": "\n".join(evidence_lines),
+    }
+
+
+def _valid_checkpoint(path: Path, run_id: str, config: dict[str, object], case_id: str, dataset_fingerprint: str, corpus_fingerprint: str | None, index_generation: int) -> dict[str, object] | None:
+    try:
+        value = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if value.get("checkpoint_version") != "pausanias.eval.checkpoint.v1" or value.get("stage") != "search" or value.get("run_id") != run_id or value.get("case_id") != case_id or value.get("config") != config or value.get("dataset_fingerprint") != dataset_fingerprint or value.get("corpus_fingerprint") != corpus_fingerprint or value.get("index_generation") != index_generation or value.get("status") != "complete":
+        return None
+    output = value.get("output")
+    if not isinstance(output, dict) or output.get("case_id") != case_id or not isinstance(output.get("question"), str) or not isinstance(output.get("search_latency_ms"), (int, float)) or not isinstance(output.get("retrieval_results"), list) or not isinstance(output.get("retrieval_fingerprint"), str):
+        return None
+    return value
+
+
+def _common_cutoff(
+    record: dict[str, object],
+    results: tuple[RetrievalResult, ...],
+    cutoff: int,
+    *,
+    answerer_model: str,
+    answerer_provider: str,
+    judge_model: str,
+    judge_provider: str,
+    with_evidence: bool,
+    user_profile: dict[str, object] | None,
+    transport: object,
+) -> CutoffOutcome:
+    targets = list(record["targets"])
+    relevant, recall, precision, mrr = retrieval_outcome(results, targets, cutoff)
+    selected = results[:cutoff]
+    source_dates = record.get("source_dates", {})
+    answer_results = [
+        {"memory": item.excerpt, "created_at": str(source_dates.get(item.source_path, "")), "section_id": item.section_id}
+        for item in selected[:200]
+    ]
+    answer_prompt = build_answer_prompt(str(record["question"]), answer_results, record.get("reference_date"), user_profile)
+    answer_meta: PromptMetadata
+    judge_meta: PromptMetadata
+    try:
+        answer_reply = _call_with_retries(transport, provider=answerer_provider, model=answerer_model, system="", user=answer_prompt)
+        generated = _extract_answer(answer_reply.text)
+        answer_meta = _prompt_metadata(answer_prompt, answerer_provider, answerer_model, answer_reply, ("reference_date", "memories", "question"))
+    except Exception:
+        answer_meta = _prompt_metadata(answer_prompt, answerer_provider, answerer_model, None, ("reference_date", "memories", "question"))
+        return CutoffOutcome(len(selected), relevant, recall, precision, mrr, None, 0, 0.0, False, None, "ERROR", None, answerer_model, "answerer_error", {"answerer": answer_meta})
+    evidence_context = str(record.get("evidence_context", "")) if with_evidence else None
+    judge_prompt = build_judge_prompt(int(record["category_number"]), str(record["question"]), preprocess_answer(int(record["category_number"]), str(record["ground_truth"])), generated, evidence_context)
+    try:
+        judge_reply = _call_with_retries(transport, provider=judge_provider, model=judge_model, system=JUDGE_SYSTEM_PROMPT, user=judge_prompt, structured=True)
+        payload = json.loads(judge_reply.text)
+        if not isinstance(payload, dict) or str(payload.get("label", "")).upper() not in {"CORRECT", "WRONG"}:
+            raise ValueError("invalid judge label")
+        judgment = str(payload["label"]).upper()
+        score = 1.0 if judgment == "CORRECT" else 0.0
+        reason = str(payload.get("reasoning", ""))
+        judge_meta = _prompt_metadata(judge_prompt, judge_provider, judge_model, judge_reply, ("question", "answer", "response"))
+        return CutoffOutcome(len(selected), relevant, recall, precision, mrr, None, 0, score, score >= 0.5, generated, judgment, reason, answerer_model, None, {"answerer": answer_meta, "judge": judge_meta})
+    except Exception:
+        judge_meta = _prompt_metadata(judge_prompt, judge_provider, judge_model, None, ("question", "answer", "response"))
+        return CutoffOutcome(len(selected), relevant, recall, precision, mrr, None, 0, 0.0, False, generated, "ERROR", None, answerer_model, "judge_error", {"answerer": answer_meta, "judge": judge_meta})
+
+
+def _common_metrics(evaluations: list[Evaluation], cutoffs: tuple[int, ...]) -> Metrics:
+    categories = list(COMPARABLE_CATEGORIES)
+    by_category = {}
+    primary = max(cutoffs)
+    for category in categories:
+        selected = [item for item in evaluations if item.category == category]
+        outcomes = [item.cutoff_outcomes[str(primary)] for item in selected]
+        errors = sum(outcome.error is not None for outcome in outcomes)
+        by_category[category] = {"total": len(outcomes), "correct": sum(outcome.score >= 0.5 for outcome in outcomes), "accuracy": 100 * sum(outcome.score >= 0.5 for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "avg_score": 100 * sum(outcome.score for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "errors": errors}
+    by_cutoff = {}
+    for cutoff in cutoffs:
+        groups = {}
+        for category in categories:
+            outcomes = [item.cutoff_outcomes[str(cutoff)] for item in evaluations if item.category == category]
+            groups[category] = {"total": len(outcomes), "correct": sum(outcome.score >= 0.5 for outcome in outcomes), "accuracy": 100 * sum(outcome.score >= 0.5 for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "avg_score": 100 * sum(outcome.score for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "errors": sum(outcome.error is not None for outcome in outcomes)}
+        outcomes = [item.cutoff_outcomes[str(cutoff)] for item in evaluations]
+        by_cutoff[str(cutoff)] = {"cutoff": cutoff, "overall": {"total": len(outcomes), "correct": sum(outcome.score >= 0.5 for outcome in outcomes), "accuracy": 100 * sum(outcome.score >= 0.5 for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "avg_score": 100 * sum(outcome.score for outcome in outcomes) / len(outcomes) if outcomes else 0.0, "errors": sum(outcome.error is not None for outcome in outcomes)}, "by_category": groups}
+    primary_outcomes = [item.cutoff_outcomes[str(primary)] for item in evaluations]
+    total = len(primary_outcomes)
+    errors = sum(outcome.error is not None for outcome in primary_outcomes)
+    return Metrics(
+        overall_accuracy=100 * sum(outcome.score >= 0.5 for outcome in primary_outcomes) / total if total else 0.0,
+        overall_avg_score=100 * sum(outcome.score for outcome in primary_outcomes) / total if total else 0.0,
+        total=total,
+        correct=sum(outcome.score >= 0.5 for outcome in primary_outcomes),
+        errors=errors,
+        by_category=by_category,
+        by_cutoff=by_cutoff,
+        latency_ms={"overall": latency_summary([item.search_latency_ms for item in evaluations]), "by_category": {category: latency_summary([item.search_latency_ms for item in evaluations if item.category == category]) for category in categories}},
+    )
+
+
+def run_locomo(
+    *,
+    run_id: str,
+    dataset_path: Path | None = None,
+    results_dir: Path = Path("results"),
+    conversations: tuple[int, ...] | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    cutoffs: tuple[int, ...] = DEFAULT_CUTOFFS,
+    answerer_model: str = "gpt-4o-mini",
+    judge_model: str = "gpt-4o-mini",
+    provider: str = "openai",
+    judge_provider: str | None = None,
+    with_evidence: bool = False,
+    user_profile: dict[str, object] | None = None,
+    predict_only: bool = False,
+    evaluate_only: bool = False,
+    resume: bool = False,
+    transport: object | None = None,
+) -> UnifiedResult | None:
+    if top_k < max(cutoffs) or not cutoffs:
+        raise ValueError("top-k must include all cutoffs")
+    selected_judge_provider = judge_provider or provider
+    if not predict_only and transport is None and (not _required_key(provider) or not _required_key(selected_judge_provider)):
+        raise LocomoError("answerer and judge API keys are required for evaluation")
+    if dataset_path is None and predict_only:
+        dataset_path = fetch_dataset()
+    entries, dataset = load_dataset(dataset_path)
+    selected = set(range(len(entries))) if conversations is None else set(conversations)
+    entries = [dict(entry, _conversation_index=index) for index, entry in enumerate(entries) if index in selected]
+    run_root = results_dir / "locomo" / run_id
+    workspace = run_root / "workspace"
+    notes = workspace / "notes"
+    database = workspace / "index.sqlite3"
+    search_dir = run_root / "checkpoints" / "search"
+    ingest_path = run_root / "checkpoints" / "ingest.json"
+    search_dir.mkdir(parents=True, exist_ok=True)
+    rendered = _render_entries(entries, notes)
+    records = _question_records(entries, rendered)
+    corpus_hash = fingerprint([{ "path": path.relative_to(notes).as_posix(), "sha256": _sha256(path.read_bytes()) } for path in sorted(notes.glob("*.md"))]) if notes.exists() else None
+    config_values = {"retrieval_mode": "lexical", "top_k": top_k, "cutoffs": list(cutoffs), "conversations": sorted(selected), "prompt_mode": f"answerer-{'profile' if user_profile else 'no-profile'}+judge-{'with-evidence' if with_evidence else 'without-evidence'}", "prompt_fixture_version": PROMPT_FIXTURE_VERSION, "answerer_model": answerer_model, "answerer_provider": provider, "judge_model": judge_model, "judge_provider": judge_provider or provider}
+    checkpoint_config = config_values
+    existing_ingest = None
+    if resume or evaluate_only:
+        try:
+            candidate = read_json(ingest_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            candidate = None
+        candidate_config = candidate.get("config") if isinstance(candidate, dict) else None
+        prompt_config_matches = isinstance(candidate_config, dict) and candidate_config.get("prompt_mode") == config_values["prompt_mode"] and candidate_config.get("prompt_fixture_version") == config_values["prompt_fixture_version"]
+        config_matches = candidate_config == config_values or (evaluate_only and transport is not None and prompt_config_matches)
+        if isinstance(candidate, dict) and candidate.get("checkpoint_version") == "pausanias.eval.checkpoint.v1" and candidate.get("stage") == "ingest" and candidate.get("run_id") == run_id and candidate.get("status") == "complete" and config_matches and candidate.get("dataset_fingerprint") == dataset["fingerprint"] and candidate.get("corpus_fingerprint") == corpus_hash:
+            existing_ingest = candidate
+            checkpoint_config = candidate_config
+    if existing_ingest is not None:
+        ingest = Checkpoint(**existing_ingest)
+        generation = int(ingest.index_generation or 0)
+    elif evaluate_only:
+        raise LocomoError("evaluation requires a complete ingest checkpoint")
+    else:
+        index(_search_config(notes, database), rebuild=True)
+        generation = 1
+        ingest = Checkpoint("ingest", run_id, dataset["fingerprint"], corpus_hash, generation, config_values, "complete", utc_now(), utc_now(), {"files": [{"path": path.name, "sha256": _sha256(path.read_bytes())} for path in sorted(notes.glob("*.md"))], "index_generation": generation})
+        ingest.write(ingest_path)
+    evaluations: list[Evaluation] = []
+    for record in records:
+        checkpoint_path = search_dir / f"{record['case_id']}.json"
+        checkpoint = _valid_checkpoint(checkpoint_path, run_id, checkpoint_config, str(record["case_id"]), str(dataset["fingerprint"]), corpus_hash, generation) if (resume or evaluate_only) else None
+        if checkpoint is None:
+            if evaluate_only:
+                raise LocomoError(f"missing search checkpoint: {record['case_id']}")
+            raw = _search_record(record, entries, _search_config(notes, database), notes, top_k)
+            Checkpoint("search", run_id, dataset["fingerprint"], corpus_hash, generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
+        else:
+            raw = checkpoint["output"]
+        retrieval = tuple(RetrievalResult(**item) for item in raw["retrieval_results"])
+        outcomes: dict[str, CutoffOutcome] = {}
+        if predict_only:
+            outcomes = {
+                str(cutoff): CutoffOutcome(
+                    retrieved_count=len(retrieval[:cutoff]),
+                    relevant_count=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[0],
+                    recall=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[1],
+                    precision=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[2],
+                    mrr=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[3],
+                    abstention_correct=None,
+                    forbidden_sources=0,
+                    score=0.0,
+                    passed=False,
+                )
+                for cutoff in cutoffs
+            }
+        else:
+            if transport is None:
+                transport = _http_transport
+            for cutoff in cutoffs:
+                outcomes[str(cutoff)] = _common_cutoff(raw, retrieval, cutoff, answerer_model=answerer_model, answerer_provider=provider, judge_model=judge_model, judge_provider=selected_judge_provider, with_evidence=with_evidence, user_profile=user_profile, transport=transport)
+        primary_outcome = outcomes[str(max(cutoffs))]
+        evaluations.append(Evaluation(str(raw["case_id"]), str(raw["category"]), str(raw["question"]), tuple(target["evidence_id"] for target in raw["targets"]), str(raw["ground_truth"]), retrieval, float(raw["search_latency_ms"]), outcomes, primary_outcome.score, primary_outcome.error))
+    if predict_only:
+        print(f"locomo predict-only: {len(evaluations)} search checkpoints; dataset fingerprint {dataset['fingerprint']}")
+        return None
+    metrics = _common_metrics(evaluations, cutoffs)
+    prompt_hashes = [outcome.prompt_metadata for evaluation in evaluations for outcome in evaluation.cutoff_outcomes.values()]
+    answer_hash = fingerprint([metadata["answerer"].template_hash for metadata in prompt_hashes if "answerer" in metadata]) if prompt_hashes else None
+    judge_hash = fingerprint([metadata["judge"].template_hash for metadata in prompt_hashes if "judge" in metadata]) if prompt_hashes else None
+    metadata = Metadata("locomo", run_id, dataset, corpus_hash, generation, None, PROMPT_VERSION, PROMPT_FIXTURE_VERSION, fingerprint({"dataset": dataset, "config": config_values, "corpus": corpus_hash}), answer_hash, judge_hash, {**config_values, "answerer_model": answerer_model, "answerer_provider": provider, "judge_model": judge_model, "judge_provider": judge_provider or provider}, ingest.started_at, utc_now())
+    result = UnifiedResult(metadata, metrics, tuple(evaluations))
+    result.write(run_root / "run.json")
+    print(f"locomo evaluation: {metrics.overall_accuracy:.2f}% accuracy across {metrics.total} questions")
+    return result
+
+
+def _profile(value: str | None) -> dict[str, object] | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("user profile must be a JSON object")
+    return payload
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-path", type=Path)
+    parser.add_argument("--results-dir", type=Path, default=Path("results"))
+    parser.add_argument("--run-id", default="latest")
+    parser.add_argument("--conversations")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--top-k-cutoffs", default="10,20,50,200")
+    parser.add_argument("--answerer-model", default="gpt-4o-mini")
+    parser.add_argument("--judge-model", default="gpt-4o-mini")
+    parser.add_argument("--provider", default="openai")
+    parser.add_argument("--judge-provider")
+    parser.add_argument("--with-evidence", action="store_true")
+    parser.add_argument("--user-profile")
+    parser.add_argument("--predict-only", action="store_true")
+    parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        conversations = tuple(int(item) for item in args.conversations.split(",")) if args.conversations else None
+        cutoffs = tuple(int(item) for item in args.top_k_cutoffs.split(","))
+        run_locomo(run_id=args.run_id, dataset_path=args.dataset_path, results_dir=args.results_dir, conversations=conversations, top_k=args.top_k, cutoffs=cutoffs, answerer_model=args.answerer_model, judge_model=args.judge_model, provider=args.provider, judge_provider=args.judge_provider, with_evidence=args.with_evidence, user_profile=_profile(args.user_profile), predict_only=args.predict_only, evaluate_only=args.evaluate_only, resume=args.resume)
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, LocomoError) as exc:
+        print(f"locomo: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

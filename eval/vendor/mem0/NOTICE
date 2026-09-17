@@ -1,0 +1,5 @@
+the locomo prompt implementation in this directory is vendored from mem0-bench
+at commit 4b61c5d31b9c668a12b4f5e78064248a02c82d2b.
+
+copyright notices and the apache-2.0 license are preserved in LICENSE.
+pausanias uses this code as the normative prompt and answer-extraction source.

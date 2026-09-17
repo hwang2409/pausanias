@@ -1,0 +1,17 @@
+{
+  "question": "What color was the bicycle?",
+  "reference_date": "Monday, May 08, 2023",
+  "search_results": [
+    {
+      "memory": "Alex bought a blue bicycle.",
+      "created_at": "2023-05-01T13:00:00",
+      "section_id": "one"
+    },
+    {
+      "memory": "Alex likes weekend rides.",
+      "created_at": "2023-05-02T13:00:00",
+      "section_id": "two"
+    }
+  ],
+  "user_profile": null
+}

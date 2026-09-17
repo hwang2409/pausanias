@@ -335,6 +335,12 @@ def _print_table(
 
 
 def main(argv: list[str] | None = None) -> int:
+    modern_flags = {"--predict-only", "--evaluate-only", "--resume", "--run-id", "--results-dir", "--top-k", "--cutoffs", "--corpus"}
+    arguments = sys.argv[1:] if argv is None else argv
+    if any(flag in arguments for flag in modern_flags):
+        from .harness import main as harness_main
+
+        return harness_main(arguments)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="print machine-readable results")
     parser.add_argument("--case", help="run one case by id")

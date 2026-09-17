@@ -1,0 +1,46 @@
+[
+  {
+    "conversation": {
+      "speaker_a": "Alex",
+      "speaker_b": "Sam",
+      "session_1": [
+        {
+          "dia_id": "D1:0",
+          "speaker": "Alex",
+          "text": "I bought a blue bicycle for weekend rides.",
+          "session_date_time": "1:00 pm on 1 May, 2023"
+        },
+        {
+          "dia_id": "D1:1",
+          "speaker": "Sam",
+          "text": "That blue bicycle sounds useful.",
+          "session_date_time": "1:01 pm on 1 May, 2023"
+        }
+      ],
+      "session_1_date_time": "1:00 pm on 1 May, 2023",
+      "session_2": [
+        {
+          "dia_id": "D2:0",
+          "speaker": "Alex",
+          "text": "I also started painting landscapes.",
+          "session_date_time": "2:00 pm on 2 May, 2023"
+        }
+      ],
+      "session_2_date_time": "2:00 pm on 2 May, 2023"
+    },
+    "qa": [
+      {
+        "question": "blue bicycle",
+        "answer": "blue",
+        "category": 4,
+        "evidence": ["D1:0"]
+      },
+      {
+        "question": "started painting landscapes",
+        "answer": "landscapes",
+        "category": 4,
+        "evidence": ["D2:0"]
+      }
+    ]
+  }
+]
