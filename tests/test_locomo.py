@@ -738,7 +738,11 @@ def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkey
     expected = json.loads(
         (Path(__file__).parent / "fixtures/locomo/pre-pr-cats-1-4.json").read_text()
     )
+    # SQLite builds can vary in floating-point FTS scores; CI observed 2e-12 drift.
+    # Keep discrete fields exact while retaining sensitivity to meaningful score changes.
     def stable(value):
+        if isinstance(value, float):
+            return round(value, 9)
         if isinstance(value, dict):
             return {
                 key: stable(item)
@@ -751,7 +755,7 @@ def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkey
 
     actual_outputs = stable(actual["evaluations"])
     assert json.dumps(actual_outputs, sort_keys=True) == json.dumps(
-        expected["evaluations"], sort_keys=True
+        stable(expected["evaluations"]), sort_keys=True
     )
 
 
