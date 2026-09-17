@@ -6,11 +6,13 @@ from pathlib import Path
 from eval.benchmarks.locomo.run import (
     StubTransport,
     _reference_date,
+    _scope_corpus_fingerprint,
     build_answer_prompt,
     build_judge_prompt,
     render_session,
     run_locomo,
 )
+from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
 
 FIXTURES = Path(__file__).parent.parent / "eval/fixtures/locomo/golden-prompts-v1"
 
@@ -44,7 +46,35 @@ def test_golden_prompt_fixtures_match_vendored_entry_points():
     for name in ("judge-without-evidence", "judge-with-evidence"):
         payload = json.loads((FIXTURES / f"{name}.json").read_text())
         actual = build_judge_prompt(payload["category"], payload["question"], payload["answer"], payload["response"], payload.get("evidence_context"))
-        assert actual == (FIXTURES / f"{name}.txt").read_text().rstrip("\n")
+    assert actual == (FIXTURES / f"{name}.txt").read_text().rstrip("\n")
+
+
+def test_locomo_runner_prompt_matches_vendored_date_fixture(tmp_path: Path):
+    fixture = json.loads((FIXTURES / "answerer-locomo-date.json").read_text())
+    dataset = json.loads((Path(__file__).parent / "fixtures/locomo/small.json").read_text())
+    dataset[0]["qa"] = [dataset[0]["qa"][0]]
+    dataset_path = tmp_path / "locomo.json"
+    dataset_path.write_text(json.dumps(dataset))
+
+    run_locomo(run_id="date-prompt", dataset_path=dataset_path, results_dir=tmp_path, top_k=1, cutoffs=(1,), predict_only=True)
+    transport = StubTransport(["ANSWER: fixture", {"label": "CORRECT", "reasoning": "fixture"}])
+    run_locomo(
+        run_id="date-prompt",
+        dataset_path=dataset_path,
+        results_dir=tmp_path,
+        top_k=1,
+        cutoffs=(1,),
+        provider="stub",
+        judge_provider="stub",
+        evaluate_only=True,
+        transport=transport,
+    )
+
+    assert transport.calls[0]["user"] == get_answer_generation_prompt(
+        fixture["question"], fixture["search_results"], fixture["reference_date"], fixture["user_profile"]
+    )
+    assert "around 2:00 pm on 2 May, 2023" in transport.calls[0]["user"]
+    assert "(Monday, May 01, 2023)" in transport.calls[0]["user"]
 
 
 def test_locomo_search_and_stub_evaluate_are_resumable(tmp_path: Path):
@@ -120,6 +150,70 @@ def test_locomo_search_is_scoped_to_each_conversation(tmp_path: Path):
     assert not any("orange telescope" in item["excerpt"] for item in checkpoint["output"]["retrieval_results"])
 
 
+def test_locomo_scope_sync_removes_deleted_sessions_and_records_scope_metadata(tmp_path: Path):
+    dataset_path = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(run_id="scope-reuse", dataset_path=dataset_path, results_dir=tmp_path, top_k=8, cutoffs=(1,), predict_only=True)
+    dataset = json.loads(dataset_path.read_text())
+    dataset[0]["conversation"].pop("session_2")
+    dataset[0]["conversation"].pop("session_2_date_time")
+    dataset[0]["qa"] = [dataset[0]["qa"][0]]
+    changed_path = tmp_path / "changed.json"
+    changed_path.write_text(json.dumps(dataset))
+
+    run_locomo(run_id="scope-reuse", dataset_path=changed_path, results_dir=tmp_path, top_k=8, cutoffs=(1,), predict_only=True)
+
+    root = tmp_path / "locomo/scope-reuse"
+    checkpoint = json.loads((root / "checkpoints/search/conv0_q0.json").read_text())
+    scope = root / "workspace/scopes/conversation-00"
+    assert [path.name for path in scope.glob("*.md")] == ["conversation-00--session-01.md"]
+    assert not any("painting landscapes" in item["excerpt"] for item in checkpoint["output"]["retrieval_results"])
+    assert checkpoint["index_generation"] == 2
+    assert checkpoint["corpus_fingerprint"] == _scope_corpus_fingerprint(scope)
+
+
+def test_locomo_retrieval_config_mismatch_recomputes_search(tmp_path: Path):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(run_id="retrieval-config", dataset_path=dataset, results_dir=tmp_path, top_k=1, cutoffs=(1,), predict_only=True)
+    responses = [item for _ in range(4) for item in ("ANSWER: fixture", {"label": "CORRECT", "reasoning": "fixture"})]
+    run_locomo(
+        run_id="retrieval-config",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        provider="stub",
+        judge_provider="stub",
+        evaluate_only=True,
+        transport=StubTransport(responses),
+    )
+
+    checkpoint = json.loads((tmp_path / "locomo/retrieval-config/checkpoints/search/conv0_q0.json").read_text())
+    assert checkpoint["config"]["top_k"] == 8
+    assert checkpoint["config"]["cutoffs"] == [1, 8]
+    assert checkpoint["config"]["retrieval_config"] == {
+        "retrieval_mode": "lexical",
+        "top_k": 8,
+        "cutoffs": [1, 8],
+        "conversations": [0],
+    }
+
+
+def test_locomo_corrupt_score_checkpoint_is_recomputed(tmp_path: Path):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(run_id="corrupt-score", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1,), predict_only=True)
+    first = StubTransport([item for _ in range(2) for item in ("ANSWER: fixture", {"label": "CORRECT", "reasoning": "fixture"})])
+    run_locomo(run_id="corrupt-score", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1,), provider="stub", judge_provider="stub", evaluate_only=True, transport=first)
+    path = tmp_path / "locomo/corrupt-score/checkpoints/evaluate/conv0_q0.json"
+    value = json.loads(path.read_text())
+    value["output"]["cutoff_outcomes"]["1"]["score"] = "not-a-number"
+    path.write_text(json.dumps(value))
+
+    second = StubTransport(["ANSWER: fixture", {"label": "CORRECT", "reasoning": "recomputed"}] * 2)
+    result = run_locomo(run_id="corrupt-score", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1,), provider="stub", judge_provider="stub", resume=True, transport=second)
+    assert result is not None
+    assert second.calls
+
+
 def test_locomo_evaluation_checkpoints_skip_completed_llm_calls(tmp_path: Path):
     dataset = Path(__file__).parent / "fixtures/locomo/small.json"
     run_locomo(run_id="checkpoint", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1,), predict_only=True)
@@ -159,7 +253,7 @@ def test_locomo_parses_raw_session_dates_for_prompts():
         }
     }
 
-    assert _reference_date(entry) == "Tuesday, May 02, 2023"
+    assert _reference_date(entry) == "2:00 pm on 2 May, 2023"
 
 
 def test_locomo_records_actual_index_generation_after_rebuild(tmp_path: Path):
