@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from .bench import format_report, run_benchmark
 from .config import ConfigError, default_config_path, load_config
 from .core import excerpt, index, read_source, search
 from .model_bundle import (
-    BundleError,
     MODEL_BUNDLE_MANIFEST,
     NUMPY_VERSION,
     ONNXRUNTIME_VERSION,
+    BundleError,
     fetch_bundle,
     license_records,
     package_version,
@@ -34,6 +34,7 @@ def parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--root")
     search_parser.add_argument("--all-projects", action="store_true")
     search_parser.add_argument("--limit", type=int, default=20)
+    search_parser.add_argument("--semantic", action="store_true", help="use semantic candidates with lexical fallback")
     search_parser.add_argument("--json", action="store_true")
     read_parser = commands.add_parser("read")
     read_parser.add_argument("--config", dest="config", default=argparse.SUPPRESS)
@@ -174,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
             print(read_source(config, args.path, args.heading, args.max_bytes))
         else:
             config = load_config(args.config)
-            results = [_result(item) for item in search(config, args.query, args.project, args.root, args.all_projects, args.limit)]
+            results = [_result(item) for item in search(config, args.query, args.project, args.root, args.all_projects, args.limit,
+                                                       semantic=args.semantic)]
             if args.json:
                 print(json.dumps(results, ensure_ascii=False))
             else:
