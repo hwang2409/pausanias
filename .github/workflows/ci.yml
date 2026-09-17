@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: create isolated environment
+        run: python -m venv .venv
+      - name: install test tooling
+        run: .venv/bin/python -m pip install --upgrade pip "pytest>=8"
+      - name: install package without extras
+        run: .venv/bin/python -m pip install .
+      - name: prove zero runtime dependencies
+        run: |
+          .venv/bin/python - <<'PY'
+          from importlib.metadata import distributions
+
+          allowed = {
+              "pausanias",
+              "pytest",
+              "iniconfig",
+              "packaging",
+              "pluggy",
+              "pygments",
+              "pip",
+              "setuptools",
+              "wheel",
+          }
+          installed = {
+              distribution.metadata["Name"].lower().replace("_", "-")
+              for distribution in distributions()
+          }
+          unexpected = sorted(installed - allowed)
+          print("installed:", ", ".join(sorted(installed)))
+          if unexpected:
+              raise SystemExit(f"unexpected base packages: {unexpected}")
+          PY
+      - name: run tests
+        run: .venv/bin/python -m pytest -q
+
+  semantic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: create isolated environment
+        run: python -m venv .venv
+      - name: install test tooling
+        run: .venv/bin/python -m pip install --upgrade pip "pytest>=8"
+      - name: install semantic profile
+        run: .venv/bin/python -m pip install ".[semantic]"
+      - name: run tests
+        run: .venv/bin/python -m pytest -q
