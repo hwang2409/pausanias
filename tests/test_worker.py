@@ -94,6 +94,7 @@ def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
         first = client.query({"query": "alpha paraphrase", "project": "p", "limit": 20}, deadline)
         second = client.query({"query": "alpha paraphrase", "project": "p", "limit": 20}, deadline)
         assert first["items"][0]["heading"] == "Note"
+        assert first["metrics"]["retrieval_mode"] == "fused"
         assert second["metrics"]["matrix_load_ms"] < first["metrics"]["matrix_load_ms"]
         assert second["metrics"]["model_load_ms"] <= first["metrics"]["model_load_ms"]
     finally:
@@ -155,10 +156,22 @@ def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
         response = run_hook(config, config_path, "alpha memory", project="p")
         assert [item.heading for item in response.candidates] == ["Note"]
         assert response.metrics.fallback is True
+        assert response.metrics.retrieval_mode == "lexical"
         expected_reason = "MODEL_MISSING" if semantic_extra_available() else "EXTRA_MISSING"
         assert response.metrics.disabled_reason == expected_reason
     finally:
         stop_worker(config.database)
+
+
+def test_hook_explicit_lexical_mode_skips_semantic_worker(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    core.index(config)
+
+    response = run_hook(config, config_path, "alpha memory", project="p", retrieval_mode="lexical")
+
+    assert [item.heading for item in response.candidates] == ["Note"]
+    assert response.metrics.fallback is True
+    assert response.metrics.retrieval_mode == "lexical"
 
 
 def test_worker_abstains_when_a_matching_source_is_deleted(tmp_path: Path):

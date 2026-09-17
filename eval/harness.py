@@ -171,7 +171,7 @@ def _checkpoint_config(
     top_k: int,
     cutoffs: tuple[int, ...],
     case_lock: str,
-    retrieval_mode: str = "lexical",
+    retrieval_mode: str = "fused",
     config: Config | None = None,
 ) -> dict[str, Any]:
     values = {
@@ -395,7 +395,7 @@ def run_internal(
     resume: bool = False,
     predict_only: bool = False,
     evaluate_only: bool = False,
-    retrieval_mode: str = "lexical",
+    retrieval_mode: str = "fused",
     through_worker: bool = False,
 ) -> UnifiedResult | None:
     if predict_only and evaluate_only:
@@ -628,6 +628,7 @@ def _run_search(
         all_projects=bool(case.scope.get("all_projects", False)),
         limit=top_k,
         refresh=refresh,
+        semantic=False,
         synonym_expansion=synonym_expansion,
     )
 
@@ -686,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cutoffs", default="1,2,4,8")
     parser.add_argument("--predict-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
-    parser.add_argument("--retrieval-mode", choices=("lexical", "fused"), default="lexical")
+    parser.add_argument("--retrieval-mode", choices=("lexical", "fused"), default="fused")
     parser.add_argument("--through-worker", action="store_true", help="run retrieval through the real hook worker")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)

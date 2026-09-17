@@ -284,11 +284,31 @@ def test_non_finite_vector_falls_back_without_scoring_nan(tmp_path: Path, bad_va
     assert all(math.isfinite(result.score) for result in results)
 
 
-def test_default_search_does_not_use_vectors(tmp_path: Path):
+def test_default_search_falls_back_lexically_without_semantic_backend(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "note.md").write_text("# Note\nalpha\n")
-    config = make_config(tmp_path, [("vault", "p", root)])
+    config = make_config(
+        tmp_path, [("vault", "p", root)], semantic_bundle=tmp_path / "missing-bundle",
+    )
     core.index(config)
 
     assert core.search(config, "alpha", project="p") == core.search(config, "alpha", project="p", semantic=False)
+
+
+def test_default_search_requests_fused_retrieval(monkeypatch, tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    config = make_config(tmp_path, [("vault", "p", root)])
+    expected = [object()]
+    called = False
+
+    def fake_semantic_search(*args, **kwargs):
+        nonlocal called
+        called = True
+        return expected
+
+    monkeypatch.setattr(core, "semantic_search", fake_semantic_search)
+
+    assert core.search(config, "paraphrase", project="p") == expected
+    assert called

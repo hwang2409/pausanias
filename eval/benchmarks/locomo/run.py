@@ -563,7 +563,7 @@ def _search_candidates(
             project=config.roots[0].project,
             limit=top_k,
         ).candidates
-    return search(config, query, project=config.roots[0].project, limit=top_k)
+    return search(config, query, project=config.roots[0].project, limit=top_k, semantic=False)
 
 
 def _search_record(

@@ -67,6 +67,7 @@ class HookMetrics:
     fallback: bool = False
     cache_state: str = "cold"
     disabled_reason: str | None = None
+    retrieval_mode: str = "lexical"
 
 
 def worker_paths(database: Path) -> WorkerPaths:
@@ -388,7 +389,7 @@ class PersistentWorker:
             fallback_started = time.perf_counter()
             candidates = search(
                 self.config, query, project, root_id, all_projects, limit,
-                synonym_expansion=synonym_expansion,
+                semantic=False, synonym_expansion=synonym_expansion,
             )
             self._check_cancelled(cancelled)
             timings["fallback_ms"] = _positive_ms(fallback_started)
@@ -408,6 +409,7 @@ class PersistentWorker:
                 "hook_total_ms": _positive_ms(started), "fallback": fallback,
                 "cache_state": "disabled" if self._encoder_error else ("warm" if self._matrix_cache else "cold"),
                 "disabled_reason": self._encoder_error,
+                "retrieval_mode": "lexical" if fallback else "fused",
             },
         }
 

@@ -1,10 +1,12 @@
 # Pausanias: Automatic Memory Context for Agents
 
 Status: Arc 2 implementation and engineering evaluation complete except the deferred
-operator-triggered LOCOMO comparison. Measured
-thresholds and the tested corpus envelope are recorded in `eval/PAUS-12-RESULTS.md`.
-Default activation remains a product decision.
-Date: 2026-09-16
+operator-triggered LOCOMO comparison. Measured thresholds and the tested corpus envelope
+are recorded in `eval/PAUS-12-RESULTS.md`. On 2026-09-17, the operator delegated the
+PAUS-13 activation decision and accepted the PAUS-12 recommendation: fused retrieval is
+the default when the semantic extra is installed and the index state is `ready`; all
+other states use lexical fallback.
+Date: 2026-09-17
 
 ## Purpose
 
@@ -615,10 +617,11 @@ incremental refresh took 439.95 ms, its persistent vector payload was 11.78 MiB,
 the SQLite index was 31.05 MiB. The measured peak RSS during indexed build was 31.77
 GiB, so the result does not validate the 50,000-section planning envelope.
 
-The evidence supports fused retrieval as the default runtime recommendation with the
-lexical fallback retained. This ticket changes no default. Full tables, policy
-ablations, hypothesis comparisons, LOCOMO readiness, commands, and caveats are in
-`eval/PAUS-12-RESULTS.md`.
+The evidence supports fused retrieval as the default runtime mode with the lexical
+fallback retained. PAUS-13 records the delegated operator decision made on 2026-09-17.
+The default activates only when the semantic extra is installed and the index state is
+`ready`. Full tables, policy ablations, hypothesis comparisons, LOCOMO readiness,
+commands, and caveats are in `eval/PAUS-12-RESULTS.md`.
 
 ### Performance budgets
 
@@ -1000,7 +1003,8 @@ These are the remaining intentional schema divergences from mem0's `UnifiedResul
 and NumPy in an optional semantic extra. Treat the model bundle as an explicitly fetched,
 hashed data artifact, not as a package dependency.
 
-The default install remains dependency-free. Semantic retrieval is an opt-in extra.
+The default install remains dependency-free. The semantic extra enables automatic fused
+retrieval only when its index state is `ready`; every other state uses lexical fallback.
 Sizes below are order-of-magnitude planning values; record exact wheel and model sizes
 for the pinned versions in the implementation PR.
 

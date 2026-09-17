@@ -59,7 +59,7 @@ def _lexical_search_child(connection, config: Config, query: str, project: str |
                           synonym_expansion: bool) -> None:
     try:
         connection.send(search(config, query, project, root_id, all_projects, limit,
-                               synonym_expansion=synonym_expansion))
+                               semantic=False, synonym_expansion=synonym_expansion))
     except Exception as exc:
         connection.send(exc)
     finally:
@@ -113,6 +113,7 @@ def _fallback(config: Config, query: str, project: str | None, root_id: str | No
         fallback=True,
         cache_state="fallback",
         disabled_reason=disabled_reason,
+        retrieval_mode="lexical",
     ))
 
 
@@ -130,12 +131,20 @@ def run_hook(
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
     synonym_expansion: bool = SYNONYM_EXPANSION,
+    retrieval_mode: str = "auto",
 ) -> HookResponse:
     """Run one semantic request through a persistent worker or lexical fallback."""
     if deadline_ms <= 0:
         raise ValueError("deadline must be positive")
+    if retrieval_mode not in {"auto", "fused", "lexical"}:
+        raise ValueError("retrieval mode must be auto, fused, or lexical")
     started = time.perf_counter()
     deadline = started + deadline_ms / 1000.0
+    if retrieval_mode == "lexical":
+        return _fallback(
+            config, query, project, root_id, all_projects, limit, started, deadline=deadline,
+            synonym_expansion=synonym_expansion,
+        )
     startup = ensure_worker(config, Path(config_path), deadline)
     if startup is None:
         return _fallback(
@@ -181,6 +190,7 @@ def run_hook(
             cache_state=str(raw_metrics.get("cache_state", "unknown")),
             disabled_reason=(str(raw_metrics["disabled_reason"])
                              if raw_metrics.get("disabled_reason") is not None else None),
+            retrieval_mode=str(raw_metrics.get("retrieval_mode", "lexical")),
         )
         return HookResponse(candidates, metrics)
     except (OSError, TimeoutError, ValueError, TypeError, OverflowError, WorkerError):

@@ -192,7 +192,7 @@ def test_links_and_index_lifecycle(tmp_path: Path):
     assert row["index_generation"] == generation
     assert json.loads(row["links"]) == ["other.md", "second"]
     connection.close()
-    assert search(config, "old plan", project="phoebe")[0].canonical_path == str(note.resolve())
+    assert search(config, "old plan", project="phoebe", semantic=False)[0].canonical_path == str(note.resolve())
     before = connect(config.database).execute("SELECT count(*) FROM sections").fetchone()[0]
     second_generation = index(config)
     after = connect(config.database).execute("SELECT count(*) FROM sections").fetchone()[0]
@@ -200,11 +200,11 @@ def test_links_and_index_lifecycle(tmp_path: Path):
     assert all(row[0] == second_generation for row in connect(config.database).execute("SELECT index_generation FROM sections"))
     note.write_text("# Decision\nUse the new plan.\n")
     index(config)
-    assert not search(config, "old plan", project="phoebe")
-    assert search(config, "new plan", project="phoebe")
+    assert not search(config, "old plan", project="phoebe", semantic=False)
+    assert search(config, "new plan", project="phoebe", semantic=False)
     note.unlink()
     index(config)
-    assert not search(config, "new plan", project="phoebe")
+    assert not search(config, "new plan", project="phoebe", semantic=False)
 
 
 def test_index_creates_missing_database_parent(tmp_path: Path):
@@ -481,7 +481,7 @@ def test_quoted_query_preserves_phrase_meaning_and_caps_terms(tmp_path: Path):
     (root / "note.md").write_text("# Terms\nold unrelated plan\n")
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
-    assert search(config, '"old plan"', project="p") == []
+    assert search(config, '"old plan"', project="p", semantic=False) == []
     started = time.perf_counter()
     results = search(config, "term " * 100_000, project="p")
     elapsed = time.perf_counter() - started
@@ -495,7 +495,7 @@ def test_selection_reason_reports_body_match(tmp_path: Path):
     (root / "note.md").write_text("# Decision\nbody-only phrase\n")
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
-    assert search(config, "body-only", project="p")[0].reason == "body match"
+    assert search(config, "body-only", project="p", semantic=False)[0].reason == "body match"
 
 
 def test_selection_reason_does_not_match_heading_prefixes(tmp_path: Path):
@@ -504,7 +504,7 @@ def test_selection_reason_does_not_match_heading_prefixes(tmp_path: Path):
     (root / "note.md").write_text("# Planet\nplan appears in the body\n")
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
-    result = search(config, "plan", project="p")[0]
+    result = search(config, "plan", project="p", semantic=False)[0]
     assert result.reason == "body match"
 
 
@@ -516,7 +516,7 @@ def test_heading_matches_survive_bounded_candidate_lanes(tmp_path: Path):
     (root / "note.md").write_text("".join(sections))
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
-    result = search(config, "needle", project="p", limit=1)
+    result = search(config, "needle", project="p", limit=1, semantic=False)
     assert result[0].heading_path == ("Needle",)
     assert result[0].reason == "heading match"
 
@@ -668,7 +668,7 @@ def test_synonym_merge_uses_best_fts_score_before_boosts(tmp_path: Path):
     )
     index(synonym_config)
 
-    results = search(synonym_config, "database", project="p")
+    results = search(synonym_config, "database", project="p", semantic=False)
 
     assert [item.heading for item in results] == ["Better", "Database architecture"]
     assert [(item.lexical_score, item.section_id) for item in results] == sorted(
@@ -701,9 +701,9 @@ def test_synonym_search_uses_alias_without_changing_disabled_output(tmp_path: Pa
     )
     index(synonym_config)
 
-    assert search(synonym_config, "db", project="p")[0].heading == "Storage"
-    assert search(synonym_config, "db", project="p", synonym_expansion=False) == []
-    assert search(synonym_config, "database", project="p")[0].heading == "Storage"
+    assert search(synonym_config, "db", project="p", semantic=False)[0].heading == "Storage"
+    assert search(synonym_config, "db", project="p", semantic=False, synonym_expansion=False) == []
+    assert search(synonym_config, "database", project="p", semantic=False)[0].heading == "Storage"
 
 
 def test_config_rejects_missing_root(tmp_path: Path):
@@ -739,9 +739,9 @@ def test_config_excludes_credentials_and_private_globs(tmp_path: Path):
     (root / "public.md").write_text("public token")
     config = make_config(tmp_path, [("vault", "p", root)], private=["private/**"])
     index(config)
-    assert search(config, "secret", project="p") == []
-    assert search(config, "private", project="p") == []
-    assert search(config, "public", project="p")
+    assert search(config, "secret", project="p", semantic=False) == []
+    assert search(config, "private", project="p", semantic=False) == []
+    assert search(config, "public", project="p", semantic=False)
 
 
 def test_private_parent_exclusion_applies_to_read(tmp_path: Path):
@@ -860,5 +860,5 @@ def test_selection_reason_matches_heading_tokens_only(tmp_path: Path):
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
 
-    assert search(config, "plan", project="p")[0].reason == "body match"
-    assert search(config, "Planet", project="p")[0].reason == "heading match"
+    assert search(config, "plan", project="p", semantic=False)[0].reason == "body match"
+    assert search(config, "Planet", project="p", semantic=False)[0].reason == "heading match"

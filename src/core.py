@@ -989,10 +989,12 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
-           semantic: bool = False, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
+           semantic: bool = True, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
     if semantic:
+        timings: dict[str, float] = {}
         return semantic_search(
             config, query, project, root_id, all_projects, limit, refresh,
+            timings=timings,
             synonym_expansion=synonym_expansion,
         )
     if limit < 1:
