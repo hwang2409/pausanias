@@ -30,16 +30,24 @@ jobs:
         run: |
           .venv/bin/python - <<'PY'
           from importlib.metadata import requires
-          from packaging.requirements import Requirement
 
-          declared = [Requirement(value) for value in requires("pausanias") or []]
-          base = [
-              str(requirement)
-              for requirement in declared
-              if requirement.marker is None
-              or requirement.marker.evaluate({"extra": ""})
-          ]
-          print("declared requirements:", ", ".join(map(str, declared)) or "none")
+          declared = requires("pausanias")
+          if declared is None:
+              raise SystemExit("pausanias metadata has no Requires-Dist entries")
+
+          def is_optional_extra(value):
+              _, separator, marker = value.partition(";")
+              if not separator:
+                  return False
+              return "".join(marker.split()) in {
+                  'extra=="dev"',
+                  'extra=="semantic"',
+                  "extra=='dev'",
+                  "extra=='semantic'",
+              }
+
+          base = [value for value in declared if not is_optional_extra(value)]
+          print("declared requirements:", ", ".join(declared) or "none")
           if base:
               raise SystemExit(f"base requirements declared: {base}")
           PY
