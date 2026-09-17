@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import platform
-import subprocess
-import sys
 from pathlib import Path
+
+from eval.schema import nearest_rank
 
 
 def _load(path: Path) -> dict[str, object]:
@@ -36,13 +35,20 @@ def _table_row(values: list[object]) -> str:
     return "| " + " | ".join(str(value) for value in values) + " |"
 
 
-def _git_commit() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unavailable"
+def _score_summary(artifact: dict[str, object], summary: dict[str, object]) -> dict[str, object]:
+    evaluations = artifact.get("evaluations", [])
+    if not isinstance(evaluations, list):
+        return summary
+    scores = [
+        float(result["score"])
+        for evaluation in evaluations
+        if isinstance(evaluation, dict) and evaluation.get("failure_reason") is None
+        for result in evaluation.get("retrieval_results", [])
+        if isinstance(result, dict) and isinstance(result.get("score"), (int, float))
+    ]
+    if not scores:
+        return summary
+    return {**summary, "p95": nearest_rank(sorted(scores), 0.95)}
 
 
 def render(lexical_path: Path, fused_path: Path) -> str:
@@ -54,13 +60,18 @@ def render(lexical_path: Path, fused_path: Path) -> str:
     lines = [
         "# paus-15 results",
         "",
+        "regeneration command: `.venv/bin/python -m eval.benchmarks.locomo.report "
+        "--lexical results/locomo/lexical/run.json "
+        "--fused results/locomo/fused/run.json "
+        "--output eval/PAUS-15-RESULTS.md`",
+        "",
         "## headline",
         "",
         "this eval measures retrieval-side abstention on LOCOMO category-5 "
         "adversarial questions.",
         "",
-        _table_row(["mode", "questions", "abstained", "false injections", "false-injection rate"]),
-        _table_row(["---", "---:", "---:", "---:", "---:"]),
+        _table_row(["mode", "questions", "abstained", "errors", "false injections", "false-injection rate"]),
+        _table_row(["---", "---:", "---:", "---:", "---:", "---:"]),
     ]
     for mode in ("lexical", "fused"):
         summary = summaries[mode]
@@ -68,6 +79,7 @@ def render(lexical_path: Path, fused_path: Path) -> str:
             mode,
             summary["total"],
             summary["abstained"],
+            summary.get("errors", 0),
             summary["false_injections"],
             _percent(summary["false_injection_rate"]),
         ]))
@@ -75,7 +87,8 @@ def render(lexical_path: Path, fused_path: Path) -> str:
     lines.extend([
         "",
         "the false-injection rate is the primary metric. an abstention is a "
-        "selection-policy result with zero injectable candidates.",
+        "successful selection pass with zero injectable candidates. failed, "
+        "timed-out, and fallback-degraded selections are errors.",
         "",
         "## injected result counts",
         "",
@@ -104,7 +117,7 @@ def render(lexical_path: Path, fused_path: Path) -> str:
         _table_row(["---", "---:", "---:", "---:", "---:", "---:", "---:"]),
     ])
     for mode in ("lexical", "fused"):
-        score = summaries[mode]["injected_score_summary"]
+        score = _score_summary(artifacts[mode], summaries[mode]["injected_score_summary"])
         lines.append(_table_row([
             mode,
             score["count"],
@@ -119,8 +132,8 @@ def render(lexical_path: Path, fused_path: Path) -> str:
         "",
         "## per-conversation breakdown",
         "",
-        _table_row(["conversation", "lexical total", "lexical false", "lexical rate", "fused total", "fused false", "fused rate"]),
-        _table_row(["---", "---:", "---:", "---:", "---:", "---:", "---:"]),
+        _table_row(["conversation", "lexical total", "lexical errors", "lexical false", "lexical rate", "fused total", "fused errors", "fused false", "fused rate"]),
+        _table_row(["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:", "---:"]),
     ])
     conversation_ids = sorted(
         set(lexical["by_conversation"]) | set(fused["by_conversation"]),
@@ -132,9 +145,11 @@ def render(lexical_path: Path, fused_path: Path) -> str:
         lines.append(_table_row([
             conversation_id,
             lexical_conversation.get("total", 0),
+            lexical_conversation.get("errors", 0),
             lexical_conversation.get("false_injections", 0),
             _percent(lexical_conversation.get("false_injection_rate", 0.0)),
             fused_conversation.get("total", 0),
+            fused_conversation.get("errors", 0),
             fused_conversation.get("false_injections", 0),
             _percent(fused_conversation.get("false_injection_rate", 0.0)),
         ]))
@@ -147,9 +162,6 @@ def render(lexical_path: Path, fused_path: Path) -> str:
         f"- dataset commit: `{dataset['version']}`",
         f"- dataset sha256: `{dataset['sha256']}`",
         f"- dataset fingerprint: `{dataset['fingerprint']}`",
-        f"- runner commit: `{_git_commit()}`",
-        f"- python: `{sys.version.split()[0]}`",
-        f"- platform: `{platform.platform()}`",
         "- retrieval limit: `top_k=200`",
         "- retrieval modes: `lexical`, `fused`",
         "- network: dataset fetch only; retrieval was local",

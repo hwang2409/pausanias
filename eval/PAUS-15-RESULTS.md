@@ -1,13 +1,15 @@
 # paus-15 results
 
+regeneration command: `.venv/bin/python -m eval.benchmarks.locomo.report --lexical results/locomo/lexical/run.json --fused results/locomo/fused/run.json --output eval/PAUS-15-RESULTS.md`
+
 ## headline
 
 this eval measures retrieval-side abstention on LOCOMO category-5 adversarial questions.
 
-| mode | questions | abstained | false injections | false-injection rate |
-| --- | ---: | ---: | ---: | ---: |
-| lexical | 446 | 440 | 6 | 1.35% |
-| fused | 446 | 0 | 446 | 100.00% |
+| mode | questions | abstained | errors | false injections | false-injection rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| lexical | 446 | 440 | 0 | 6 | 1.35% |
+| fused | 446 | 0 | 0 | 446 | 100.00% |
 
 the false-injection rate is the primary metric. an abstention is a successful selection pass with zero injectable candidates. failed, timed-out, and fallback-degraded selections are errors.
 
@@ -144,18 +146,18 @@ scores cover every injected result in a false-injection query. they support late
 
 ## per-conversation breakdown
 
-| conversation | lexical total | lexical false | lexical rate | fused total | fused false | fused rate |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 47 | 1 | 2.13% | 47 | 47 | 100.00% |
-| 1 | 24 | 1 | 4.17% | 24 | 24 | 100.00% |
-| 2 | 41 | 0 | 0.00% | 41 | 41 | 100.00% |
-| 3 | 61 | 1 | 1.64% | 61 | 61 | 100.00% |
-| 4 | 64 | 1 | 1.56% | 64 | 64 | 100.00% |
-| 5 | 35 | 0 | 0.00% | 35 | 35 | 100.00% |
-| 6 | 40 | 0 | 0.00% | 40 | 40 | 100.00% |
-| 7 | 48 | 1 | 2.08% | 48 | 48 | 100.00% |
-| 8 | 40 | 1 | 2.50% | 40 | 40 | 100.00% |
-| 9 | 46 | 0 | 0.00% | 46 | 46 | 100.00% |
+| conversation | lexical total | lexical errors | lexical false | lexical rate | fused total | fused errors | fused false | fused rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 47 | 0 | 1 | 2.13% | 47 | 0 | 47 | 100.00% |
+| 1 | 24 | 0 | 1 | 4.17% | 24 | 0 | 24 | 100.00% |
+| 2 | 41 | 0 | 0 | 0.00% | 41 | 0 | 41 | 100.00% |
+| 3 | 61 | 0 | 1 | 1.64% | 61 | 0 | 61 | 100.00% |
+| 4 | 64 | 0 | 1 | 1.56% | 64 | 0 | 64 | 100.00% |
+| 5 | 35 | 0 | 0 | 0.00% | 35 | 0 | 35 | 100.00% |
+| 6 | 40 | 0 | 0 | 0.00% | 40 | 0 | 40 | 100.00% |
+| 7 | 48 | 0 | 1 | 2.08% | 48 | 0 | 48 | 100.00% |
+| 8 | 40 | 0 | 1 | 2.50% | 40 | 0 | 40 | 100.00% |
+| 9 | 46 | 0 | 0 | 0.00% | 46 | 0 | 46 | 100.00% |
 
 ## dataset and environment
 
@@ -163,9 +165,6 @@ scores cover every injected result in a false-injection query. they support late
 - dataset commit: `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`
 - dataset sha256: `79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`
 - dataset fingerprint: `79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`
-- runner commit: `151369816c7f179c9fd369371d59ae3ad08508f8`
-- python: `3.14.7`
-- platform: `macOS-26.6.2-arm64-arm-64bit-Mach-O`
 - retrieval limit: `top_k=200`
 - retrieval modes: `lexical`, `fused`
 - network: dataset fetch only; retrieval was local

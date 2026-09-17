@@ -16,6 +16,7 @@ from eval.benchmarks.locomo.run import (
     run_locomo,
 )
 from eval.benchmarks.locomo.metrics import _score_summary
+from eval.benchmarks.locomo.report import render as render_report
 from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
 from pausanias.hook import HookMetrics, HookResponse
 from pausanias.vectors import Candidate
@@ -617,8 +618,105 @@ def test_abstention_hook_exception_is_an_error(tmp_path: Path, monkeypatch):
     assert result.evaluations[0].cutoff_outcomes["2"].error == "retrieval_error"
 
 
+def test_expired_real_hook_is_an_eval_error(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/abstention.json"
+    real_run_hook = locomo_runner.run_hook
+
+    def expired_run_hook(*args, **kwargs):
+        kwargs["deadline_ms"] = 0.000001
+        return real_run_hook(*args, **kwargs)
+
+    monkeypatch.setattr(locomo_runner, "run_hook", expired_run_hook)
+    result = run_locomo(
+        run_id="abstention-real-timeout",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        retrieval_mode="lexical",
+        abstention=True,
+    )
+
+    assert result is not None
+    assert result.metrics.errors == 2
+    for evaluation in result.evaluations:
+        outcome = evaluation.cutoff_outcomes["2"]
+        assert outcome.judgment == "ERROR"
+        assert outcome.error == "retrieval_error"
+    diagnostics = json.loads(
+        (tmp_path / "locomo/abstention-real-timeout/checkpoints/search/conv0_q1.json").read_text()
+    )["output"]["retrieval_diagnostics"]
+    assert diagnostics["status"] == "timeout"
+    assert diagnostics["failure_reason"] == "deadline_exceeded"
+    assert diagnostics["fallback"] is False
+
+
 def test_score_summary_uses_nearest_rank_p95():
     assert _score_summary([1.0, 2.0, 3.0])["p95"] == 3.0
+
+
+def test_report_matches_committed_fixture(tmp_path: Path):
+    dataset = {
+        "name": "fixture",
+        "version": "v1",
+        "sha256": "dataset-sha",
+        "fingerprint": "dataset-fingerprint",
+    }
+    lexical = {
+        "metadata": {"dataset": dataset},
+        "metrics": {"abstention": {
+            "total": 2,
+            "abstained": 1,
+            "errors": 1,
+            "false_injections": 0,
+            "false_injection_rate": 0.0,
+            "injected_count_distribution": {"0": 1},
+            "injected_score_summary": {"count": 0, "min": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0},
+            "by_conversation": {"0": {
+                "total": 2,
+                "abstained": 1,
+                "errors": 1,
+                "false_injections": 0,
+                "false_injection_rate": 0.0,
+            }},
+        }},
+        "evaluations": [
+            {"failure_reason": None, "retrieval_results": []},
+            {"failure_reason": "retrieval_error", "retrieval_results": []},
+        ],
+    }
+    fused = {
+        "metadata": {"dataset": dataset},
+        "metrics": {"abstention": {
+            "total": 2,
+            "abstained": 0,
+            "errors": 0,
+            "false_injections": 2,
+            "false_injection_rate": 1.0,
+            "injected_count_distribution": {"1": 1, "2": 1},
+            "injected_score_summary": {"count": 3, "min": 0.1, "p50": 0.2, "p95": 0.3, "max": 0.3, "mean": 0.2},
+            "by_conversation": {"0": {
+                "total": 2,
+                "abstained": 0,
+                "errors": 0,
+                "false_injections": 2,
+                "false_injection_rate": 1.0,
+            }},
+        }},
+        "evaluations": [
+            {"failure_reason": None, "retrieval_results": [{"score": 0.1}]},
+            {"failure_reason": None, "retrieval_results": [{"score": 0.2}, {"score": 0.3}]},
+        ],
+    }
+    lexical_path = tmp_path / "lexical.json"
+    fused_path = tmp_path / "fused.json"
+    lexical_path.write_text(json.dumps(lexical))
+    fused_path.write_text(json.dumps(fused))
+
+    actual = render_report(lexical_path, fused_path)
+    expected = (Path(__file__).parent / "fixtures/locomo/report.md").read_text()
+
+    assert actual == expected
 
 
 def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkeypatch):
