@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import math
 import sqlite3
 import struct
@@ -26,9 +27,16 @@ class FakeEncoder:
         return vectors
 
 
-def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes: list[Path] | None = None):
+def make_config(
+    tmp_path: Path,
+    roots: list[tuple[str, str, Path]],
+    global_notes: list[Path] | None = None,
+    semantic_bundle: Path | None = None,
+):
     global_notes = global_notes or []
     lines = [f'database = "{tmp_path / "index.sqlite3"}"']
+    if semantic_bundle is not None:
+        lines.extend(["", f'semantic_bundle = "{semantic_bundle}"'])
     if global_notes:
         lines.append("global_notes = [" + ", ".join(f'"{path}"' for path in global_notes) + "]")
     for root_id, project, path in roots:
@@ -36,6 +44,10 @@ def make_config(tmp_path: Path, roots: list[tuple[str, str, Path]], global_notes
     config_path = tmp_path / "config.toml"
     config_path.write_text("\n".join(lines))
     return load_config(config_path)
+
+
+def semantic_extra_available() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime"))
 
 
 def test_pinned_tokenizer_defaults_missing_direction_and_truncates(tmp_path: Path):
@@ -189,12 +201,13 @@ def test_failed_vector_refresh_publishes_lexical_generation_as_stale(tmp_path: P
         connection.close()
 
 
-def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "note.md").write_text("# Note\nlexical fallback\n")
-    config = make_config(tmp_path, [("vault", "p", root)])
-    monkeypatch.setattr(core, "package_version", lambda _: None)
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config = make_config(tmp_path, [("vault", "p", root)], semantic_bundle=bundle)
 
     core.index(config)
     results = core.semantic_search(config, "lexical fallback", project="p")
@@ -202,7 +215,8 @@ def test_semantic_failure_falls_back_to_lexical_search(tmp_path: Path, monkeypat
     assert [result.heading for result in results] == ["Note"]
     connection = sqlite3.connect(config.database)
     try:
-        assert connection.execute("SELECT value FROM metadata WHERE key = 'semantic_reason'").fetchone()[0] == "MODEL_MISSING"
+        expected_reason = "MODEL_MISSING" if semantic_extra_available() else "EXTRA_MISSING"
+        assert connection.execute("SELECT value FROM metadata WHERE key = 'semantic_reason'").fetchone()[0] == expected_reason
     finally:
         connection.close()
 

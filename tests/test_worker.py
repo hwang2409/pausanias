@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 import subprocess
 import sys
 import threading
@@ -43,16 +44,20 @@ class FailingEncoder:
         raise RuntimeError("encode failed")
 
 
-def make_config(tmp_path: Path):
+def make_config(tmp_path: Path, semantic_bundle: Path | None = None):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "note.md").write_text("# Note\nalpha memory\n")
     path = tmp_path / "config.toml"
-    path.write_text(
-        f'database = "{tmp_path / "index.sqlite3"}"\n\n'
-        f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n'
-    )
+    config_text = f'database = "{tmp_path / "index.sqlite3"}"\n\n'
+    if semantic_bundle is not None:
+        config_text += f'semantic_bundle = "{semantic_bundle}"\n\n'
+    path.write_text(config_text + f'[[roots]]\nid = "vault"\nproject = "p"\npath = "{root}"\n')
     return path, load_config(path)
+
+
+def semantic_extra_available() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in ("numpy", "onnxruntime"))
 
 
 def wait_for_socket(path: Path) -> None:
@@ -97,13 +102,16 @@ def test_worker_reuses_encoder_and_matrix(tmp_path: Path):
 
 
 def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
-    config_path, config = make_config(tmp_path)
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config_path, config = make_config(tmp_path, semantic_bundle=bundle)
     core.index(config)
     try:
         response = run_hook(config, config_path, "alpha memory", project="p")
         assert [item.heading for item in response.candidates] == ["Note"]
         assert response.metrics.fallback is True
-        assert response.metrics.disabled_reason == "MODEL_MISSING"
+        expected_reason = "MODEL_MISSING" if semantic_extra_available() else "EXTRA_MISSING"
+        assert response.metrics.disabled_reason == expected_reason
     finally:
         stop_worker(config.database)
 
@@ -186,7 +194,9 @@ def test_waiter_timeout_returns_lexical_fallback(tmp_path: Path, monkeypatch: py
 
 
 def test_worker_death_mid_query_recovers_on_next_hook(tmp_path: Path):
-    config_path, config = make_config(tmp_path)
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config_path, config = make_config(tmp_path, semantic_bundle=bundle)
     core.index(config)
     paths = worker_paths(config.database)
     try:

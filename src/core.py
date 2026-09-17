@@ -815,7 +815,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
     if refresh is not None:
         refresh.update(validation_refresh)
     if validation_refresh:
-        return []
+        return lexical[:limit]
     if timings is not None and not timings.get("semantic_available"):
         return lexical[:limit]
     guard_identifiers = {
