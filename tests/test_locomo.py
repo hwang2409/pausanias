@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import eval.benchmarks.locomo.run as locomo_runner
 from eval.benchmarks.locomo.run import (
     StubTransport,
@@ -14,6 +16,7 @@ from eval.benchmarks.locomo.run import (
     run_locomo,
 )
 from eval.vendor.mem0.benchmarks.locomo.prompts import get_answer_generation_prompt
+from pausanias.vectors import Candidate
 
 FIXTURES = Path(__file__).parent.parent / "eval/fixtures/locomo/golden-prompts-v1"
 
@@ -78,6 +81,11 @@ def test_locomo_runner_prompt_matches_vendored_date_fixture(tmp_path: Path):
     assert "(Monday, May 01, 2023)" in transport.calls[0]["user"]
 
 
+def test_locomo_rejects_predict_and_evaluate_only_together():
+    with pytest.raises(ValueError, match="--predict-only and --evaluate-only cannot be combined"):
+        run_locomo(run_id="invalid-flags", predict_only=True, evaluate_only=True)
+
+
 def test_locomo_search_and_stub_evaluate_are_resumable(tmp_path: Path):
     dataset = Path(__file__).parent / "fixtures/locomo/small.json"
     run_locomo(
@@ -106,6 +114,216 @@ def test_locomo_search_and_stub_evaluate_are_resumable(tmp_path: Path):
     assert result.metrics.total == 2
     assert result.metrics.errors == 0
     assert result.metadata.prompt_fixture_version == "golden-prompts-v1"
+
+
+def test_predict_only_writes_retrieval_summary(tmp_path: Path):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    result = run_locomo(
+        run_id="predict-summary",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 2, 4, 8),
+        predict_only=True,
+    )
+
+    assert result is not None
+    artifact = json.loads((tmp_path / "locomo/predict-summary/run.json").read_text())
+    assert artifact["metadata"]["corpus_fingerprint"]
+    assert artifact["metadata"]["dataset"]["fingerprint"]
+    assert artifact["metadata"]["config"]["retrieval_mode"] == "lexical"
+    assert artifact["metadata"]["config"]["answerer_model"] is None
+    assert artifact["metadata"]["config"]["answerer_provider"] is None
+    assert artifact["metadata"]["config"]["judge_model"] is None
+    assert artifact["metadata"]["config"]["judge_provider"] is None
+    assert artifact["metadata"]["answerer_prompt_hash"] is None
+    assert artifact["metadata"]["judge_prompt_hash"] is None
+    assert artifact["metadata"]["prompt_version"] is None
+    assert artifact["metadata"]["prompt_fixture_version"] is None
+
+    for cutoff in (1, 2, 4, 8):
+        outcomes = [item.cutoff_outcomes[str(cutoff)] for item in result.evaluations]
+        summary = result.metrics.by_cutoff[str(cutoff)]["overall"]
+        assert summary["total"] == len(outcomes)
+        assert summary["relevant_count"] == sum(item.relevant_count for item in outcomes)
+        assert summary["recall"] == pytest.approx(sum(item.recall for item in outcomes) / len(outcomes))
+        assert summary["precision"] == pytest.approx(sum(item.precision for item in outcomes) / len(outcomes))
+        assert summary["mrr"] == pytest.approx(sum(item.mrr for item in outcomes) / len(outcomes))
+
+    assert result.metrics.latency_ms["overall"]["max_ms"] >= result.metrics.latency_ms["overall"]["p95_ms"]
+    assert all(
+        outcome.generated_answer is None
+        and outcome.judgment is None
+        and outcome.model is None
+        and outcome.prompt_metadata == {}
+        for evaluation in result.evaluations
+        for outcome in evaluation.cutoff_outcomes.values()
+    )
+
+
+def test_predict_only_resume_reuses_search_checkpoints(tmp_path: Path, monkeypatch):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(run_id="predict-resume", dataset_path=dataset, results_dir=tmp_path, top_k=8, cutoffs=(1, 8), predict_only=True)
+    checkpoint_path = tmp_path / "locomo/predict-resume/checkpoints/search/conv0_q0.json"
+    checkpoint_before = checkpoint_path.read_bytes()
+
+    def fail_if_recomputed(*args, **kwargs):
+        raise AssertionError("resume recomputed a search checkpoint")
+
+    monkeypatch.setattr(locomo_runner, "_search_record", fail_if_recomputed)
+    result = run_locomo(
+        run_id="predict-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        resume=True,
+    )
+
+    assert result is not None
+    assert checkpoint_path.read_bytes() == checkpoint_before
+    assert (tmp_path / "locomo/predict-resume/run.json").exists()
+
+
+@pytest.mark.parametrize("diagnostic_mutation", ("empty", "missing_failure_reason"))
+def test_fused_resume_recomputes_checkpoint_with_incomplete_diagnostics(tmp_path: Path, monkeypatch, diagnostic_mutation: str):
+    dataset = Path(__file__).parent / "fixtures/locomo/small.json"
+    run_locomo(
+        run_id="fused-diagnostics-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        retrieval_mode="fused",
+    )
+    checkpoint_path = tmp_path / "locomo/fused-diagnostics-resume/checkpoints/search/conv0_q0.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    if diagnostic_mutation == "empty":
+        checkpoint["output"]["retrieval_diagnostics"] = {}
+    else:
+        del checkpoint["output"]["retrieval_diagnostics"]["failure_reason"]
+    checkpoint_path.write_text(json.dumps(checkpoint))
+
+    real_search_record = locomo_runner._search_record
+    recomputed = []
+
+    def record_recompute(*args, **kwargs):
+        recomputed.append(args[0]["case_id"])
+        return real_search_record(*args, **kwargs)
+
+    monkeypatch.setattr(locomo_runner, "_search_record", record_recompute)
+    result = run_locomo(
+        run_id="fused-diagnostics-resume",
+        dataset_path=dataset,
+        results_dir=tmp_path,
+        top_k=8,
+        cutoffs=(1, 8),
+        predict_only=True,
+        resume=True,
+        retrieval_mode="fused",
+    )
+
+    assert result is not None
+    assert "conv0_q0" in recomputed
+    assert result.metrics.baselines["retrieval_diagnostics"]["searches"] == 2
+    assert json.loads(checkpoint_path.read_text())["output"]["retrieval_diagnostics"]
+
+
+def test_predict_only_aggregates_multiple_categories_and_diagnostics(tmp_path: Path, monkeypatch):
+    dataset = json.loads((Path(__file__).parent / "fixtures/locomo/small.json").read_text())
+    dataset[0]["qa"][0]["category"] = 1
+    dataset[0]["qa"][1]["category"] = 2
+    dataset_path = tmp_path / "multi-category.json"
+    dataset_path.write_text(json.dumps(dataset))
+
+    def candidate(section_id: str, path: Path, root_id: str, project: str) -> Candidate:
+        return Candidate(
+            section_id,
+            str(path),
+            None,
+            (),
+            1,
+            100,
+            root_id,
+            project,
+            section_id,
+            section_id,
+            None,
+            None,
+            None,
+            1.0,
+            "fixture",
+        )
+
+    def fake_search(config, query, top_k, retrieval_mode, worker_config_path):
+        scope = config.database.parent
+        root_id = config.roots[0].id
+        project = config.roots[0].project
+        session_one = scope / "conversation-00--session-01.md"
+        session_two = scope / "conversation-00--session-02.md"
+        if query == "blue bicycle":
+            results = [
+                candidate("blue", session_one, root_id, project),
+                candidate("wrong", session_two, root_id, project),
+            ]
+        else:
+            results = [
+                candidate("wrong", session_one, root_id, project),
+                candidate("landscapes", session_two, root_id, project),
+            ]
+        return results[:top_k], None
+
+    monkeypatch.setattr(locomo_runner, "_search_candidates", fake_search)
+    result = run_locomo(
+        run_id="multi-category-summary",
+        dataset_path=dataset_path,
+        results_dir=tmp_path,
+        top_k=2,
+        cutoffs=(1, 2),
+        predict_only=True,
+    )
+
+    assert result is not None
+    artifact = json.loads((tmp_path / "locomo/multi-category-summary/run.json").read_text())
+    assert artifact["metrics"]["by_category"] == {
+        "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+        "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 1.0},
+        "temporal": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 0.5},
+        "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+    }
+    assert artifact["metrics"]["by_cutoff"] == {
+        "1": {
+            "cutoff": 1,
+            "overall": {"total": 2, "relevant_count": 1, "recall": 0.5, "precision": 0.5, "mrr": 0.5},
+            "by_category": {
+                "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 1.0, "mrr": 1.0},
+                "temporal": {"total": 1, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+            },
+        },
+        "2": {
+            "cutoff": 2,
+            "overall": {"total": 2, "relevant_count": 2, "recall": 1.0, "precision": 0.5, "mrr": 0.75},
+            "by_category": {
+                "single-hop": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+                "multi-hop": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 1.0},
+                "temporal": {"total": 1, "relevant_count": 1, "recall": 1.0, "precision": 0.5, "mrr": 0.5},
+                "open-domain": {"total": 0, "relevant_count": 0, "recall": 0.0, "precision": 0.0, "mrr": 0.0},
+            },
+        },
+    }
+    assert artifact["metrics"]["baselines"] == {
+        "retrieval_diagnostics": {
+            "searches": 2,
+            "fallback_count": 0,
+            "retrieval_mode_counts": {"lexical": 2},
+            "semantic_state_counts": {},
+            "failure_reason_counts": {},
+        }
+    }
 
 
 def test_stub_failures_keep_mem0_error_semantics(tmp_path: Path):

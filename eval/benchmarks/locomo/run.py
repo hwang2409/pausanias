@@ -39,6 +39,12 @@ from eval.schema import (
     retrieval_result_from_dict,
     utc_now,
 )
+from eval.benchmarks.locomo.metrics import (
+    COMPARABLE_CATEGORIES,
+    _predict_metrics,
+    has_complete_retrieval_diagnostics,
+    retrieval_outcome,
+)
 from eval.vendor.mem0.benchmarks.locomo.prompts import (
     CATEGORIES_TO_EVALUATE,
     CATEGORY_NAMES,
@@ -59,9 +65,6 @@ PROMPT_VERSION = "mem0-locomo-4b61c5d"
 PROMPT_FIXTURE_VERSION = "golden-prompts-v1"
 DEFAULT_CUTOFFS = (10, 20, 50, 200)
 DEFAULT_TOP_K = 200
-COMPARABLE_CATEGORIES = ("single-hop", "multi-hop", "temporal", "open-domain")
-
-
 class LocomoError(RuntimeError):
     """Raised for invalid benchmark input or a failed stage."""
 
@@ -313,23 +316,6 @@ def _candidate_result(candidate: Candidate, notes: Path, rank: int) -> Retrieval
     )
 
 
-def _target_matches(result: RetrievalResult, target: dict[str, object]) -> bool:
-    return result.source_path == target["path"] and result.line_start <= int(target["line_start"]) and result.line_end >= int(target["line_end"])
-
-
-def retrieval_outcome(results: tuple[RetrievalResult, ...], targets: list[dict[str, object]], cutoff: int) -> tuple[int, float, float, float]:
-    selected = results[:cutoff]
-    matched_targets = {target["evidence_id"] for target in targets if any(_target_matches(result, target) for result in selected)}
-    matched_results = {result.section_id for result in selected if any(_target_matches(result, target) for target in targets)}
-    relevant = len(matched_targets)
-    recall = relevant / len(targets) if targets else 0.0
-    precision = len(matched_results) / len(selected) if selected else 0.0
-    mrr = 1.0 / next((result.rank for result in selected if result.section_id in matched_results), 1_000_000)
-    if not matched_results:
-        mrr = 0.0
-    return relevant, recall, precision, mrr
-
-
 def _prompt_metadata(prompt: str, provider: str, model: str, reply: LLMReply | None, slots: tuple[str, ...]) -> PromptMetadata:
     return PromptMetadata(
         prompt_version=PROMPT_VERSION,
@@ -552,18 +538,20 @@ def _search_candidates(
     top_k: int,
     retrieval_mode: str,
     worker_config_path: Path | None,
-) -> list[Candidate]:
+) -> tuple[list[Candidate], dict[str, object] | None]:
     if retrieval_mode == "fused":
         if worker_config_path is None:
             raise LocomoError("fused retrieval requires a worker config")
-        return run_hook(
+        response = run_hook(
             config,
             worker_config_path,
             query,
             project=config.roots[0].project,
             limit=top_k,
-        ).candidates
-    return search(config, query, project=config.roots[0].project, limit=top_k, semantic=False)
+            retrieval_mode="fused",
+        )
+        return response.candidates, asdict(response.metrics)
+    return search(config, query, project=config.roots[0].project, limit=top_k, semantic=False), None
 
 
 def _search_record(
@@ -584,7 +572,7 @@ def _search_record(
         excerpt = "\n".join(lines[int(target["line_start"]) - 1:int(target["line_end"])])
         evidence_lines.append(f"[{target['evidence_id']}] {excerpt}")
     start = time.perf_counter()
-    candidates = _search_candidates(
+    candidates, diagnostics = _search_candidates(
         config,
         str(record["question"]),
         top_k,
@@ -601,6 +589,7 @@ def _search_record(
         "reference_date": record["sessions"][-1][1] if record["sessions"] else None,
         "source_dates": source_dates,
         "evidence_context": "\n".join(evidence_lines),
+        **({"retrieval_diagnostics": diagnostics} if diagnostics is not None else {}),
     }
 
 
@@ -701,6 +690,8 @@ def run_locomo(
     transport: object | None = None,
     retrieval_mode: str = "lexical",
 ) -> UnifiedResult | None:
+    if predict_only and evaluate_only:
+        raise ValueError("--predict-only and --evaluate-only cannot be combined")
     if top_k < max(cutoffs) or not cutoffs:
         raise ValueError("top-k must include all cutoffs")
     if retrieval_mode not in {"lexical", "fused"}:
@@ -708,9 +699,10 @@ def run_locomo(
     selected_judge_provider = judge_provider or provider
     if not predict_only and transport is None and (not _required_key(provider) or not _required_key(selected_judge_provider)):
         raise LocomoError("answerer and judge API keys are required for evaluation")
-    if dataset_path is None and predict_only:
+    auto_dataset = dataset_path is None
+    if auto_dataset and predict_only:
         dataset_path = fetch_dataset()
-    entries, dataset = load_dataset(dataset_path)
+    entries, dataset = load_dataset(None if auto_dataset else dataset_path)
     selected = set(range(len(entries))) if conversations is None else set(conversations)
     entries = [dict(entry, _conversation_index=index) for index, entry in enumerate(entries) if index in selected]
     run_root = results_dir / "locomo" / run_id
@@ -805,6 +797,7 @@ def run_locomo(
             worker_config_paths.get(int(records[0]["conversation_index"])),
         )
     evaluations: list[Evaluation] = []
+    diagnostic_records: list[dict[str, object]] = []
     for record in records:
         scope_notes, scope_config = scope_configs[int(record["conversation_index"])]
         scope_metadata = scope_indexes[int(record["conversation_index"])]
@@ -821,6 +814,14 @@ def run_locomo(
             corpus_fingerprint=scope_corpus_hash,
             index_generation=scope_generation,
         ) if (resume or evaluate_only) else None
+        if (
+            checkpoint is not None
+            and predict_only
+            and resume
+            and retrieval_mode == "fused"
+            and not has_complete_retrieval_diagnostics(checkpoint.output.get("retrieval_diagnostics"))
+        ):
+            checkpoint = None
         if checkpoint is None:
             if evaluate_only and existing_ingest is not None:
                 raise LocomoError(f"missing search checkpoint: {record['case_id']}")
@@ -835,6 +836,11 @@ def run_locomo(
             Checkpoint("search", run_id, dataset["fingerprint"], scope_corpus_hash, scope_generation, config_values, "complete", utc_now(), utc_now(), raw, str(record["case_id"])).write(checkpoint_path)
         else:
             raw = checkpoint.output
+        raw_diagnostics = raw.get("retrieval_diagnostics")
+        if isinstance(raw_diagnostics, dict):
+            diagnostic_records.append(raw_diagnostics)
+        elif retrieval_mode == "lexical":
+            diagnostic_records.append({"retrieval_mode": "lexical", "fallback": False})
         retrieval = tuple(retrieval_result_from_dict(item) for item in raw["retrieval_results"])
         evaluation_path = evaluate_dir / f"{record['case_id']}.json"
         if not predict_only:
@@ -854,20 +860,19 @@ def run_locomo(
                 continue
         outcomes: dict[str, CutoffOutcome] = {}
         if predict_only:
-            outcomes = {
-                str(cutoff): CutoffOutcome(
+            for cutoff in cutoffs:
+                relevant, recall, precision, mrr = retrieval_outcome(retrieval, list(raw["targets"]), cutoff)
+                outcomes[str(cutoff)] = CutoffOutcome(
                     retrieved_count=len(retrieval[:cutoff]),
-                    relevant_count=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[0],
-                    recall=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[1],
-                    precision=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[2],
-                    mrr=retrieval_outcome(retrieval, list(raw["targets"]), cutoff)[3],
+                    relevant_count=relevant,
+                    recall=recall,
+                    precision=precision,
+                    mrr=mrr,
                     abstention_correct=None,
                     forbidden_sources=0,
                     score=0.0,
                     passed=False,
                 )
-                for cutoff in cutoffs
-            }
         else:
             if transport is None:
                 transport = _http_transport
@@ -894,8 +899,38 @@ def run_locomo(
         for _, scope_config in scope_configs.values():
             stop_worker(scope_config.database)
     if predict_only:
+        predict_config = {
+            **retrieval_config,
+            "prompt_mode": None,
+            "prompt_version": None,
+            "prompt_fixture_version": None,
+            "profile_fingerprint": None,
+            "answerer_model": None,
+            "answerer_provider": None,
+            "judge_model": None,
+            "judge_provider": None,
+        }
+        metrics = _predict_metrics(evaluations, cutoffs, diagnostic_records)
+        metadata = Metadata(
+            "locomo",
+            run_id,
+            dataset,
+            corpus_hash,
+            generation,
+            None,
+            None,
+            None,
+            fingerprint({"dataset": dataset, "config": predict_config, "corpus": corpus_hash}),
+            None,
+            None,
+            predict_config,
+            ingest.started_at,
+            utc_now(),
+        )
+        result = UnifiedResult(metadata, metrics, tuple(evaluations))
+        result.write(run_root / "run.json")
         print(f"locomo predict-only: {len(evaluations)} search checkpoints; dataset fingerprint {dataset['fingerprint']}")
-        return None
+        return result
     metrics = _common_metrics(evaluations, cutoffs)
     prompt_hashes = [outcome.prompt_metadata for evaluation in evaluations for outcome in evaluation.cutoff_outcomes.values()]
     answer_hash = fingerprint([metadata["answerer"].template_hash for metadata in prompt_hashes if "answerer" in metadata]) if prompt_hashes else None
