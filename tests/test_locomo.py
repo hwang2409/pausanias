@@ -739,10 +739,8 @@ def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkey
         (Path(__file__).parent / "fixtures/locomo/pre-pr-cats-1-4.json").read_text()
     )
     # SQLite builds can vary in floating-point FTS scores; CI observed 2e-12 drift.
-    # Keep discrete fields exact while retaining sensitivity to meaningful score changes.
+    # Keep non-score fields exact while retaining sensitivity to meaningful score changes.
     def stable(value):
-        if isinstance(value, float):
-            return round(value, 9)
         if isinstance(value, dict):
             return {
                 key: stable(item)
@@ -753,10 +751,25 @@ def test_regular_locomo_path_matches_pinned_pre_pr_golden(tmp_path: Path, monkey
             return [stable(item) for item in value]
         return value
 
+    def assert_stable_equal(actual, expected, path=()):
+        if isinstance(actual, dict) and isinstance(expected, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                assert_stable_equal(actual[key], expected[key], (*path, key))
+            return
+        if isinstance(actual, list) and isinstance(expected, list):
+            assert len(actual) == len(expected)
+            for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+                assert_stable_equal(actual_item, expected_item, (*path, index))
+            return
+        if path[-1:] == ("score",) and "retrieval_results" in path:
+            assert actual == pytest.approx(expected, rel=0, abs=5e-12)
+            return
+        assert type(actual) is type(expected)
+        assert actual == expected
+
     actual_outputs = stable(actual["evaluations"])
-    assert json.dumps(actual_outputs, sort_keys=True) == json.dumps(
-        stable(expected["evaluations"]), sort_keys=True
-    )
+    assert_stable_equal(actual_outputs, stable(expected["evaluations"]))
 
 
 def test_locomo_corrupt_score_checkpoint_is_recomputed(tmp_path: Path):
