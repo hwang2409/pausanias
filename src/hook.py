@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import multiprocessing
 import time
 from pathlib import Path
 
@@ -42,10 +43,51 @@ def _candidate(value: dict[str, object]) -> Candidate:
     )
 
 
+def _lexical_search_child(connection, config: Config, query: str, project: str | None,
+                          root_id: str | None, all_projects: bool, limit: int) -> None:
+    try:
+        connection.send(search(config, query, project, root_id, all_projects, limit))
+    except Exception as exc:
+        connection.send(exc)
+    finally:
+        connection.close()
+
+
+def _lexical_search_until(config: Config, query: str, project: str | None, root_id: str | None,
+                          all_projects: bool, limit: int, deadline: float | None) -> list[Candidate]:
+    if deadline is not None and time.perf_counter() >= deadline:
+        return []
+    start_method = "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
+    context = multiprocessing.get_context(start_method)
+    parent, child = context.Pipe(False)
+    process = context.Process(
+        target=_lexical_search_child,
+        args=(child, config, query, project, root_id, all_projects, limit),
+        daemon=True,
+    )
+    process.start()
+    child.close()
+    try:
+        remaining = None if deadline is None else max(deadline - time.perf_counter(), 0.0)
+        if remaining == 0.0 or not parent.poll(remaining):
+            process.kill()
+            process.join(timeout=0)
+            return []
+        value = parent.recv()
+        return value if isinstance(value, list) and all(isinstance(item, Candidate) for item in value) else []
+    finally:
+        parent.close()
+        if process.is_alive():
+            process.kill()
+        process.join(timeout=0)
+
+
 def _fallback(config: Config, query: str, project: str | None, root_id: str | None,
-              all_projects: bool, limit: int, started: float, worker_startup_ms: float = 0.000001) -> HookResponse:
+              all_projects: bool, limit: int, started: float,
+              worker_startup_ms: float = 0.000001, deadline: float | None = None,
+              disabled_reason: str | None = None) -> HookResponse:
     fallback_started = time.perf_counter()
-    candidates = search(config, query, project, root_id, all_projects, limit)
+    candidates = _lexical_search_until(config, query, project, root_id, all_projects, limit, deadline)
     fallback_ms = max((time.perf_counter() - fallback_started) * 1000.0, 0.000001)
     return HookResponse(candidates, HookMetrics(
         worker_startup_ms=worker_startup_ms,
@@ -53,6 +95,7 @@ def _fallback(config: Config, query: str, project: str | None, root_id: str | No
         hook_total_ms=max((time.perf_counter() - started) * 1000.0, 0.000001),
         fallback=True,
         cache_state="fallback",
+        disabled_reason=disabled_reason,
     ))
 
 
@@ -73,7 +116,7 @@ def run_hook(
     deadline = started + deadline_ms / 1000.0
     startup = ensure_worker(config, Path(config_path), deadline)
     if startup is None:
-        return _fallback(config, query, project, root_id, all_projects, limit, started)
+        return _fallback(config, query, project, root_id, all_projects, limit, started, deadline=deadline)
     paths, worker_startup_ms = startup
     try:
         response = WorkerClient(paths).query({
@@ -91,6 +134,9 @@ def run_hook(
         if not all(isinstance(item, dict) for item in items):
             raise ValueError("worker candidates are invalid")
         candidates = [_candidate(item) for item in items]
+        status = raw_metrics.get("status", response.get("status", "ok"))
+        if status == "semantic_failure" and not bool(raw_metrics.get("fallback", False)):
+            raise WorkerError("worker reported semantic failure without fallback")
         metrics = HookMetrics(
             worker_startup_ms=worker_startup_ms,
             model_load_ms=float(raw_metrics.get("model_load_ms", 0.000001)),
@@ -103,7 +149,10 @@ def run_hook(
             hook_total_ms=max((time.perf_counter() - started) * 1000.0, 0.000001),
             fallback=bool(raw_metrics.get("fallback", False)),
             cache_state=str(raw_metrics.get("cache_state", "unknown")),
+            disabled_reason=(str(raw_metrics["disabled_reason"])
+                             if raw_metrics.get("disabled_reason") is not None else None),
         )
         return HookResponse(candidates, metrics)
     except (OSError, TimeoutError, ValueError, TypeError, OverflowError, WorkerError):
-        return _fallback(config, query, project, root_id, all_projects, limit, started, worker_startup_ms)
+        return _fallback(config, query, project, root_id, all_projects, limit, started,
+                         worker_startup_ms, deadline)

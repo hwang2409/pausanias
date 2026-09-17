@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+import subprocess
+import time
 
-from pausanias.bench import format_report, run_benchmark
+import pausanias.bench as bench
+from pausanias.bench import QuerySpec, _run_hook_benchmark, format_report, run_benchmark
 from pausanias.synth import generate_corpus
 
 
@@ -73,3 +77,55 @@ def test_targetless_metrics_are_not_reported_as_passed():
     for name in ("index_build_ms", "incremental_refresh_ms", "warm_search_p50_ms"):
         assert report["checks"][name]["passed"] is None
     assert "n/a" in format_report(report)
+
+
+def test_hook_process_uses_parent_wall_time(monkeypatch, tmp_path: Path):
+    payload = {"items": [], "metrics": {"hook_total_ms": 1.0, "fallback": False}}
+
+    def fake_run(*args, **kwargs):
+        time.sleep(0.01)
+        return subprocess.CompletedProcess(args[0], 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(bench.subprocess, "run", fake_run)
+    query = QuerySpec("alpha")
+    result = bench._hook_process(tmp_path / "config.toml", query)
+    assert result["metrics"]["hook_internal_ms"] == 1.0
+    assert result["metrics"]["hook_total_ms"] >= 10.0
+
+
+def test_hook_gate_fails_when_parent_budget_is_exceeded(tmp_path: Path, monkeypatch):
+    config_path, config = _benchmark_config(tmp_path)
+    queries = [QuerySpec("alpha", project="real")]
+    metrics = {
+        "hook_total_ms": 301.0,
+        "worker_startup_ms": 1.0,
+        "model_load_ms": 1.0,
+        "matrix_load_ms": 1.0,
+        "encode_ms": 1.0,
+        "scan_ms": 1.0,
+        "fallback_ms": 1.0,
+        "fts_search_ms": 1.0,
+        "hybrid_overhead_ms": 1.0,
+        "fallback": False,
+        "cache_state": "warm",
+    }
+    monkeypatch.setattr(bench, "_hook_process", lambda *args: {"metrics": dict(metrics), "items": []})
+    monkeypatch.setattr(bench, "stop_worker", lambda *args: None)
+    result = _run_hook_benchmark(config_path, config, queries, 1)
+    assert result["warm"]["gate"]["passed"] is False
+
+
+def _benchmark_config(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\nalpha memory\n")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'database = "{tmp_path / "index.sqlite3"}"\n\n'
+        f'[[roots]]\nid = "root"\nproject = "real"\npath = "{root}"\n'
+    )
+    from pausanias.config import load_config
+    from pausanias.core import index
+    config = load_config(config_path)
+    index(config)
+    return config_path, config

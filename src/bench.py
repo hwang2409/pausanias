@@ -7,8 +7,10 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import random
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,6 +21,7 @@ from .core import index, search
 from .worker import stop_worker
 from .splitter import split_markdown
 from .synth import generate_corpus
+from .model_bundle import MODEL_BUNDLE_MANIFEST
 
 
 IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
@@ -484,12 +487,19 @@ def _hook_process(config_path: Path, query: QuerySpec) -> dict:
     repository = str(Path(__file__).resolve().parents[1])
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = repository if not existing_pythonpath else repository + os.pathsep + existing_pythonpath
+    started = time.perf_counter()
     completed = subprocess.run(command, capture_output=True, text=True, cwd=repository, env=environment, check=False)
+    wall_ms = _positive_milliseconds(time.perf_counter() - started)
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "hook process failed")
     value = json.loads(completed.stdout)
     if not isinstance(value, dict) or not isinstance(value.get("metrics"), dict):
         raise RuntimeError("hook process returned an invalid report")
+    metrics = value["metrics"]
+    metrics["hook_internal_ms"] = metrics.get("hook_total_ms", 0.000001)
+    metrics["hook_total_ms"] = wall_ms
+    value["candidate_count"] = len(value.get("items", [])) if isinstance(value.get("items"), list) else 0
+    metrics["candidate_count"] = value["candidate_count"]
     return value
 
 
@@ -497,7 +507,7 @@ def _stage_summary(values: list[float]) -> dict[str, float]:
     return {"p50_ms": _percentile(values, 0.50), "p95_ms": _percentile(values, 0.95), "max_ms": max(values)}
 
 
-def _phase_report(samples: list[dict]) -> dict[str, object]:
+def _phase_report(samples: list[dict], corpus_section_count: int = 0) -> dict[str, object]:
     names = (
         "hook_total_ms", "worker_startup_ms", "model_load_ms", "matrix_load_ms",
         "encode_ms", "scan_ms", "fallback_ms", "fts_search_ms", "hybrid_overhead_ms",
@@ -509,6 +519,12 @@ def _phase_report(samples: list[dict]) -> dict[str, object]:
     return {
         "metrics": metrics,
         "fallback_count": sum(bool(sample.get("fallback", False)) for sample in samples),
+        "candidate_count": sum(int(sample.get("candidate_count", 0)) for sample in samples),
+        "corpus_section_count": corpus_section_count,
+        "throughput": {
+            "queries_per_second": len(samples) / max(sum(float(sample.get("hook_total_ms", 0.000001)) for sample in samples) / 1000.0, 0.000001),
+            "encoded_sections_per_second": corpus_section_count / max(sum(float(sample.get("encode_ms", 0.000001)) for sample in samples) / 1000.0, 0.000001),
+        },
         "samples": len(samples),
         "cache_states": sorted({str(sample.get("cache_state", "unknown")) for sample in samples}),
     }
@@ -521,8 +537,10 @@ def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySp
     for query in queries:
         stop_worker(config.database)
         cold_samples.append(_hook_process(config_path, query)["metrics"])
-    warm = _phase_report(warm_samples)
-    cold = _phase_report(cold_samples)
+    with sqlite3.connect(config.database) as connection:
+        corpus_section_count = int(connection.execute("SELECT count(*) FROM sections").fetchone()[0])
+    warm = _phase_report(warm_samples, corpus_section_count)
+    cold = _phase_report(cold_samples, corpus_section_count)
     semantic_enabled = any(not bool(sample.get("fallback", False)) for sample in warm_samples + cold_samples)
     if not semantic_enabled:
         reason = "semantic backend unavailable; lexical gate remains active"
@@ -543,6 +561,20 @@ def _run_hook_benchmark(config_path: Path, config: Config, queries: list[QuerySp
         }
     result = {
         "query_count": query_count,
+        "throughput": {
+            "warm_queries_per_second": warm["throughput"]["queries_per_second"],
+            "cold_queries_per_second": cold["throughput"]["queries_per_second"],
+            "warm_encoded_sections_per_second": warm["throughput"]["encoded_sections_per_second"],
+            "cold_encoded_sections_per_second": cold["throughput"]["encoded_sections_per_second"],
+        },
+        "candidate_count": warm["candidate_count"] + cold["candidate_count"],
+        "corpus_size": {
+            "files": sum(len(_markdown_files(root.path)) for root in config.roots),
+            "sections": corpus_section_count,
+        },
+        "platform": platform.platform(),
+        "provider": MODEL_BUNDLE_MANIFEST["runtime"]["provider"],
+        "model_manifest": MODEL_BUNDLE_MANIFEST,
         "warm": {**warm, "gate": warm_gate},
         "cold": {**cold, "gate": cold_gate},
         "gates": {"warm_scan_path": warm_gate, "cold_scan_path": cold_gate},
@@ -594,7 +626,13 @@ def format_report(report: dict) -> str:
     lines += ["", f"warm p95 gate: {status}{enforcement}"]
     hook = report.get("hook_path")
     if hook is not None:
-        lines += ["", "hook-path stage metrics (p50 / p95 / max ms)"]
+        corpus = hook["corpus_size"]
+        lines += [
+            "",
+            f"hook corpus: {corpus['files']} files, {corpus['sections']} sections; candidates={hook['candidate_count']}",
+            f"hook platform: {hook['platform']}; provider: {hook['provider']}",
+            "hook-path stage metrics (p50 / p95 / max ms)",
+        ]
         for phase_name in ("warm", "cold"):
             phase = hook[phase_name]
             lines.append(f"{phase_name} scan path:")

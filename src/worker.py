@@ -33,6 +33,10 @@ class WorkerError(RuntimeError):
     """Raised when a worker cannot serve a request."""
 
 
+class RequestCancelled(WorkerError):
+    """Raised when the client cancels an in-flight request."""
+
+
 @dataclass(frozen=True)
 class WorkerPaths:
     socket: Path
@@ -52,6 +56,7 @@ class HookMetrics:
     hook_total_ms: float = 0.000001
     fallback: bool = False
     cache_state: str = "cold"
+    disabled_reason: str | None = None
 
 
 def worker_paths(database: Path) -> WorkerPaths:
@@ -79,8 +84,25 @@ def _write_record(path: Path, record: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _write_record_fd(fd: int, record: dict[str, object]) -> None:
+    """Update the lock record without replacing its flocked inode."""
+    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(payload)
+    while view:
+        view = view[os.write(fd, view):]
+    os.fsync(fd)
+
+
 def pid_alive(pid: int) -> bool:
     if pid < 1:
+        return False
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        waited = 0
+    if waited == pid:
         return False
     try:
         os.kill(pid, 0)
@@ -114,6 +136,9 @@ def stop_worker(database: Path, paths: WorkerPaths | None = None) -> bool:
             stopped = True
         except OSError:
             pass
+        wait_deadline = time.monotonic() + 1.0
+        while pid_alive(pid) and time.monotonic() < wait_deadline:
+            time.sleep(0.005)
     try:
         worker_paths_value.socket.unlink()
     except FileNotFoundError:
@@ -137,9 +162,12 @@ class PersistentWorker:
         self.idle_seconds = idle_seconds
         self._encoder = encoder
         self._encoder_error: str | None = None
+        self._encoder_failure_token: tuple[object, ...] | None = None
         self._encoder_lock = threading.Lock()
         self._matrix_cache: dict[tuple[object, ...], tuple[object, list[object]]] = {}
         self._matrix_lock = threading.Lock()
+        self._requests: dict[str, threading.Event] = {}
+        self._requests_lock = threading.Lock()
         self._started = time.perf_counter()
         self._stopping = threading.Event()
 
@@ -148,33 +176,66 @@ class PersistentWorker:
         return int(value) if value is not None else None
 
     def _publish(self, state: str, pid: int) -> None:
-        _write_record(self.paths.lock, {
+        record = {
             "database": str(self.config.database), "pid": pid,
             "launch_nonce": os.environ.get("PAUSANIAS_WORKER_NONCE", ""),
             "start_time": self._started, "socket_path": str(self.paths.socket),
             "readiness": state,
-        })
+        }
+        lock_fd = self._lock_fd()
+        if lock_fd is None:
+            _write_record(self.paths.lock, record)
+        else:
+            _write_record_fd(lock_fd, record)
+
+    def _backend_failure_token(self) -> tuple[object, ...]:
+        """Track state that can repair a cached model-load failure."""
+        try:
+            reason = semantic_backend_reason(self.config)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            reason = "MODEL_STATE_UNREADABLE"
+        paths = [self.config.bundle_dir, self.config.bundle_dir / "manifest.json",
+                 self.config.bundle_dir / "onnx/model.onnx"]
+        stats: list[object] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                stats.append((str(path), None))
+            else:
+                stats.append((str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        return (reason, *stats)
 
     def _load_encoder(self) -> tuple[object | None, float]:
         if self._encoder_error is not None:
-            return None, 0.000001
+            if (not self._injected_encoder_factory
+                    and self._encoder_failure_token == self._backend_failure_token()):
+                return None, 0.000001
+            self._encoder_error = None
+            self._encoder_failure_token = None
         if self._encoder is not None:
             return self._encoder, 0.000001
         with self._encoder_lock:
             if self._encoder_error is not None:
-                return None, 0.000001
+                if (not self._injected_encoder_factory
+                        and self._encoder_failure_token == self._backend_failure_token()):
+                    return None, 0.000001
+                self._encoder_error = None
+                self._encoder_failure_token = None
             if self._encoder is not None:
                 return self._encoder, 0.000001
             started = time.perf_counter()
             reason = None if self._injected_encoder_factory else semantic_backend_reason(self.config)
             if reason is not None:
                 self._encoder_error = reason
+                self._encoder_failure_token = self._backend_failure_token()
                 return None, _positive_ms(started)
             try:
                 bundle = self.config.bundle_dir if self._injected_encoder_factory else _resolve_active_bundle(self.config.bundle_dir)
                 self._encoder = self.encoder_factory(bundle)
             except (BundleError, OSError, SemanticError, RuntimeError, ValueError, TypeError) as exc:
                 self._encoder_error = str(exc)
+                self._encoder_failure_token = self._backend_failure_token()
                 return None, _positive_ms(started)
             return self._encoder, _positive_ms(started)
 
@@ -191,7 +252,12 @@ class PersistentWorker:
             "reason": candidate.reason,
         }
 
-    def _query(self, request: dict[str, object]) -> dict[str, object]:
+    @staticmethod
+    def _check_cancelled(cancelled: threading.Event | None) -> None:
+        if cancelled is not None and cancelled.is_set():
+            raise RequestCancelled("worker request cancelled")
+
+    def _query(self, request: dict[str, object], cancelled: threading.Event | None = None) -> dict[str, object]:
         started = time.perf_counter()
         query = request.get("query")
         if not isinstance(query, str):
@@ -206,25 +272,34 @@ class PersistentWorker:
             raise WorkerError("worker root_id must be a string or null")
         if not isinstance(all_projects, bool) or not isinstance(limit, int):
             raise WorkerError("worker scope values are invalid")
+        self._check_cancelled(cancelled)
         encoder, model_load_ms = self._load_encoder()
         timings: dict[str, float] = {}
         fallback = encoder is None
+        semantic_failure = False
+        failure_reason: str | None = None
         candidates: list[Candidate] = []
         if encoder is not None:
             encode_started = time.perf_counter()
             try:
                 vector = encoder_vectors(encoder, [query])[0]
+                self._check_cancelled(cancelled)
                 timings["encode_ms"] = _positive_ms(encode_started)
-                with self._matrix_lock:
+                while not self._matrix_lock.acquire(timeout=0.01):
+                    self._check_cancelled(cancelled)
+                try:
                     try:
                         candidates = scan_vectors(
                             self.config, unpack_vector(vector, int(MODEL_BUNDLE_MANIFEST["dimension"])),
                             project, root_id, all_projects, limit, timings=timings,
                             matrix_cache=self._matrix_cache,
                         )
+                        self._check_cancelled(cancelled)
                         if not timings.get("semantic_available"):
                             fallback = True
-                    except (SemanticError, ValueError, TypeError, RuntimeError, OSError):
+                            semantic_failure = True
+                            failure_reason = "semantic backend unavailable"
+                    except (SemanticError, ValueError, TypeError, RuntimeError, OSError) as exc:
                         self._matrix_cache.clear()
                         try:
                             candidates = scan_vectors(
@@ -232,25 +307,40 @@ class PersistentWorker:
                                 project, root_id, all_projects, limit, timings=timings,
                                 matrix_cache=self._matrix_cache,
                             )
-                        except (SemanticError, ValueError, TypeError, RuntimeError, OSError):
+                        except (SemanticError, ValueError, TypeError, RuntimeError, OSError) as retry_exc:
                             candidates = []
                             fallback = True
+                            semantic_failure = True
+                            failure_reason = str(retry_exc) or str(exc)
                         else:
                             fallback = not bool(timings.get("semantic_available"))
+                            semantic_failure = fallback
+                            failure_reason = "semantic backend unavailable" if fallback else None
                     generations = {key[0] for key in self._matrix_cache}
                     if len(generations) > 1:
                         newest = max(generations)
                         self._matrix_cache = {key: value for key, value in self._matrix_cache.items() if key[0] == newest}
-            except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError):
+                finally:
+                    self._matrix_lock.release()
+            except RequestCancelled:
+                raise
+            except (IndexError, SemanticError, ValueError, TypeError, RuntimeError, OSError) as exc:
                 candidates = []
+                fallback = True
+                semantic_failure = True
+                failure_reason = str(exc) or "semantic query failed"
         if fallback:
+            self._check_cancelled(cancelled)
             fallback_started = time.perf_counter()
             candidates = search(self.config, query, project, root_id, all_projects, limit)
+            self._check_cancelled(cancelled)
             timings["fallback_ms"] = _positive_ms(fallback_started)
         timings.setdefault("encode_ms", 0.000001)
         timings.setdefault("matrix_load_ms", 0.000001)
         timings.setdefault("scan_ms", 0.000001)
         return {
+            "status": "semantic_failure" if semantic_failure else ("semantic_disabled" if encoder is None else "ok"),
+            "failure_reason": failure_reason,
             "items": [self._candidate_payload(candidate) for candidate in candidates],
             "metrics": {
                 "worker_startup_ms": 0.000001, "model_load_ms": model_load_ms,
@@ -259,12 +349,14 @@ class PersistentWorker:
                 "fts_search_ms": timings.get("fallback_ms", 0.000001) if fallback else 0.000001,
                 "hybrid_overhead_ms": 0.000001,
                 "hook_total_ms": _positive_ms(started), "fallback": fallback,
-                "cache_state": "warm" if self._matrix_cache else "cold",
+                "cache_state": "disabled" if self._encoder_error else ("warm" if self._matrix_cache else "cold"),
                 "disabled_reason": self._encoder_error,
             },
         }
 
     def _serve_connection(self, connection: socket.socket) -> None:
+        request_id: str | None = None
+        cancelled: threading.Event | None = None
         try:
             connection.settimeout(ADAPTER_DEADLINE_MS / 1000.0)
             data = b""
@@ -273,9 +365,27 @@ class PersistentWorker:
                 if not chunk:
                     break
                 data += chunk
-            response = self._query(json.loads(data.decode("utf-8")))
+            request = json.loads(data.decode("utf-8"))
+            if not isinstance(request, dict):
+                raise WorkerError("worker request must be an object")
+            if request.get("command") == "cancel":
+                target = request.get("request_id")
+                cancelled_request = self._cancel_request(target)
+                response = {"cancelled": cancelled_request}
+            else:
+                request_id = request.get("request_id") if isinstance(request.get("request_id"), str) else uuid.uuid4().hex
+                cancelled = threading.Event()
+                with self._requests_lock:
+                    self._requests[request_id] = cancelled
+                response = self._query(request, cancelled)
+        except RequestCancelled:
+            response = {"cancelled": True}
         except (OSError, ValueError, TypeError, json.JSONDecodeError, WorkerError) as exc:
             response = {"error": str(exc)}
+        finally:
+            if request_id is not None:
+                with self._requests_lock:
+                    self._requests.pop(request_id, None)
         try:
             connection.sendall(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
         except OSError:
@@ -320,6 +430,16 @@ class PersistentWorker:
             except OSError:
                 pass
 
+    def _cancel_request(self, request_id: object) -> bool:
+        if not isinstance(request_id, str):
+            return False
+        with self._requests_lock:
+            event = self._requests.get(request_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
 
 def _acquire_lock(path: Path) -> int | None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,10 +455,11 @@ def _acquire_lock(path: Path) -> int | None:
 def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
                   database: Path | None = None) -> subprocess.Popen:
     nonce = uuid.uuid4().hex
-    _write_record(paths.lock, {
+    initial_record = {
         "database": str(database or paths.lock.parent), "pid": 0, "launch_nonce": nonce,
         "start_time": time.time(), "socket_path": str(paths.socket), "readiness": "starting",
-    })
+    }
+    _write_record_fd(lock_fd, initial_record)
     environment = os.environ.copy()
     environment["PAUSANIAS_WORKER_LOCK_FD"] = str(lock_fd)
     environment["PAUSANIAS_WORKER_NONCE"] = nonce
@@ -348,9 +469,9 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
         env=environment, pass_fds=(lock_fd,), close_fds=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    record = _read_record(paths.lock)
+    record = _read_record(paths.lock) or initial_record
     record["pid"] = process.pid
-    _write_record(paths.lock, record)
+    _write_record_fd(lock_fd, record)
     return process
 
 
@@ -387,25 +508,41 @@ class WorkerClient:
         self.paths = paths
 
     def query(self, request: dict[str, object], deadline: float) -> dict[str, object]:
+        request = {**request, "request_id": uuid.uuid4().hex}
+        request_id = request["request_id"]
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             raise TimeoutError("worker request exceeded adapter deadline")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(remaining)
-            connection.connect(str(self.paths.socket))
-            connection.sendall(json.dumps(request).encode("utf-8") + b"\n")
-            data = b""
-            while not data.endswith(b"\n") and len(data) < 2_000_000:
-                chunk = connection.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(remaining)
+                connection.connect(str(self.paths.socket))
+                connection.sendall(json.dumps(request).encode("utf-8") + b"\n")
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 2_000_000:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+        except (TimeoutError, socket.timeout):
+            self.cancel(str(request_id))
+            raise TimeoutError("worker request exceeded adapter deadline")
         response = json.loads(data.decode("utf-8"))
         if not isinstance(response, dict):
             raise WorkerError("worker response must be an object")
         if "error" in response:
             raise WorkerError(str(response["error"]))
         return response
+
+    def cancel(self, request_id: str) -> bool:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.005)
+                connection.connect(str(self.paths.socket))
+                connection.sendall(json.dumps({"command": "cancel", "request_id": request_id}).encode("utf-8") + b"\n")
+            return True
+        except OSError:
+            return False
 
 
 def main(argv: list[str] | None = None) -> int:
