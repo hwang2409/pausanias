@@ -58,8 +58,11 @@ from eval.vendor.mem0.benchmarks.locomo.prompts import (
     preprocess_answer,
 )
 
-DATASET_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 DATASET_COMMIT = "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376"
+DATASET_URL = (
+    "https://raw.githubusercontent.com/snap-research/locomo/"
+    f"{DATASET_COMMIT}/data/locomo10.json"
+)
 DATASET_SOURCE_COMMIT = DATASET_COMMIT
 DATASET_SHA256 = "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
 DATASET_DIR = Path("datasets/locomo")
