@@ -138,6 +138,29 @@ For short follow-ups such as “what about that?”, add bounded recent user mes
 
 Do not include previously injected packets or generated answers in the default query. Otherwise, a bad memory can cause its own repeated retrieval.
 
+### Relaxed lexical matching (PAUS-17)
+
+Strict lexical matching ANDs every token, so a question such as “what are the vault
+conventions for frontmatter?” also requires “what”, “are”, and “the”. On LOCOMO that
+made the lexical lane find evidence for 2 of 1,540 questions. Its near-perfect lexical
+abstention came from matching almost nothing.
+
+After the strict pass, a relaxed pass admits sections that cover enough of the query's
+content terms:
+
+- Drop stopwords. Require at least two content terms; a lone leftover keyword (“what
+  about that decision”) is a follow-up without context, not a query.
+- Require every term when there are two, otherwise at least half of them.
+- Require at least 45% of the query's total IDF weight, so a near miss cannot drop the
+  most distinctive term (“Postmark email provider” against a generic provider note).
+- Count ancestor headings as part of a section (“Vault Conventions > Frontmatter”).
+- Rank relaxed matches after every strict match by
+  `sum(idf(term) * field weight)`: own heading 2.0, ancestor heading 1.5, body 1.0.
+- Quoted queries stay strict.
+
+Term sets come from FTS5 itself, one query per content term, so section bodies are not
+re-tokenized. Measured results and the IDF floor sweep are in `eval/PAUS-17-RESULTS.md`.
+
 ### Scope and ranking
 
 Apply allowed-root and project filters before candidate selection. Project requests can also search explicitly configured global notes. Cross-project search requires an explicit request or configuration; semantic similarity cannot grant access.

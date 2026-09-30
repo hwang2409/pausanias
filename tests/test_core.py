@@ -614,6 +614,7 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "balanced_admission",
         "synonym_expansion",
         "synonym_variant_merge",
+        "relaxed_lexical_matching",
     }
 
 
@@ -1023,3 +1024,78 @@ def test_selection_reason_matches_heading_tokens_only(tmp_path: Path):
 
     assert search(config, "plan", project="p", semantic=False)[0].reason == "body match"
     assert search(config, "Planet", project="p", semantic=False)[0].reason == "heading match"
+
+
+def _relaxed_vault(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "conventions.md").write_text(
+        "# Vault Conventions\n\nRules for every note.\n\n"
+        "## Frontmatter\n\nEvery note starts with a type and an updated date.\n\n"
+        "## Templates\n\nCopy a template before writing.\n"
+    )
+    (root / "provider.md").write_text(
+        "# Provider comparison\n\nThe comparison lists several email provider options.\n"
+    )
+    (root / "strict.md").write_text(
+        "# What are the vault conventions for frontmatter\n\n"
+        "what are the vault conventions for frontmatter, answered verbatim.\n"
+    )
+    for number in range(12):
+        (root / f"filler-{number}.md").write_text(f"# Filler {number}\n\nUnrelated note about gardening.\n")
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+    return root, config
+
+
+def test_relaxed_matching_answers_natural_language_questions(tmp_path: Path):
+    root, config = _relaxed_vault(tmp_path)
+    (root / "strict.md").unlink()
+    index(config)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results, "stopwords must not block a lexical match"
+    assert results[0].heading == "Frontmatter"
+    assert "partial match (3/3 terms)" in results[0].reason
+
+
+def test_strict_matches_rank_before_relaxed_matches(tmp_path: Path):
+    _, config = _relaxed_vault(tmp_path)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("strict.md")
+    assert "partial match" not in results[0].reason
+    assert any("partial match" in item.reason for item in results[1:])
+
+
+def test_relaxed_matching_rejects_near_miss_without_rare_term(tmp_path: Path):
+    _, config = _relaxed_vault(tmp_path)
+
+    assert search(config, "Postmark email provider migration", project="p", semantic=False) == []
+
+
+def test_relaxed_matching_ignores_lone_follow_up_keyword(tmp_path: Path):
+    _, config = _relaxed_vault(tmp_path)
+
+    assert search(config, "what about that frontmatter", project="p", semantic=False) == []
+
+
+def test_quoted_queries_stay_strict(tmp_path: Path):
+    _, config = _relaxed_vault(tmp_path)
+
+    assert search(config, '"frontmatter templates" conventions', project="p", semantic=False) == []
+
+
+def test_relaxed_matching_can_be_disabled(tmp_path: Path):
+    root, config = _relaxed_vault(tmp_path)
+    (root / "strict.md").unlink()
+    index(config)
+
+    results, _, _, _ = core._lexical_candidates(
+        config, "what are the vault conventions for frontmatter?", "p", None, False, 50,
+        relaxed_matching=False,
+    )
+
+    assert results == []

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -68,6 +69,27 @@ SYNONYM_VARIANT_MERGE = True
 SYNONYM_VARIANT_MERGE_RATIONALE = (
     "merge variants by best FTS score, then break ties by section ID"
 )
+RELAXED_LEXICAL_MATCHING = True
+RELAXED_MIN_COVERAGE = 0.5
+RELAXED_MIN_IDF_COVERAGE = 0.45
+RELAXED_LEXICAL_MATCHING_RATIONALE = (
+    "after strict all-term matches, admit sections that contain enough of the query's content terms "
+    "(stopwords dropped; needs 2+ content terms; at least 2, or every term when there are exactly 2) and most of their IDF "
+    "weight, so natural-language questions reach the lexical lane without dropping a query's most "
+    "distinctive term; strict matches always rank first and quoted queries stay strict"
+)
+MAX_RELAXED_ROWS = 1000
+# Relaxed matches rank by sum(idf(term) * weight of where it matched): the section's
+# own heading, then its ancestor headings, then its body.
+RELAXED_FIELD_WEIGHTS = {"heading": 2.0, "heading_path": 1.5, "text": 1.0}
+QUERY_STOPWORDS = frozenset(
+    "a about after again all also am an and any are as at be been before being both but by can could "
+    "did do does doing done during each else ever for from had has have having he her here hers him his "
+    "how i if in into is it its itself just me more most my myself no nor not now of off on once only or "
+    "other our ours out over own same she should so some such than that the their theirs them then there "
+    "these they this those through to too under until up upon us very was we were what whatever when "
+    "where whether which while who whom whose why will with would you your yours".split()
+)
 RRF_RANK_CONSTANT = 60
 TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+|[\w]+", flags=re.UNICODE)
 
@@ -97,6 +119,12 @@ SELECTION_POLICIES = {
     "synonym_variant_merge": {
         "enabled": SYNONYM_VARIANT_MERGE,
         "rationale": SYNONYM_VARIANT_MERGE_RATIONALE,
+    },
+    "relaxed_lexical_matching": {
+        "enabled": RELAXED_LEXICAL_MATCHING,
+        "value": RELAXED_MIN_COVERAGE,
+        "idf_coverage": RELAXED_MIN_IDF_COVERAGE,
+        "rationale": RELAXED_LEXICAL_MATCHING_RATIONALE,
     },
 }
 
@@ -615,6 +643,21 @@ def _fts_query(query: str) -> tuple[str, list[str]]:
     return " AND ".join(clauses), tokens
 
 
+def _content_terms(tokens: list[str]) -> list[str]:
+    terms: list[str] = []
+    for token in tokens:
+        term = token.casefold()
+        if term not in QUERY_STOPWORDS and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _relaxed_required(term_count: int) -> int:
+    if term_count <= 2:
+        return term_count
+    return max(2, math.ceil(RELAXED_MIN_COVERAGE * term_count))
+
+
 def _column_query(column: str, fts: str) -> str:
     return f"{column} : ({fts})"
 
@@ -692,6 +735,7 @@ def _lexical_candidates(
     refresh: set[str] | None = None,
     timings: dict[str, float] | None = None,
     synonym_expansion: bool = SYNONYM_EXPANSION,
+    relaxed_matching: bool = RELAXED_LEXICAL_MATCHING,
 ) -> tuple[list[Candidate], dict[str, int], dict[int, set[str]], bool]:
     if not config.database.exists():
         return [], {}, {}, bool(_guard_atoms(query))
@@ -756,6 +800,67 @@ def _lexical_candidates(
                                 best_fts_scores[section_id] = fts_score
                     else:
                         rows_by_id.update({row["section_id"]: row for row in global_query})
+        # Relaxed pass: strict matching ANDs every token, so natural-language questions
+        # ("what are the vault conventions for frontmatter?") rarely match. Admit
+        # sections covering enough content terms; they rank after every strict match.
+        relaxed_terms = _content_terms(tokens) if relaxed_matching and '"' not in normalized_query else []
+        relaxed_required = _relaxed_required(len(relaxed_terms))
+        relaxed_coverage: dict[str, int] = {}
+        relaxed_weight: dict[str, float] = {}
+        # A lone leftover keyword ("what about that decision") is too weak to match on.
+        if len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
+            relaxed_fts = " OR ".join('"' + term.replace('"', '""') + '"' for term in relaxed_terms)
+            rows = connection.execute(
+                "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
+                "JOIN sections_fts ON sections_fts.section_id = s.section_id WHERE "
+                + " AND ".join(conditions) + " ORDER BY fts_score, s.section_id LIMIT ?",
+                (relaxed_fts, *scope_params, min(MAX_RELAXED_ROWS, candidate_limit * 4)),
+            ).fetchall()
+            section_count = connection.execute("SELECT count(*) FROM sections").fetchone()[0] or 1
+            # FTS already knows which sections contain each term; avoid re-tokenizing bodies.
+            in_section: dict[str, set[str]] = {}
+            in_heading: dict[str, set[str]] = {}
+            idf: dict[str, float] = {}
+            for term in relaxed_terms:
+                quoted_term = '"' + term.replace('"', '""') + '"'
+                in_section[term] = {
+                    found["section_id"] for found in connection.execute(
+                        "SELECT section_id FROM sections_fts WHERE sections_fts MATCH ?", (quoted_term,),
+                    )
+                }
+                in_heading[term] = {
+                    found["section_id"] for found in connection.execute(
+                        "SELECT section_id FROM sections_fts WHERE sections_fts MATCH ?",
+                        (_column_query("heading", quoted_term),),
+                    )
+                }
+                frequency = len(in_section[term])
+                idf[term] = math.log((section_count - frequency + 0.5) / (frequency + 0.5) + 1.0)
+            total_idf = sum(idf.values())
+            for row in rows:
+                section_id = row["section_id"]
+                if section_id in rows_by_id:
+                    continue
+                # Ancestor headings are part of a section's meaning ("Vault Conventions > Frontmatter").
+                path_tokens = _token_set(row["heading_path"] or "")
+                weight, matched, matched_idf = 0.0, 0, 0.0
+                for term in relaxed_terms:
+                    if section_id in in_heading[term]:
+                        field_weight = RELAXED_FIELD_WEIGHTS["heading"]
+                    elif term in path_tokens:
+                        field_weight = RELAXED_FIELD_WEIGHTS["heading_path"]
+                    elif section_id in in_section[term]:
+                        field_weight = RELAXED_FIELD_WEIGHTS["text"]
+                    else:
+                        continue
+                    matched += 1
+                    matched_idf += idf[term]
+                    weight += idf[term] * field_weight
+                # Missing a rare term ("Postmark email provider") must not admit a near miss.
+                if matched >= relaxed_required and matched_idf >= RELAXED_MIN_IDF_COVERAGE * total_idf:
+                    rows_by_id[section_id] = row
+                    relaxed_coverage[section_id] = matched
+                    relaxed_weight[section_id] = weight
         atom_matches: dict[int, set[str]] = {}
         for ordinal, atom in enumerate(_guard_atoms(query), 1):
             atom_query = _guard_fts_query(atom)
@@ -811,17 +916,23 @@ def _lexical_candidates(
         heading_path = tuple(filter(None, row["heading_path"].split("\n")))
         heading_tokens = _token_set(row["heading"] or "")
         body_tokens = _token_set(row["text"])
+        relaxed = row["section_id"] in relaxed_coverage
+        if relaxed:
+            heading_tokens |= _token_set(row["heading_path"] or "")
+        match_tokens = set(relaxed_terms) if relaxed else lower_tokens
         identifier_boost = sum(
-            2.0 for token in lower_tokens
+            2.0 for token in match_tokens
             if re.fullmatch(r"[a-z]{2,}-\d+", token) and token in heading_tokens | body_tokens
         )
-        heading_matches = bool(lower_tokens & heading_tokens)
-        body_matches = bool(lower_tokens & body_tokens)
-        heading_boost = sum(0.75 for token in lower_tokens if token in heading_tokens)
+        heading_matches = bool(match_tokens & heading_tokens)
+        body_matches = bool(match_tokens & body_tokens)
+        heading_boost = sum(0.75 for token in match_tokens if token in heading_tokens)
         score = -float(row["fts_score"]) + identifier_boost + heading_boost
         reasons: list[str] = []
         if is_global:
             reasons.append("global-note inclusion")
+        if relaxed:
+            reasons.append(f"partial match ({relaxed_coverage[row['section_id']]}/{len(relaxed_terms)} terms)")
         if identifier_boost:
             reasons.append("identifier match")
         if heading_matches:
@@ -835,10 +946,15 @@ def _lexical_candidates(
             row["created_date"], score, ", ".join(reasons) or "text match",
             None, None, float(row["fts_score"]), None, None, "lexical", None,
         ))
-    if expansion_active:
-        results.sort(key=lambda item: (item.lexical_score, item.section_id))
-    else:
-        results.sort(key=lambda item: (-item.score, item.section_id))
+    def order(item: Candidate) -> tuple[object, ...]:
+        # Strict matches keep their existing order; relaxed matches follow by weighted coverage.
+        if item.section_id in relaxed_coverage:
+            return (1, -relaxed_weight[item.section_id], -item.score, item.section_id)
+        if expansion_active:
+            return (0, 0, item.lexical_score, item.section_id)
+        return (0, 0, -item.score, item.section_id)
+
+    results.sort(key=order)
     ranked = [replace(item, lexical_rank=rank) for rank, item in enumerate(results, 1)]
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 
