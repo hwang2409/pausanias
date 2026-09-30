@@ -38,6 +38,12 @@ index, or runtime is unavailable. With `--diagnostics --json`, search returns an
 `items` array and a sibling `diagnostics` object, including state and reason for empty
 results. A default base-install lexical search keeps its legacy JSON array shape.
 
+Lexical search first ranks sections containing every query term. It then admits sections
+covering most of the query's distinctive content terms, with stopwords dropped, so natural
+questions such as `what are the vault conventions for frontmatter?` match. These relaxed
+matches rank after every exact match and report `partial match (k/n terms)` as their
+reason. Quote a phrase to keep the whole query strict.
+
 The optional synonym table is local and operator-maintained:
 
 ```toml
