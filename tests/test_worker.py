@@ -281,6 +281,41 @@ def test_worker_apis_reject_unversioned_paths_without_connecting(
         PersistentWorker(config, legacy_paths)
 
 
+def test_ensure_retries_transient_identity_timeout_without_stopping_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import pausanias.worker as worker_module
+
+    config_path, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    worker = PersistentWorker(config, paths, idle_seconds=2)
+    thread = threading.Thread(target=worker.serve)
+    thread.start()
+    try:
+        wait_for_socket(paths.socket)
+        original_identity_matches = worker_module._identity_matches
+        calls = 0
+
+        def transient_identity_timeout(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return False
+            return original_identity_matches(*args, **kwargs)
+
+        def unexpected_stop(*_args, **_kwargs):
+            raise AssertionError("matching worker was stopped after a transient timeout")
+
+        monkeypatch.setattr(worker_module, "_identity_matches", transient_identity_timeout)
+        monkeypatch.setattr(worker_module, "stop_worker", unexpected_stop)
+
+        assert ensure_worker(config, config_path, time.perf_counter() + 1, paths) is not None
+        assert calls >= 2
+    finally:
+        worker._stopping.set()
+        thread.join(timeout=2)
+
+
 def test_upgrade_ignores_real_legacy_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     legacy_tree_value = os.environ.get("PAUSANIAS_MAIN_TREE")
     if legacy_tree_value is None:

@@ -732,22 +732,18 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
     started = time.perf_counter()
     expected_fingerprint = _config_fingerprint(config)
 
-    def ready_record() -> bool:
-        record = _read_record(worker_paths_value.record)
-        remaining = min(SOCKET_TIMEOUT_SECONDS, max(deadline - time.perf_counter(), 0.0))
+    def expected_record(record: dict[str, object]) -> bool:
         return (_record_identity(record) is not None
                 and record.get("protocol_version") == WORKER_PROTOCOL_VERSION
                 and record.get("config_fingerprint") == expected_fingerprint
                 and record.get("readiness") == "ready"
-                and record.get("socket_path") == str(worker_paths_value.socket)
-                and _identity_matches(worker_paths_value, record, remaining))
+                and record.get("socket_path") == str(worker_paths_value.socket))
 
-    if worker_paths_value.socket.exists():
-        if ready_record():
-            return worker_paths_value, _positive_ms(started)
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0 or not stop_worker(config.database, worker_paths_value, remaining):
-            return None
+    def ready_record() -> bool:
+        record = _read_record(worker_paths_value.record)
+        remaining = min(SOCKET_TIMEOUT_SECONDS, max(deadline - time.perf_counter(), 0.0))
+        return (expected_record(record)
+                and _identity_matches(worker_paths_value, record, remaining))
 
     while time.perf_counter() < deadline:
         if ready_record():
@@ -761,11 +757,12 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
             if worker_paths_value.socket.exists():
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0 or not stop_worker(
-                    config.database, worker_paths_value, remaining,
-                ):
-                    return None
+                record = _read_record(worker_paths_value.record)
+                if not expected_record(record):
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        stop_worker(config.database, worker_paths_value, remaining)
+                time.sleep(min(0.005, max(deadline - time.perf_counter(), 0.0)))
                 continue
             record = _read_record(worker_paths_value.record)
             _remove_stale_record(worker_paths_value, record)
