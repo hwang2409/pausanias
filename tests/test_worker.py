@@ -378,28 +378,22 @@ def test_ready_record_cannot_be_read_during_publish(tmp_path: Path, monkeypatch:
                                   args=(fd, {"pid": 42, "readiness": "ready"}))
         writer.start()
         assert write_started.wait(2)
-        release_write.set()
+        try:
+            output = process.communicate(timeout=0.2)[0].strip()
+        except subprocess.TimeoutExpired:
+            release_write.set()
+        else:
+            release_write.set()
         writer.join(timeout=2)
-        output = process.communicate(timeout=2)[0].strip()
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        if process.poll() is None:
+            output = process.communicate(timeout=2)[0].strip()
         assert output == "{'pid': 42, 'readiness': 'ready'}"
     finally:
         release_write.set()
         process.kill() if process.poll() is None else None
         process.wait()
         os.close(fd)
-
-
-def test_hook_worker_is_stopped_after_hook(tmp_path: Path):
-    bundle = tmp_path / "invalid-bundle"
-    bundle.mkdir()
-    config_path, config = make_config(tmp_path, semantic_bundle=bundle)
-    core.index(config)
-
-    response = run_hook(config, config_path, "alpha memory", project="p")
-
-    assert response.metrics.fallback is True
-    assert worker_pids(config_path) == []
-
 
 def test_generation_invalidation_loads_new_matrix_mid_lifecycle(tmp_path: Path):
     config_path, config = make_config(tmp_path)

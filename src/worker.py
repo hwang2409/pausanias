@@ -88,8 +88,27 @@ def _positive_ms(started: float) -> float:
 
 def _read_record(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return {}
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        value = json.loads(os.read(fd, 1_000_000).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    return value if isinstance(value, dict) else {}
+
+
+def _read_record_fd(fd: int) -> dict[str, object]:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        value = json.loads(os.read(fd, 1_000_000).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -575,9 +594,6 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
         env=environment, pass_fds=(lock_fd,), close_fds=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    record = _read_record(paths.lock) or initial_record
-    record["pid"] = process.pid
-    _write_record_fd(lock_fd, record)
     return process
 
 
@@ -593,7 +609,7 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
         stop_worker(config.database, worker_paths_value)
     lock_fd = _acquire_lock(worker_paths_value.lock)
     if lock_fd is not None:
-        record = _read_record(worker_paths_value.lock)
+        record = _read_record_fd(lock_fd)
         pid = record.get("pid")
         if isinstance(pid, int) and pid_alive(pid) and not socket_ready(worker_paths_value.socket):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
