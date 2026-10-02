@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import importlib.util
 from pathlib import Path
@@ -17,6 +18,7 @@ from pausanias.core import connect, index, read_source, search
 from pausanias.hook import HookResponse
 from pausanias.splitter import explicit_links, split_markdown
 from pausanias.worker import HookMetrics, PersistentWorker, socket_ready, worker_paths
+from pausanias.vectors import Candidate
 
 
 def make_config(
@@ -503,6 +505,30 @@ def test_selection_reason_reports_body_match(tmp_path: Path):
     config = make_config(tmp_path, [("vault", "p", root)])
     index(config)
     assert search(config, "body-only", project="p", semantic=False)[0].reason == "body match"
+
+
+def test_fused_relaxed_candidate_cannot_displace_strict_match(tmp_path: Path):
+    def candidate(section_id: str, heading: str) -> Candidate:
+        return Candidate(
+            section_id, f"{section_id}.md", heading, (heading,), 1, 2, "vault", "p",
+            "alpha beta", "hash", None, None, None, 0.0, "match",
+        )
+
+    strict = candidate("strict", "Strict")
+    relaxed = candidate("relaxed", "Relaxed")
+    results = core._fuse_candidates(
+        [
+            replace(strict, lexical_rank=1),
+            replace(relaxed, lexical_rank=2),
+        ],
+        [
+            replace(relaxed, vector_rank=1, vector_score=1.0),
+            replace(strict, vector_rank=10, vector_score=1.0),
+        ],
+        {"strict": 1}, {}, False, 1, balanced_admission=False,
+    )
+
+    assert results[0].heading == "Strict"
 
 
 def test_selection_reason_does_not_match_heading_prefixes(tmp_path: Path):
