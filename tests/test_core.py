@@ -639,6 +639,17 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "synonym_variant_merge",
         "relaxed_lexical_matching",
     }
+    relaxed = result["fusion_policies"]["selection_policies"]["relaxed_lexical_matching"]
+    assert "strict_hit_limit" not in relaxed
+    assert relaxed["with_strict_hits"] == {
+        "content_term_coverage": "complete",
+        "heading_anchor": "own_heading",
+        "rank": "after_strict_hits",
+    }
+    assert relaxed["without_strict_hits"] == {
+        "content_term_coverage": "relaxed_thresholds",
+        "heading_anchor": "not_required",
+    }
 
 
 def test_cli_diagnostics_include_empty_search_state(tmp_path: Path, capsys):
