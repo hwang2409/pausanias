@@ -329,7 +329,7 @@ def test_worker_death_mid_query_recovers_on_next_hook(tmp_path: Path):
 def test_live_pid_lock_is_not_treated_as_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_path, config = make_config(tmp_path)
     paths = worker_paths(config.database)
-    _write_record(paths.lock, {"pid": os.getpid(), "readiness": "starting"})
+    _write_record(paths.record, {"pid": os.getpid(), "readiness": "starting"})
     monkeypatch.setattr("pausanias.worker.launch_worker", lambda *args: pytest.fail("live worker was replaced"))
     assert ensure_worker(config, config_path, time.perf_counter() + 0.03, paths) is None
 
@@ -338,10 +338,10 @@ def test_dead_pid_lock_is_taken_over(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config)
     paths = worker_paths(config.database)
-    _write_record(paths.lock, {"pid": 999999, "readiness": "starting"})
+    _write_record(paths.record, {"pid": 999999, "readiness": "starting"})
     try:
         assert ensure_worker(config, config_path, time.perf_counter() + 2, paths) is not None
-        record = _read_record(paths.lock)
+        record = _read_record(paths.record)
         assert record["pid"] != 999999
         assert socket_ready(paths.socket)
     finally:
@@ -413,7 +413,7 @@ def test_old_format_lock_content_does_not_break_startup(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config)
     paths = worker_paths(config.database)
-    _write_record(paths.lock, {"pid": 999999, "readiness": "starting"})
+    paths.lock.write_text('{"pid": 999999, "readiness": "starting"}')
     try:
         assert ensure_worker(config, config_path, time.perf_counter() + 2, paths) is not None
         assert _read_record(paths.record)["pid"] != 999999

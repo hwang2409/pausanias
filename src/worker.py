@@ -54,6 +54,10 @@ class WorkerPaths:
     socket: Path
     lock: Path
 
+    @property
+    def record(self) -> Path:
+        return self.lock.with_name(self.lock.name + ".record")
+
 
 @dataclass(frozen=True)
 class HookMetrics:
@@ -87,27 +91,9 @@ def _positive_ms(started: float) -> float:
 
 
 def _read_record(path: Path) -> dict[str, object]:
+    """Read an atomic snapshot; readers never participate in lifecycle locking."""
     try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return {}
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
-        value = json.loads(os.read(fd, 1_000_000).decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return {}
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-    return value if isinstance(value, dict) else {}
-
-
-def _read_record_fd(fd: int) -> dict[str, object]:
-    try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        value = json.loads(os.read(fd, 1_000_000).decode("utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -115,19 +101,22 @@ def _read_record_fd(fd: int) -> dict[str, object]:
 
 def _write_record(path: Path, record: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _write_record_fd(fd: int, record: dict[str, object]) -> None:
-    """Update the lock record without replacing its flocked inode."""
-    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    view = memoryview(payload)
-    while view:
-        view = view[os.write(fd, view):]
-    os.fsync(fd)
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _config_fingerprint(config: Config) -> str:
@@ -188,26 +177,33 @@ def socket_ready(path: Path) -> bool:
         return False
 
 
-def stop_worker(database: Path, paths: WorkerPaths | None = None) -> bool:
+def stop_worker(database: Path, paths: WorkerPaths | None = None, timeout: float = 1.0) -> bool:
     worker_paths_value = paths or worker_paths(database)
-    record = _read_record(worker_paths_value.lock)
+    record = _read_record(worker_paths_value.record)
     pid = record.get("pid")
     stopped = False
+    deadline = time.monotonic() + max(timeout, 0.0)
     if isinstance(pid, int) and pid_alive(pid):
         try:
             os.kill(pid, signal.SIGTERM)
             stopped = True
         except OSError:
             pass
-        wait_deadline = time.monotonic() + 1.0
-        while pid_alive(pid) and time.monotonic() < wait_deadline:
-            time.sleep(0.005)
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(min(0.005, max(deadline - time.monotonic(), 0.0)))
     try:
         worker_paths_value.socket.unlink()
     except FileNotFoundError:
         pass
     except OSError:
         pass
+    if not (isinstance(pid, int) and pid_alive(pid)):
+        try:
+            worker_paths_value.record.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     return stopped
 
 
@@ -246,11 +242,7 @@ class PersistentWorker:
             "start_time": self._started, "socket_path": str(self.paths.socket),
             "readiness": state, "config_fingerprint": _config_fingerprint(self.config),
         }
-        lock_fd = self._lock_fd()
-        if lock_fd is None:
-            _write_record(self.paths.lock, record)
-        else:
-            _write_record_fd(lock_fd, record)
+        _write_record(self.paths.record, record)
 
     def _backend_failure_token(self) -> tuple[object, ...]:
         """Track state that can repair a cached model-load failure."""
@@ -496,32 +488,41 @@ class PersistentWorker:
         except FileNotFoundError:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.paths.socket))
-        os.chmod(self.paths.socket, 0o600)
-        server.listen(32)
-        self._publish("ready", os.getpid())
-        lock_fd = self._lock_fd()
-        if lock_fd is not None:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-        server.settimeout(0.25)
-        last_request = time.monotonic()
         try:
-            while not self._stopping.is_set():
-                if time.monotonic() - last_request >= self.idle_seconds:
-                    break
-                try:
-                    connection, _ = server.accept()
-                except TimeoutError:
-                    self._prune_cancellation_tombstones()
-                    continue
-                last_request = time.monotonic()
-                threading.Thread(target=self._serve_connection, args=(connection,), daemon=True).start()
-        finally:
-            self._stopping.set()
-            server.close()
+            # Publish first: a connectable socket always has this worker's record.
+            self._publish("ready", os.getpid())
+            server.bind(str(self.paths.socket))
+            os.chmod(self.paths.socket, 0o600)
+            server.listen(32)
+            lock_fd_value = self._lock_fd()
+            if lock_fd_value is not None:
+                fcntl.flock(lock_fd_value, fcntl.LOCK_UN)
+                os.close(lock_fd_value)
+            server.settimeout(0.25)
+            last_request = time.monotonic()
             try:
-                self.paths.socket.unlink()
+                while not self._stopping.is_set():
+                    if time.monotonic() - last_request >= self.idle_seconds:
+                        break
+                    try:
+                        connection, _ = server.accept()
+                    except TimeoutError:
+                        self._prune_cancellation_tombstones()
+                        continue
+                    last_request = time.monotonic()
+                    threading.Thread(target=self._serve_connection, args=(connection,), daemon=True).start()
+            finally:
+                self._stopping.set()
+                server.close()
+                try:
+                    self.paths.socket.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        finally:
+            try:
+                self.paths.record.unlink()
             except FileNotFoundError:
                 pass
             except OSError:
@@ -584,7 +585,7 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
         "start_time": time.time(), "socket_path": str(paths.socket), "readiness": "starting",
         "config_fingerprint": config_fingerprint_value,
     }
-    _write_record_fd(lock_fd, initial_record)
+    _write_record(paths.record, initial_record)
     environment = os.environ.copy()
     environment["PAUSANIAS_WORKER_LOCK_FD"] = str(lock_fd)
     environment["PAUSANIAS_WORKER_NONCE"] = nonce
@@ -602,30 +603,43 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
     worker_paths_value = paths or worker_paths(config.database)
     started = time.perf_counter()
     expected_fingerprint = _config_fingerprint(config)
+
+    def ready_record() -> bool:
+        record = _read_record(worker_paths_value.record)
+        return (record.get("config_fingerprint") == expected_fingerprint
+                and record.get("readiness") == "ready"
+                and record.get("socket_path") == str(worker_paths_value.socket))
+
     if socket_ready(worker_paths_value.socket):
-        record = _read_record(worker_paths_value.lock)
-        if record.get("config_fingerprint") == expected_fingerprint:
+        if ready_record():
             return worker_paths_value, _positive_ms(started)
-        stop_worker(config.database, worker_paths_value)
-    lock_fd = _acquire_lock(worker_paths_value.lock)
-    if lock_fd is not None:
-        record = _read_record_fd(lock_fd)
-        pid = record.get("pid")
-        if isinstance(pid, int) and pid_alive(pid) and not socket_ready(worker_paths_value.socket):
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-        else:
-            try:
-                launch_worker(
-                    config_path, worker_paths_value, lock_fd, config.database, expected_fingerprint,
-                )
-            except OSError:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0 or not stop_worker(config.database, worker_paths_value, remaining):
+            return None
+
+    while time.perf_counter() < deadline:
+        lock_fd = _acquire_lock(worker_paths_value.lock)
+        if lock_fd is not None:
+            record = _read_record(worker_paths_value.record)
+            pid = record.get("pid")
+            if isinstance(pid, int) and pid_alive(pid):
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
-                return None
-            os.close(lock_fd)
-    while time.perf_counter() < deadline:
-        if socket_ready(worker_paths_value.socket):
+            else:
+                try:
+                    worker_paths_value.record.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    launch_worker(
+                        config_path, worker_paths_value, lock_fd, config.database, expected_fingerprint,
+                    )
+                except OSError:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                    return None
+                os.close(lock_fd)
+        if socket_ready(worker_paths_value.socket) and ready_record():
             return worker_paths_value, _positive_ms(started)
         time.sleep(min(0.005, max(deadline - time.perf_counter(), 0.0)))
     return None
