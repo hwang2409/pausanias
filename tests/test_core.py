@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import importlib.util
 from pathlib import Path
@@ -17,6 +18,7 @@ from pausanias.core import connect, index, read_source, search
 from pausanias.hook import HookResponse
 from pausanias.splitter import explicit_links, split_markdown
 from pausanias.worker import HookMetrics, PersistentWorker, socket_ready, worker_paths
+from pausanias.vectors import Candidate
 
 
 def make_config(
@@ -505,6 +507,27 @@ def test_selection_reason_reports_body_match(tmp_path: Path):
     assert search(config, "body-only", project="p", semantic=False)[0].reason == "body match"
 
 
+def test_fused_candidate_without_relaxed_lexical_credit_cannot_displace_strict_match(tmp_path: Path):
+    def candidate(section_id: str, heading: str) -> Candidate:
+        return Candidate(
+            section_id, f"{section_id}.md", heading, (heading,), 1, 2, "vault", "p",
+            "alpha beta", "hash", None, None, None, 0.0, "match",
+        )
+
+    strict = candidate("strict", "Strict")
+    relaxed = replace(candidate("relaxed", "Relaxed"), reason="partial match (2/3 terms)")
+    results = core._fuse_candidates(
+        [replace(strict, lexical_rank=1)],
+        [
+            replace(relaxed, vector_rank=1, vector_score=1.0),
+            replace(strict, vector_rank=10, vector_score=1.0),
+        ],
+        {"strict": 1}, {}, False, 1, balanced_admission=False,
+    )
+
+    assert results[0].heading == "Strict"
+
+
 def test_selection_reason_does_not_match_heading_prefixes(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
@@ -615,6 +638,17 @@ def test_cli_diagnostics_enumerate_fusion_policies(tmp_path: Path, capsys):
         "synonym_expansion",
         "synonym_variant_merge",
         "relaxed_lexical_matching",
+    }
+    relaxed = result["fusion_policies"]["selection_policies"]["relaxed_lexical_matching"]
+    assert "strict_hit_limit" not in relaxed
+    assert relaxed["with_strict_hits"] == {
+        "content_term_coverage": "complete",
+        "heading_anchor": "own_heading",
+        "rank": "after_strict_hits",
+    }
+    assert relaxed["without_strict_hits"] == {
+        "content_term_coverage": "relaxed_thresholds",
+        "heading_anchor": "not_required",
     }
 
 
@@ -1060,14 +1094,66 @@ def test_relaxed_matching_answers_natural_language_questions(tmp_path: Path):
     assert "partial match (3/3 terms)" in results[0].reason
 
 
-def test_strict_matches_rank_before_relaxed_matches(tmp_path: Path):
+def test_strong_relaxed_matches_rank_after_strict_matches(tmp_path: Path):
     _, config = _relaxed_vault(tmp_path)
 
     results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
 
     assert results[0].canonical_path.endswith("strict.md")
     assert "partial match" not in results[0].reason
-    assert any("partial match" in item.reason for item in results[1:])
+    assert any("partial match (3/3 terms)" in item.reason for item in results[1:])
+
+
+def test_body_only_relaxed_match_stays_excluded_when_strict_match_exists(tmp_path: Path):
+    root, config = _relaxed_vault(tmp_path)
+    (root / "body-echo.md").write_text(
+        "# Meeting transcript\n\nThe team discussed vault conventions and frontmatter.\n"
+    )
+    index(config)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("strict.md")
+    assert all(not item.canonical_path.endswith("body-echo.md") for item in results)
+
+
+def test_ancestor_heading_does_not_anchor_relaxed_match_after_strict_hit(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "strict.md").write_text(
+        "# Direct answer\n\nThe literal question was: what are notes alpha beta?\n"
+    )
+    (root / "shopping.md").write_text(
+        "# Notes\n\n## Shopping\n\nRemember to compare alpha beta products.\n"
+    )
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+
+    results = search(config, "what are notes alpha beta?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("strict.md")
+    assert all(item.heading != "Shopping" for item in results)
+
+
+def test_strong_heading_relaxed_match_survives_unrelated_strict_body_hit(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "conventions.md").write_text(
+        "# Vault Conventions\n\nRules for every note.\n\n"
+        "## Frontmatter\n\nEvery note starts with a type and an updated date.\n"
+    )
+    (root / "transcript.md").write_text(
+        "# Meeting transcript\n\nSomeone asked, what are the vault conventions for frontmatter?\n"
+        "The meeting moved to another topic without answering.\n"
+    )
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("transcript.md")
+    assert results[1].heading == "Frontmatter"
+    assert "partial match (3/3 terms)" in results[1].reason
 
 
 def test_relaxed_matching_rejects_near_miss_without_rare_term(tmp_path: Path):

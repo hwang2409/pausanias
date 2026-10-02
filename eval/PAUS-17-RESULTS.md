@@ -12,7 +12,25 @@ python -m eval.benchmarks.locomo.run --retrieval-mode {lexical,fused} --predict-
 python -m eval.benchmarks.locomo.run --retrieval-mode {lexical,fused} --abstention
 ```
 
-## LOCOMO retrieval, categories 1–4 (1,540 questions)
+## Verbatim precision gate fix
+
+Exactly one verbatim case regressed. For `concept-turn-idempotence` (`same turn id packet`), pre-PAUS-17 returned only `beacon/concepts/idempotence.md` at rank 1. PAUS-17 kept that result at rank 1 but added the irrelevant `beacon/concepts/timeout.md` relaxed `2/3`-term body match at rank 2, reducing that case's precision@4 from 1.0 to 0.5 and fused verbatim precision@4 from 0.927419 to 0.911290.
+
+Three general policy families were measured. Harness columns are fused/lexical exit codes followed by verbatim, paraphrase, and held-out precision@4. `eval.run` is recall@4 / precision@4 / MRR / abstention accuracy. LOCOMO is recall@10 / MRR; false injection (FI) uses all 446 category-5 questions.
+
+| policy | harness exit F/L | fused V/P/H | lexical V/P/H | `eval.run` | LOCOMO fused | LOCOMO lexical | FI fused/lexical |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| PAUS-17 as-is (all relaxed admitted) | 2 / 2 | .911 / .688 / .813 | .984 / .167 / .250 | .735 / .724 / .735 / 1.000 | 50.5% / .405 | 38.9% / .363 | 100.00% / 67.71% |
+| c73db4a (disable fused relaxed pass) | 0 / 2 | .927 / .688 / .813 | .984 / .167 / .250 | .735 / .735 / .735 / 1.000 | 40.8% / .271 | 38.9% / .363 | 100.00% / 67.71% |
+| semantic-overlap admission (relaxed with a strict hit needs a semantic-lane hit) | 0 / 0 | .927 / .688 / .813 | 1.000 / .167 / .250 | .735 / .735 / .735 / 1.000 | 50.49% / .4053 | 38.82% / .3627 | 100.00% / 67.71% |
+| strict K=1 (relaxed only when strict returns zero hits) | 0 / 0 | .927 / .688 / .813 | 1.000 / .167 / .250 | .735 / .735 / .735 / 1.000 | 50.43% / .4051 | 38.82% / .3627 | 99.78% / 67.71% |
+| **complete coverage + own-heading anchor (chosen, Round 4)** | **0 / 0** | **.927 / .688 / .813** | **1.000 / .167 / .250** | **.735 / .735 / .735 / 1.000** | **50.43% / .4051** | **38.82% / .3627** | not rerun |
+| 75% content-term coverage | 0 / 0 | .927 / .688 / .813 | 1.000 / .000 / .000 | .673 / .673 / .673 / 1.000 | 41.70% / .3104 | 21.34% / .2127 | 100.00% / 27.58% |
+
+Strict K=1 was the initial precision fix: it passes every internal gate in both modes, exceeds the 48% / .38 fused LOCOMO bars, retains all but 0.07 percentage points of PAUS-17 recall, and avoids one fused category-5 injection that the slightly higher-recall semantic-overlap option does not. A follow-up starvation repro showed that one unrelated strict body hit could suppress a better relaxed section. The final policy therefore also admits a relaxed candidate alongside strict hits only when it covers every content term and at least one term occurs in its own heading. Such candidates remain ranked after all strict hits, while body-only echoes and candidates anchored only by generic ancestor headings remain excluded. The follow-up policy fixed both repros without changing either LOCOMO score or any internal category precision. No threshold, case, or lock file changed.
+
+Round 4 reran the option after restricting the anchor from the own-or-ancestor heading path to the section's own heading. Both harnesses exited 0 with unchanged fused/lexical verbatim, paraphrase, and held-out precision. LOCOMO also remained unchanged at 50.43% / .4051 fused and 38.82% / .3627 lexical on dataset SHA-256 `79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`.
+
 
 | mode | run | recall@10 | MRR@10 | recall@50 | recall@200 |
 | --- | --- | ---: | ---: | ---: | ---: |

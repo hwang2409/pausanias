@@ -73,10 +73,10 @@ RELAXED_LEXICAL_MATCHING = True
 RELAXED_MIN_COVERAGE = 0.5
 RELAXED_MIN_IDF_COVERAGE = 0.45
 RELAXED_LEXICAL_MATCHING_RATIONALE = (
-    "after strict all-term matches, admit sections that contain enough of the query's content terms "
-    "(stopwords dropped; needs 2+ content terms; at least 2, or every term when there are exactly 2) and most of their IDF "
-    "weight, so natural-language questions reach the lexical lane without dropping a query's most "
-    "distinctive term; strict matches always rank first and quoted queries stay strict"
+    "admit sections that contain enough of the query's content terms (stopwords dropped; needs 2+ content terms; "
+    "at least 2, or every term when there are exactly 2) and most of their IDF weight; when strict all-term matches "
+    "exist, require complete content-term coverage with at least one term in the section's own heading and rank relaxed "
+    "matches after strict matches; quoted queries stay strict"
 )
 MAX_RELAXED_ROWS = 1000
 # Relaxed matches rank by sum(idf(term) * weight of where it matched): the section's
@@ -124,6 +124,15 @@ SELECTION_POLICIES = {
         "enabled": RELAXED_LEXICAL_MATCHING,
         "value": RELAXED_MIN_COVERAGE,
         "idf_coverage": RELAXED_MIN_IDF_COVERAGE,
+        "with_strict_hits": {
+            "content_term_coverage": "complete",
+            "heading_anchor": "own_heading",
+            "rank": "after_strict_hits",
+        },
+        "without_strict_hits": {
+            "content_term_coverage": "relaxed_thresholds",
+            "heading_anchor": "not_required",
+        },
         "rationale": RELAXED_LEXICAL_MATCHING_RATIONALE,
     },
 }
@@ -843,6 +852,7 @@ def _lexical_candidates(
                 frequency = len(in_section[term])
                 idf[term] = math.log((section_count - frequency + 0.5) / (frequency + 0.5) + 1.0)
             total_idf = sum(idf.values())
+            has_strict_hits = bool(rows_by_id)
             for row in rows:
                 section_id = row["section_id"]
                 if section_id in rows_by_id:
@@ -850,9 +860,11 @@ def _lexical_candidates(
                 # Ancestor headings are part of a section's meaning ("Vault Conventions > Frontmatter").
                 path_tokens = _token_set(row["heading_path"] or "")
                 weight, matched, matched_idf = 0.0, 0, 0.0
+                own_heading_matched = False
                 for term in relaxed_terms:
                     if section_id in in_heading[term]:
                         field_weight = RELAXED_FIELD_WEIGHTS["heading"]
+                        own_heading_matched = True
                     elif term in path_tokens:
                         field_weight = RELAXED_FIELD_WEIGHTS["heading_path"]
                     elif section_id in in_section[term]:
@@ -862,8 +874,15 @@ def _lexical_candidates(
                     matched += 1
                     matched_idf += idf[term]
                     weight += idf[term] * field_weight
+                # With strict hits, only admit complete content-term coverage anchored in
+                # the section's own heading. Ancestor headings are too generic for this gate.
+                strong_with_strict_hits = matched == len(relaxed_terms) and own_heading_matched
                 # Missing a rare term ("Postmark email provider") must not admit a near miss.
-                if matched >= relaxed_required and matched_idf >= RELAXED_MIN_IDF_COVERAGE * total_idf:
+                if (
+                    (not has_strict_hits or strong_with_strict_hits)
+                    and matched >= relaxed_required
+                    and matched_idf >= RELAXED_MIN_IDF_COVERAGE * total_idf
+                ):
                     rows_by_id[section_id] = row
                     relaxed_coverage[section_id] = matched
                     relaxed_weight[section_id] = weight
