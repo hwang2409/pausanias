@@ -25,6 +25,7 @@ from .core import (
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
     SYNONYM_EXPANSION,
+    RELAXED_LEXICAL_MATCHING,
     semantic_index_state,
     search,
     semantic_search,
@@ -322,6 +323,7 @@ class PersistentWorker:
         )
         balanced_admission = request.get("balanced_admission", BALANCED_ADMISSION)
         synonym_expansion = request.get("synonym_expansion", SYNONYM_EXPANSION)
+        relaxed_matching = request.get("relaxed_matching", RELAXED_LEXICAL_MATCHING)
         if project is not None and not isinstance(project, str):
             raise WorkerError("worker project must be a string or null")
         if root_id is not None and not isinstance(root_id, str):
@@ -344,6 +346,8 @@ class PersistentWorker:
             raise WorkerError("worker balanced admission policy is invalid")
         if not isinstance(synonym_expansion, bool):
             raise WorkerError("worker synonym expansion policy is invalid")
+        if not isinstance(relaxed_matching, bool):
+            raise WorkerError("worker relaxed matching policy is invalid")
         self._check_cancelled(cancelled)
         semantic_state, semantic_reason = semantic_index_state(self.config)
         encoder, model_load_ms = self._load_encoder()
@@ -367,6 +371,7 @@ class PersistentWorker:
                         ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
                         balanced_admission=balanced_admission,
                         synonym_expansion=synonym_expansion,
+                        relaxed_matching=relaxed_matching,
                     )
                     self._check_cancelled(cancelled)
                     if not timings.get("semantic_available"):
@@ -398,6 +403,7 @@ class PersistentWorker:
             candidates = search(
                 self.config, query, project, root_id, all_projects, limit,
                 semantic=False, synonym_expansion=synonym_expansion,
+                relaxed_matching=relaxed_matching,
             )
             self._check_cancelled(cancelled)
             timings["fallback_ms"] = _positive_ms(fallback_started)

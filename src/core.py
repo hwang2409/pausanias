@@ -149,6 +149,7 @@ FUSION_DIAGNOSTICS = {
 def fusion_diagnostics(
     config: Config | None = None,
     synonym_expansion: bool = SYNONYM_EXPANSION,
+    relaxed_matching: bool = RELAXED_LEXICAL_MATCHING,
 ) -> dict[str, object]:
     policy = {**SELECTION_POLICIES}
     try:
@@ -168,6 +169,11 @@ def fusion_diagnostics(
         "enabled": bool(table["enabled"]) and synonym_expansion,
         "runtime_toggle": synonym_expansion,
         "table": table,
+    }
+    policy["relaxed_lexical_matching"] = {
+        **policy["relaxed_lexical_matching"],
+        "enabled": policy["relaxed_lexical_matching"]["enabled"] and relaxed_matching,
+        "runtime_toggle": relaxed_matching,
     }
     return {
         **FUSION_DIAGNOSTICS,
@@ -1066,7 +1072,8 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                     relative_semantic_score_floor: float | None = RELATIVE_SEMANTIC_SCORE_FLOOR,
                     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
                     balanced_admission: bool = BALANCED_ADMISSION,
-                    synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
+                    synonym_expansion: bool = SYNONYM_EXPANSION,
+                    relaxed_matching: bool = RELAXED_LEXICAL_MATCHING) -> list[Candidate]:
     """Fuse bounded lexical and semantic lanes, with lexical fallback on failure."""
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -1074,7 +1081,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
     validation_refresh: set[str] = set()
     lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
         config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
-        synonym_expansion,
+        synonym_expansion, relaxed_matching=relaxed_matching,
     )
     if timings is not None:
         timings.setdefault("semantic_available", 0.0)
@@ -1127,13 +1134,15 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
 
 def search(config: Config, query: str, project: str | None = None, root_id: str | None = None,
            all_projects: bool = False, limit: int = 20, refresh: set[str] | None = None,
-           semantic: bool = True, synonym_expansion: bool = SYNONYM_EXPANSION) -> list[Candidate]:
+           semantic: bool = True, synonym_expansion: bool = SYNONYM_EXPANSION,
+           relaxed_matching: bool = RELAXED_LEXICAL_MATCHING) -> list[Candidate]:
     if semantic:
         timings: dict[str, float] = {}
         return semantic_search(
             config, query, project, root_id, all_projects, limit, refresh,
             timings=timings,
             synonym_expansion=synonym_expansion,
+            relaxed_matching=relaxed_matching,
         )
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -1141,6 +1150,7 @@ def search(config: Config, query: str, project: str | None = None, root_id: str 
     results, _, _, _ = _lexical_candidates(
         config, query, project, root_id, all_projects, min(MAX_CANDIDATES, max(limit * 5, 50)),
         validation_refresh, synonym_expansion=synonym_expansion,
+        relaxed_matching=relaxed_matching,
     )
     if refresh is not None:
         refresh.update(validation_refresh)

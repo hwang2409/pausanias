@@ -25,6 +25,7 @@ from pausanias.worker import (
     socket_ready,
     stop_worker,
     worker_paths,
+    WorkerError,
 )
 
 
@@ -164,6 +165,31 @@ def test_hook_falls_back_lexically_when_model_is_unavailable(tmp_path: Path):
         assert response.metrics.status == "semantic_disabled"
     finally:
         stop_worker(config.database)
+
+
+def test_worker_rejects_non_boolean_relaxed_matching(tmp_path: Path):
+    _, config = make_config(tmp_path)
+    worker = PersistentWorker(config)
+
+    with pytest.raises(WorkerError, match="relaxed matching policy is invalid"):
+        worker._query({"query": "alpha", "relaxed_matching": "false"})
+
+
+def test_hook_and_worker_can_disable_relaxed_matching(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    root = config.roots[0].path
+    note = root / "note.md"
+    note.write_text("# Vault Conventions\n\n## Frontmatter\n\nEvery note starts with a type and an updated date.\n")
+    core.index(config)
+    query = "what are the vault conventions for frontmatter?"
+
+    direct = run_hook(config, config_path, query, project="p",
+                      retrieval_mode="lexical", relaxed_matching=False)
+    worker = PersistentWorker(config)
+    response = worker._query({"query": query, "project": "p", "relaxed_matching": False})
+
+    assert direct.candidates == []
+    assert response["items"] == []
 
 
 def test_hook_explicit_lexical_mode_skips_semantic_worker(tmp_path: Path):

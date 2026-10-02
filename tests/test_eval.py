@@ -26,6 +26,13 @@ def _threshold_file(path: Path, *, recall: float = 0.0) -> Path:
     return path
 
 
+def test_harness_relaxed_matching_ablation_spec():
+    assert eval_harness.ABLATION_SPECS["relaxed_lexical_matching_disabled"] == {
+        "relaxed_matching": False,
+        "policy": "relaxed_lexical_matching",
+    }
+
+
 def test_score_case_precision_changes_when_noise_is_added(tmp_path: Path):
     runtime_corpus = tmp_path / "corpus"
     runtime_corpus.mkdir()
