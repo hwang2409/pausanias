@@ -348,6 +348,59 @@ def test_dead_pid_lock_is_taken_over(tmp_path: Path):
         stop_worker(config.database, paths)
 
 
+def test_ready_record_cannot_be_read_during_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import pausanias.worker as worker_module
+
+    path = tmp_path / "record"
+    _write_record(path, {"pid": 1, "readiness": "starting"})
+    fd = os.open(path, os.O_RDWR)
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write = worker_module.os.write
+
+    def delayed_write(write_fd, payload):
+        write_started.set()
+        assert release_write.wait(2)
+        return original_write(write_fd, payload)
+
+    monkeypatch.setattr(worker_module.os, "write", delayed_write)
+    process = subprocess.Popen(
+        [sys.executable, "-c", "from pathlib import Path; import sys; "
+         "sys.path.insert(0, sys.argv[2]); from pausanias.worker import _read_record; "
+         "print(_read_record(Path(sys.argv[1])), flush=True)", str(path),
+         str(Path(__file__).resolve().parents[1])],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        writer = threading.Thread(target=worker_module._write_record_fd,
+                                  args=(fd, {"pid": 42, "readiness": "ready"}))
+        writer.start()
+        assert write_started.wait(2)
+        release_write.set()
+        writer.join(timeout=2)
+        output = process.communicate(timeout=2)[0].strip()
+        assert output == "{'pid': 42, 'readiness': 'ready'}"
+    finally:
+        release_write.set()
+        process.kill() if process.poll() is None else None
+        process.wait()
+        os.close(fd)
+
+
+def test_hook_worker_is_stopped_after_hook(tmp_path: Path):
+    bundle = tmp_path / "invalid-bundle"
+    bundle.mkdir()
+    config_path, config = make_config(tmp_path, semantic_bundle=bundle)
+    core.index(config)
+
+    response = run_hook(config, config_path, "alpha memory", project="p")
+
+    assert response.metrics.fallback is True
+    assert worker_pids(config_path) == []
+
+
 def test_generation_invalidation_loads_new_matrix_mid_lifecycle(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config, encoder=FakeEncoder())
