@@ -69,3 +69,7 @@ jobs:
         run: .venv/bin/python -m pip install ".[semantic]"
       - name: run tests
         run: .venv/bin/python -m pytest -q
+      - name: run retrieval harness gates
+        run: |
+          .venv/bin/python -m eval.harness --retrieval-mode fused
+          .venv/bin/python -m eval.harness --retrieval-mode lexical

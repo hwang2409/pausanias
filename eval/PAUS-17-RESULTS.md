@@ -12,7 +12,25 @@ python -m eval.benchmarks.locomo.run --retrieval-mode {lexical,fused} --predict-
 python -m eval.benchmarks.locomo.run --retrieval-mode {lexical,fused} --abstention
 ```
 
-## LOCOMO retrieval, categories 1–4 (1,540 questions)
+## Verbatim precision gate fix
+
+The regression was caused by relaxed lexical candidates being admitted to the fused lexical lane alongside strict matches; their lexical RRF credit could displace strict/semantic results in the top four. Fused retrieval now keeps the strict pass authoritative when semantic fusion is active; lexical retrieval retains the relaxed pass.
+
+| check | before PAUS-17 | after fix |
+| --- | ---: | ---: |
+| fused verbatim precision@4 | 0.911290 | 0.927419 |
+| lexical verbatim precision@4 | 0.983871 | 1.000000 |
+| `eval.run` recall@4 / precision@4 / MRR / abstention | 0.735 / 0.724 / 0.735 / 1.000 | 0.735 / 0.735 / 0.735 / 1.000 |
+
+LOCOMO retrieval-only comparison (1,540 category 1–4 questions):
+
+| mode | recorded PAUS-17 recall@10 / MRR | fix recall@10 / MRR | delta |
+| --- | ---: | ---: | ---: |
+| lexical | 38.9% / 0.363 | 38.9% / 0.363 | 0.0 / 0.000 |
+| fused | 50.5% / 0.405 | 29.8% / 0.161 | -20.7pp / -0.244 |
+
+Category-5 false injection remained 67.71% lexical and 100.00% fused. The fused LOCOMO loss is material; retaining PAUS-17's fused gain requires a more selective strict/relaxed admission policy than this gate-safe fallback.
+
 
 | mode | run | recall@10 | MRR@10 | recall@50 | recall@200 |
 | --- | --- | ---: | ---: | ---: | ---: |

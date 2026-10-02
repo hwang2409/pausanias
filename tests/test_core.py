@@ -515,7 +515,7 @@ def test_fused_relaxed_candidate_cannot_displace_strict_match(tmp_path: Path):
         )
 
     strict = candidate("strict", "Strict")
-    relaxed = candidate("relaxed", "Relaxed")
+    relaxed = replace(candidate("relaxed", "Relaxed"), reason="partial match (2/3 terms)")
     results = core._fuse_candidates(
         [
             replace(strict, lexical_rank=1),

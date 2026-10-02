@@ -814,7 +814,7 @@ def _lexical_candidates(
         relaxed_coverage: dict[str, int] = {}
         relaxed_weight: dict[str, float] = {}
         # A lone leftover keyword ("what about that decision") is too weak to match on.
-        if len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
+        if len(rows_by_id) < 2 and len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
             relaxed_fts = " OR ".join('"' + term.replace('"', '""') + '"' for term in relaxed_terms)
             rows = connection.execute(
                 "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
@@ -965,6 +965,10 @@ def _lexical_candidates(
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 
 
+def _is_relaxed_candidate(candidate: Candidate) -> bool:
+    return "partial match (" in candidate.reason
+
+
 def _fuse_candidates(
     lexical: list[Candidate],
     vector: list[Candidate],
@@ -1020,9 +1024,17 @@ def _fuse_candidates(
     guard_status = (
         "protected" if protected_order else ("bypassed:no-protected-hit" if guarded else "not-applicable")
     )
+    relaxed_ids = {candidate.section_id for candidate in lexical if _is_relaxed_candidate(candidate)}
+    strict_lexical_exists = any(
+        candidate.lexical_rank is not None and candidate.section_id not in relaxed_ids
+        for candidate in lexical
+    )
     fused: list[Candidate] = []
     for section_id, candidate in admitted.items():
-        lexical_rank = candidate.lexical_rank
+        relaxed_without_strict_lane = strict_lexical_exists and (
+            section_id in relaxed_ids or _is_relaxed_candidate(candidate)
+        )
+        lexical_rank = None if relaxed_without_strict_lane else candidate.lexical_rank
         vector_rank = candidate.vector_rank
         fused_score = (1.0 / (RRF_RANK_CONSTANT + lexical_rank) if lexical_rank is not None else 0.0) + (
             1.0 / (RRF_RANK_CONSTANT + vector_rank) if vector_rank is not None else 0.0
@@ -1081,7 +1093,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
     validation_refresh: set[str] = set()
     lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
         config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
-        synonym_expansion, relaxed_matching=relaxed_matching,
+        synonym_expansion, relaxed_matching=False,
     )
     if timings is not None:
         timings.setdefault("semantic_available", 0.0)
@@ -1126,6 +1138,10 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                 if (candidate.vector_score or 0.0) >= semantic_floor
                 or candidate.section_id in lexical_ids
             ]
+    lexical = [
+        replace(item, lexical_rank=None) if _is_relaxed_candidate(item) else item
+        for item in lexical
+    ]
     return _fuse_candidates(
         lexical, semantic, primary_rank, atom_matches, guarded, limit, timings, semantic_score_floor,
         balanced_admission,
