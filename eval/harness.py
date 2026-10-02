@@ -19,6 +19,7 @@ from pausanias.core import (
     SEMANTIC_SCORE_FLOOR,
     TICKET_ID_CROSS_REFERENCE_FILTER,
     SYNONYM_EXPANSION,
+    RELAXED_LEXICAL_MATCHING,
     Candidate,
     fusion_diagnostics,
     index,
@@ -77,6 +78,10 @@ ABLATION_SPECS = {
     "synonym_expansion_disabled": {
         "synonym_expansion": False,
         "policy": "synonym_expansion",
+    },
+    "relaxed_lexical_matching_disabled": {
+        "relaxed_matching": False,
+        "policy": "relaxed_lexical_matching",
     },
 }
 
@@ -589,6 +594,7 @@ def _run_search(
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
     synonym_expansion: bool = SYNONYM_EXPANSION,
+    relaxed_matching: bool = RELAXED_LEXICAL_MATCHING,
 ) -> list[Candidate]:
     if config_path is not None and retrieval_mode == "fused":
         return run_hook(
@@ -604,6 +610,7 @@ def _run_search(
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
             synonym_expansion=synonym_expansion,
+            relaxed_matching=relaxed_matching,
         ).candidates
     if retrieval_mode == "fused":
         return semantic_search(
@@ -619,6 +626,7 @@ def _run_search(
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
             synonym_expansion=synonym_expansion,
+            relaxed_matching=relaxed_matching,
         )
     return search(
         config,
@@ -630,6 +638,7 @@ def _run_search(
         refresh=refresh,
         semantic=False,
         synonym_expansion=synonym_expansion,
+        relaxed_matching=relaxed_matching,
     )
 
 
@@ -646,6 +655,7 @@ def _search_case(
     ticket_id_cross_reference_filter: bool = TICKET_ID_CROSS_REFERENCE_FILTER,
     balanced_admission: bool = BALANCED_ADMISSION,
     synonym_expansion: bool = SYNONYM_EXPANSION,
+    relaxed_matching: bool = RELAXED_LEXICAL_MATCHING,
 ) -> dict[str, Any]:
     with _temporarily_deleted(runtime_corpus, case.delete_sources):
         refresh: set[str] = set()
@@ -662,6 +672,7 @@ def _search_case(
             ticket_id_cross_reference_filter=ticket_id_cross_reference_filter,
             balanced_admission=balanced_admission,
             synonym_expansion=synonym_expansion,
+            relaxed_matching=relaxed_matching,
         )
         elapsed = (time.perf_counter() - started) * 1000
     return {

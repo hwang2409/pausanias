@@ -85,9 +85,13 @@ On a 1,538-section personal vault, warm, with 30 lexical candidate calls:
 The first version tokenized every relaxed candidate body in Python (p95 60 ms, max
 159 ms). The final version asks FTS5 for per-term section sets instead.
 
-## Follow-up
+## Relaxed lexical matching ablation
 
-The harness ablation table does not yet include `relaxed_lexical_matching_disabled`.
-That needs the toggle plumbed through `run_hook` and the worker protocol, as
-`synonym_expansion` is. `_lexical_candidates(..., relaxed_matching=False)` exists and is
-tested.
+The fused harness now includes `relaxed_lexical_matching_disabled`:
+
+| ablation | recall@4 | precision@4 | MRR | abstention accuracy | forbidden violations | delta from active (recall, precision, MRR, abstention, forbidden) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| relaxed lexical matching disabled | 1.000 | 0.862 | 0.990 | 1.000 | 0 | (0.000, -0.010, 0.000, 0.000, 0) |
+
+Active fused retrieval remains 100.00% harness accuracy. The disabled-policy row is
+based on `python -m eval.harness --retrieval-mode fused`.
