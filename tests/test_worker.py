@@ -413,12 +413,23 @@ def test_record_is_private_under_permissive_umask(tmp_path: Path):
     assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_live_pid_lock_is_not_treated_as_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_unverified_live_pid_record_is_replaced_without_signalling_it(tmp_path: Path):
     config_path, config = make_config(tmp_path)
+    core.index(config)
     paths = worker_paths(config.database)
-    _write_record(paths.record, {"pid": os.getpid(), "readiness": "starting"})
-    monkeypatch.setattr("pausanias.worker.launch_worker", lambda *args: pytest.fail("live worker was replaced"))
-    assert ensure_worker(config, config_path, time.perf_counter() + 0.03, paths) is None
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    _write_record(paths.record, {
+        "pid": sleeper.pid, "launch_nonce": "unverified", "readiness": "starting",
+    })
+    try:
+        assert ensure_worker(config, config_path, time.perf_counter() + 2, paths) is not None
+        assert sleeper.poll() is None
+        assert _read_record(paths.record)["pid"] != sleeper.pid
+    finally:
+        stop_worker(config.database, paths)
+        if sleeper.poll() is None:
+            sleeper.terminate()
+        sleeper.wait(timeout=2)
 
 
 def test_dead_pid_lock_is_taken_over(tmp_path: Path):
@@ -513,9 +524,10 @@ def test_record_reader_never_observes_truncate_window(
     writer = threading.Thread(target=publish)
     writer.start()
     assert write_paused.wait(2)
-    assert _read_record(path) == old
+    observed = _read_record(path)
     release_write.set()
     writer.join(timeout=2)
+    assert observed == old
     assert not writer.is_alive()
     assert _read_record(path) == new
 
