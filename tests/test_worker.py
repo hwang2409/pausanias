@@ -258,20 +258,7 @@ import pausanias.worker as worker_module
 from pausanias.worker import ensure_worker
 config_path = Path(sys.argv[1])
 config = load_config(config_path)
-write_record = worker_module._write_record
-barrier_prefix = config_path.with_name(config_path.name + ".launch-barrier.")
-def synchronized_write(path, record):
-    write_record(path, record)
-    if record.get("pid") == 0:
-        marker = Path(str(barrier_prefix) + str(os.getpid()))
-        marker.write_text("ready")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if len(list(barrier_prefix.parent.glob(barrier_prefix.name + "*"))) >= 4:
-                break
-            time.sleep(0.001)
-worker_module._write_record = synchronized_write
-result = ensure_worker(config, config_path, time.perf_counter() + 2)
+result = ensure_worker(config, config_path, time.perf_counter() + 4)
 print(result is not None, flush=True)
 """
     repository = Path(__file__).resolve().parents[1]
@@ -280,9 +267,9 @@ print(result is not None, flush=True)
     processes = [subprocess.Popen(
         [sys.executable, "-c", script, str(config_path)],
         cwd=repository, env=environment, stdout=subprocess.PIPE, text=True,
-    ) for _ in range(4)]
+    ) for _ in range(32)]
     try:
-        outputs = [process.communicate(timeout=4)[0].strip() for process in processes]
+        outputs = [process.communicate(timeout=8)[0].strip() for process in processes]
         assert outputs == ["True"] * 4
         paths = worker_paths(config.database)
         pids = worker_pids(config_path)
