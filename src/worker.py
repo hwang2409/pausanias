@@ -39,6 +39,7 @@ ADAPTER_DEADLINE_MS = 750.0
 DEFAULT_IDLE_SECONDS = 30 * 60
 SOCKET_TIMEOUT_SECONDS = 0.05
 CANCELLATION_TOMBSTONE_SECONDS = 5.0
+WORKER_PROTOCOL_VERSION = 2
 
 
 class WorkerError(RuntimeError):
@@ -53,6 +54,10 @@ class RequestCancelled(WorkerError):
 class WorkerPaths:
     socket: Path
     lock: Path
+
+    @property
+    def record(self) -> Path:
+        return self.lock.with_name(self.lock.name + ".record")
 
 
 @dataclass(frozen=True)
@@ -79,7 +84,14 @@ def worker_paths(database: Path) -> WorkerPaths:
     identity = str(database.expanduser().resolve())
     digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
     parent = Path(tempfile.gettempdir())
-    return WorkerPaths(parent / f"pausanias-{digest}.sock", parent / f"pausanias-{digest}.lock")
+    namespace = f"pausanias-{digest}-v{WORKER_PROTOCOL_VERSION}"
+    return WorkerPaths(parent / f"{namespace}.sock", parent / f"{namespace}.lock")
+
+
+def _paths_use_current_protocol(paths: WorkerPaths) -> bool:
+    version = f"-v{WORKER_PROTOCOL_VERSION}"
+    return (paths.socket.name.endswith(f"{version}.sock")
+            and paths.lock.name.endswith(f"{version}.lock"))
 
 
 def _positive_ms(started: float) -> float:
@@ -87,28 +99,38 @@ def _positive_ms(started: float) -> float:
 
 
 def _read_record(path: Path) -> dict[str, object]:
+    """Read an atomic snapshot; readers never participate in lifecycle locking."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, UnicodeDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
 
 def _write_record(path: Path, record: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _write_record_fd(fd: int, record: dict[str, object]) -> None:
-    """Update the lock record without replacing its flocked inode."""
-    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    view = memoryview(payload)
-    while view:
-        view = view[os.write(fd, view):]
-    os.fsync(fd)
+    fd: int | None = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            json.dump(record, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _config_fingerprint(config: Config) -> str:
@@ -169,26 +191,99 @@ def socket_ready(path: Path) -> bool:
         return False
 
 
-def stop_worker(database: Path, paths: WorkerPaths | None = None) -> bool:
-    worker_paths_value = paths or worker_paths(database)
-    record = _read_record(worker_paths_value.lock)
+def _worker_request(paths: WorkerPaths, request: dict[str, object], timeout: float) -> dict[str, object] | None:
+    if timeout <= 0:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(timeout)
+            connection.connect(str(paths.socket))
+            connection.sendall(json.dumps(request).encode("utf-8") + b"\n")
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 64_000:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        response = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return response if isinstance(response, dict) else None
+
+
+def _record_identity(record: dict[str, object]) -> tuple[int, str] | None:
     pid = record.get("pid")
-    stopped = False
-    if isinstance(pid, int) and pid_alive(pid):
+    nonce = record.get("launch_nonce")
+    if not isinstance(pid, int) or not pid_alive(pid) or not isinstance(nonce, str) or not nonce:
+        return None
+    return pid, nonce
+
+
+def _identity_matches(paths: WorkerPaths, record: dict[str, object], timeout: float) -> bool:
+    identity = _record_identity(record)
+    if identity is None:
+        return False
+    response = _worker_request(paths, {"command": "identity"}, timeout)
+    return (response is not None
+            and response.get("protocol_version") == WORKER_PROTOCOL_VERSION
+            and response.get("pid") == identity[0]
+            and response.get("launch_nonce") == identity[1])
+
+
+def _remove_stale_record(paths: WorkerPaths, record: dict[str, object]) -> None:
+    if _read_record(paths.record) != record:
+        return
+    try:
+        paths.record.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def stop_worker(database: Path, paths: WorkerPaths | None = None, timeout: float = 1.0) -> bool:
+    """Stop only the worker whose socket identity matches its atomic record.
+
+    An alive PID in a stale record is never enough authority to signal that
+    process. If its socket cannot be authenticated, only stale path files are
+    removed; the unverified process is left untouched.
+    """
+    worker_paths_value = paths or worker_paths(database)
+    if not _paths_use_current_protocol(worker_paths_value):
+        return False
+    record = _read_record(worker_paths_value.record)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    remaining = max(deadline - time.monotonic(), 0.0)
+    verified = _identity_matches(worker_paths_value, record, remaining)
+    if not verified:
+        socket_is_live = socket_ready(worker_paths_value.socket)
+        if not socket_is_live:
+            try:
+                worker_paths_value.socket.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+        _remove_stale_record(worker_paths_value, record)
+        return False
+
+    pid, nonce = _record_identity(record) or (0, "")
+    remaining = max(deadline - time.monotonic(), 0.0)
+    response = _worker_request(
+        worker_paths_value, {"command": "shutdown", "launch_nonce": nonce}, remaining,
+    )
+    stopped = response is not None and response.get("stopping") is True
+    while pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(min(0.005, max(deadline - time.monotonic(), 0.0)))
+    if pid_alive(pid) and stopped:
+        # The immediately preceding socket handshake proved this PID owns the
+        # endpoint and nonce, so a signal fallback cannot target a stale PID.
         try:
             os.kill(pid, signal.SIGTERM)
-            stopped = True
         except OSError:
             pass
-        wait_deadline = time.monotonic() + 1.0
-        while pid_alive(pid) and time.monotonic() < wait_deadline:
-            time.sleep(0.005)
-    try:
-        worker_paths_value.socket.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+    if not pid_alive(pid):
+        try:
+            worker_paths_value.socket.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+        _remove_stale_record(worker_paths_value, record)
     return stopped
 
 
@@ -201,6 +296,8 @@ class PersistentWorker:
                  encoder: object | None = None):
         self.config = config
         self.paths = paths or worker_paths(config.database)
+        if not _paths_use_current_protocol(self.paths):
+            raise WorkerError("worker paths do not match the current protocol namespace")
         self.encoder_factory = encoder_factory or OnnxEncoder
         self._injected_encoder_factory = encoder_factory is not None or encoder is not None
         self.idle_seconds = idle_seconds
@@ -215,6 +312,7 @@ class PersistentWorker:
         self._requests_lock = threading.Lock()
         self._started = time.perf_counter()
         self._stopping = threading.Event()
+        self._launch_nonce = os.environ.get("PAUSANIAS_WORKER_NONCE") or uuid.uuid4().hex
 
     def _lock_fd(self) -> int | None:
         value = os.environ.get("PAUSANIAS_WORKER_LOCK_FD")
@@ -223,15 +321,12 @@ class PersistentWorker:
     def _publish(self, state: str, pid: int) -> None:
         record = {
             "database": str(self.config.database), "pid": pid,
-            "launch_nonce": os.environ.get("PAUSANIAS_WORKER_NONCE", ""),
+            "launch_nonce": self._launch_nonce,
             "start_time": self._started, "socket_path": str(self.paths.socket),
-            "readiness": state, "config_fingerprint": _config_fingerprint(self.config),
+            "readiness": state, "protocol_version": WORKER_PROTOCOL_VERSION,
+            "config_fingerprint": _config_fingerprint(self.config),
         }
-        lock_fd = self._lock_fd()
-        if lock_fd is None:
-            _write_record(self.paths.lock, record)
-        else:
-            _write_record_fd(lock_fd, record)
+        _write_record(self.paths.record, record)
 
     def _backend_failure_token(self) -> tuple[object, ...]:
         """Track state that can repair a cached model-load failure."""
@@ -436,6 +531,7 @@ class PersistentWorker:
     def _serve_connection(self, connection: socket.socket) -> None:
         request_id: str | None = None
         cancelled: threading.Event | None = None
+        shutdown_requested = False
         try:
             connection.settimeout(ADAPTER_DEADLINE_MS / 1000.0)
             data = b""
@@ -447,7 +543,19 @@ class PersistentWorker:
             request = json.loads(data.decode("utf-8"))
             if not isinstance(request, dict):
                 raise WorkerError("worker request must be an object")
-            if request.get("command") == "cancel":
+            command = request.get("command")
+            if command == "identity":
+                response = {
+                    "pid": os.getpid(), "launch_nonce": self._launch_nonce,
+                    "protocol_version": WORKER_PROTOCOL_VERSION,
+                }
+            elif command == "shutdown":
+                nonce = request.get("launch_nonce")
+                if not isinstance(nonce, str) or not nonce or nonce != self._launch_nonce:
+                    raise WorkerError("worker shutdown authentication failed")
+                response = {"stopping": True}
+                shutdown_requested = True
+            elif command == "cancel":
                 target = request.get("request_id")
                 cancelled_request = self._cancel_request(target)
                 response = {"cancelled": cancelled_request}
@@ -469,6 +577,14 @@ class PersistentWorker:
             pass
         finally:
             connection.close()
+        if shutdown_requested:
+            self._stopping.set()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                    wake.settimeout(SOCKET_TIMEOUT_SECONDS)
+                    wake.connect(str(self.paths.socket))
+            except OSError:
+                pass
 
     def serve(self) -> None:
         self.paths.socket.parent.mkdir(parents=True, exist_ok=True)
@@ -477,36 +593,65 @@ class PersistentWorker:
         except FileNotFoundError:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.paths.socket))
-        os.chmod(self.paths.socket, 0o600)
-        server.listen(32)
-        self._publish("ready", os.getpid())
-        lock_fd = self._lock_fd()
-        if lock_fd is not None:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-        server.settimeout(0.25)
-        last_request = time.monotonic()
-        try:
-            while not self._stopping.is_set():
-                if time.monotonic() - last_request >= self.idle_seconds:
-                    break
-                try:
-                    connection, _ = server.accept()
-                except TimeoutError:
-                    self._prune_cancellation_tombstones()
-                    continue
-                last_request = time.monotonic()
-                threading.Thread(target=self._serve_connection, args=(connection,), daemon=True).start()
-        finally:
+        previous_handlers: dict[int, object] = {}
+
+        def request_stop(_signum: int, _frame: object) -> None:
             self._stopping.set()
-            server.close()
             try:
-                self.paths.socket.unlink()
-            except FileNotFoundError:
-                pass
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                    wake.settimeout(SOCKET_TIMEOUT_SECONDS)
+                    wake.connect(str(self.paths.socket))
             except OSError:
                 pass
+
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_stop)
+        try:
+            # Publish first: a connectable socket always has this worker's record.
+            self._publish("ready", os.getpid())
+            server.bind(str(self.paths.socket))
+            os.chmod(self.paths.socket, 0o600)
+            server.listen(32)
+            lock_fd_value = self._lock_fd()
+            if lock_fd_value is not None:
+                fcntl.flock(lock_fd_value, fcntl.LOCK_UN)
+                os.close(lock_fd_value)
+            server.settimeout(0.25)
+            last_request = time.monotonic()
+            try:
+                while not self._stopping.is_set():
+                    if time.monotonic() - last_request >= self.idle_seconds:
+                        break
+                    try:
+                        connection, _ = server.accept()
+                    except TimeoutError:
+                        self._prune_cancellation_tombstones()
+                        continue
+                    except OSError:
+                        if self._stopping.is_set():
+                            break
+                        raise
+                    if self._stopping.is_set():
+                        connection.close()
+                        break
+                    last_request = time.monotonic()
+                    threading.Thread(target=self._serve_connection, args=(connection,), daemon=True).start()
+            finally:
+                self._stopping.set()
+                server.close()
+                try:
+                    self.paths.socket.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
+        finally:
+            record = _read_record(self.paths.record)
+            if (record.get("pid") == os.getpid()
+                    and record.get("launch_nonce") == self._launch_nonce):
+                _remove_stale_record(self.paths, record)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
     def _cancel_request(self, request_id: object) -> bool:
         if not isinstance(request_id, str):
@@ -563,9 +708,10 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
     initial_record = {
         "database": str(database or paths.lock.parent), "pid": 0, "launch_nonce": nonce,
         "start_time": time.time(), "socket_path": str(paths.socket), "readiness": "starting",
+        "protocol_version": WORKER_PROTOCOL_VERSION,
         "config_fingerprint": config_fingerprint_value,
     }
-    _write_record_fd(lock_fd, initial_record)
+    _write_record(paths.record, initial_record)
     environment = os.environ.copy()
     environment["PAUSANIAS_WORKER_LOCK_FD"] = str(lock_fd)
     environment["PAUSANIAS_WORKER_NONCE"] = nonce
@@ -575,30 +721,51 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
         env=environment, pass_fds=(lock_fd,), close_fds=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    record = _read_record(paths.lock) or initial_record
-    record["pid"] = process.pid
-    _write_record_fd(lock_fd, record)
     return process
 
 
 def ensure_worker(config: Config, config_path: Path, deadline: float,
                   paths: WorkerPaths | None = None) -> tuple[WorkerPaths, float] | None:
     worker_paths_value = paths or worker_paths(config.database)
+    if not _paths_use_current_protocol(worker_paths_value):
+        return None
     started = time.perf_counter()
     expected_fingerprint = _config_fingerprint(config)
-    if socket_ready(worker_paths_value.socket):
-        record = _read_record(worker_paths_value.lock)
-        if record.get("config_fingerprint") == expected_fingerprint:
+
+    def expected_record(record: dict[str, object]) -> bool:
+        return (_record_identity(record) is not None
+                and record.get("protocol_version") == WORKER_PROTOCOL_VERSION
+                and record.get("config_fingerprint") == expected_fingerprint
+                and record.get("readiness") == "ready"
+                and record.get("socket_path") == str(worker_paths_value.socket))
+
+    def ready_record() -> bool:
+        record = _read_record(worker_paths_value.record)
+        remaining = min(SOCKET_TIMEOUT_SECONDS, max(deadline - time.perf_counter(), 0.0))
+        return (expected_record(record)
+                and _identity_matches(worker_paths_value, record, remaining))
+
+    while time.perf_counter() < deadline:
+        if ready_record():
             return worker_paths_value, _positive_ms(started)
-        stop_worker(config.database, worker_paths_value)
-    lock_fd = _acquire_lock(worker_paths_value.lock)
-    if lock_fd is not None:
-        record = _read_record(worker_paths_value.lock)
-        pid = record.get("pid")
-        if isinstance(pid, int) and pid_alive(pid) and not socket_ready(worker_paths_value.socket):
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-        else:
+        lock_fd = _acquire_lock(worker_paths_value.lock)
+        if lock_fd is not None:
+            if ready_record():
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                return worker_paths_value, _positive_ms(started)
+            if worker_paths_value.socket.exists():
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                record = _read_record(worker_paths_value.record)
+                if not expected_record(record):
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        stop_worker(config.database, worker_paths_value, remaining)
+                time.sleep(min(0.005, max(deadline - time.perf_counter(), 0.0)))
+                continue
+            record = _read_record(worker_paths_value.record)
+            _remove_stale_record(worker_paths_value, record)
             try:
                 launch_worker(
                     config_path, worker_paths_value, lock_fd, config.database, expected_fingerprint,
@@ -608,8 +775,7 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
                 os.close(lock_fd)
                 return None
             os.close(lock_fd)
-    while time.perf_counter() < deadline:
-        if socket_ready(worker_paths_value.socket):
+        if ready_record():
             return worker_paths_value, _positive_ms(started)
         time.sleep(min(0.005, max(deadline - time.perf_counter(), 0.0)))
     return None
@@ -617,6 +783,8 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
 
 class WorkerClient:
     def __init__(self, paths: WorkerPaths):
+        if not _paths_use_current_protocol(paths):
+            raise WorkerError("worker paths do not match the current protocol namespace")
         self.paths = paths
 
     def query(self, request: dict[str, object], deadline: float) -> dict[str, object]:
