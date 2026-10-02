@@ -815,7 +815,7 @@ def _lexical_candidates(
         relaxed_coverage: dict[str, int] = {}
         relaxed_weight: dict[str, float] = {}
         # A lone leftover keyword ("what about that decision") is too weak to match on.
-        if not rows_by_id and len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
+        if len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
             relaxed_fts = " OR ".join('"' + term.replace('"', '""') + '"' for term in relaxed_terms)
             rows = connection.execute(
                 "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
@@ -844,6 +844,7 @@ def _lexical_candidates(
                 frequency = len(in_section[term])
                 idf[term] = math.log((section_count - frequency + 0.5) / (frequency + 0.5) + 1.0)
             total_idf = sum(idf.values())
+            has_strict_hits = bool(rows_by_id)
             for row in rows:
                 section_id = row["section_id"]
                 if section_id in rows_by_id:
@@ -851,11 +852,14 @@ def _lexical_candidates(
                 # Ancestor headings are part of a section's meaning ("Vault Conventions > Frontmatter").
                 path_tokens = _token_set(row["heading_path"] or "")
                 weight, matched, matched_idf = 0.0, 0, 0.0
+                heading_matched = False
                 for term in relaxed_terms:
                     if section_id in in_heading[term]:
                         field_weight = RELAXED_FIELD_WEIGHTS["heading"]
+                        heading_matched = True
                     elif term in path_tokens:
                         field_weight = RELAXED_FIELD_WEIGHTS["heading_path"]
+                        heading_matched = True
                     elif section_id in in_section[term]:
                         field_weight = RELAXED_FIELD_WEIGHTS["text"]
                     else:
@@ -863,8 +867,15 @@ def _lexical_candidates(
                     matched += 1
                     matched_idf += idf[term]
                     weight += idf[term] * field_weight
+                # With strict hits, only admit complete content-term coverage anchored in
+                # the section's own or ancestor heading. This excludes body-only echoes.
+                strong_with_strict_hits = matched == len(relaxed_terms) and heading_matched
                 # Missing a rare term ("Postmark email provider") must not admit a near miss.
-                if matched >= relaxed_required and matched_idf >= RELAXED_MIN_IDF_COVERAGE * total_idf:
+                if (
+                    (not has_strict_hits or strong_with_strict_hits)
+                    and matched >= relaxed_required
+                    and matched_idf >= RELAXED_MIN_IDF_COVERAGE * total_idf
+                ):
                     rows_by_id[section_id] = row
                     relaxed_coverage[section_id] = matched
                     relaxed_weight[section_id] = weight

@@ -1083,13 +1083,27 @@ def test_relaxed_matching_answers_natural_language_questions(tmp_path: Path):
     assert "partial match (3/3 terms)" in results[0].reason
 
 
-def test_strict_matches_prevent_relaxed_admission(tmp_path: Path):
+def test_strong_relaxed_matches_rank_after_strict_matches(tmp_path: Path):
     _, config = _relaxed_vault(tmp_path)
 
     results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
 
     assert results[0].canonical_path.endswith("strict.md")
-    assert all("partial match" not in item.reason for item in results)
+    assert "partial match" not in results[0].reason
+    assert any("partial match (3/3 terms)" in item.reason for item in results[1:])
+
+
+def test_body_only_relaxed_match_stays_excluded_when_strict_match_exists(tmp_path: Path):
+    root, config = _relaxed_vault(tmp_path)
+    (root / "body-echo.md").write_text(
+        "# Meeting transcript\n\nThe team discussed vault conventions and frontmatter.\n"
+    )
+    index(config)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("strict.md")
+    assert all(not item.canonical_path.endswith("body-echo.md") for item in results)
 
 
 def test_strong_heading_relaxed_match_survives_unrelated_strict_body_hit(tmp_path: Path):
