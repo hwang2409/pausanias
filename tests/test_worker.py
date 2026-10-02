@@ -348,52 +348,77 @@ def test_dead_pid_lock_is_taken_over(tmp_path: Path):
         stop_worker(config.database, paths)
 
 
-def test_ready_record_cannot_be_read_during_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_record_reader_never_sees_partial_atomic_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import pausanias.worker as worker_module
 
     path = tmp_path / "record"
-    _write_record(path, {"pid": 1, "readiness": "starting"})
-    fd = os.open(path, os.O_RDWR)
+    old = {"pid": 1, "readiness": "ready"}
+    new = {"pid": 42, "readiness": "ready"}
+    _write_record(path, old)
+    replace_started = threading.Event()
+    release_replace = threading.Event()
+    original_replace = worker_module.os.replace
+
+    def delayed_replace(source, destination):
+        replace_started.set()
+        assert release_replace.wait(2)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(worker_module.os, "replace", delayed_replace)
+    writer = threading.Thread(target=worker_module._write_record, args=(path, new))
+    writer.start()
+    assert replace_started.wait(2)
+    assert _read_record(path) == old
+    release_replace.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    assert _read_record(path) == new
+
+
+def test_hung_lifecycle_writer_does_not_block_ensure_worker(tmp_path: Path):
     import fcntl
+
+    config_path, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    paths.lock.touch()
+    fd = os.open(paths.lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    write_started = threading.Event()
-    release_write = threading.Event()
-    original_write = worker_module.os.write
-
-    def delayed_write(write_fd, payload):
-        write_started.set()
-        assert release_write.wait(2)
-        return original_write(write_fd, payload)
-
-    monkeypatch.setattr(worker_module.os, "write", delayed_write)
-    process = subprocess.Popen(
-        [sys.executable, "-c", "from pathlib import Path; import sys; "
-         "sys.path.insert(0, sys.argv[2]); from pausanias.worker import _read_record; "
-         "print(_read_record(Path(sys.argv[1])), flush=True)", str(path),
-         str(Path(__file__).resolve().parents[1])],
-        stdout=subprocess.PIPE, text=True,
-    )
     try:
-        writer = threading.Thread(target=worker_module._write_record_fd,
-                                  args=(fd, {"pid": 42, "readiness": "ready"}))
-        writer.start()
-        assert write_started.wait(2)
-        try:
-            output = process.communicate(timeout=0.2)[0].strip()
-        except subprocess.TimeoutExpired:
-            release_write.set()
-        else:
-            release_write.set()
-        writer.join(timeout=2)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        if process.poll() is None:
-            output = process.communicate(timeout=2)[0].strip()
-        assert output == "{'pid': 42, 'readiness': 'ready'}"
+        started = time.perf_counter()
+        assert ensure_worker(config, config_path, started + 0.1, paths) is None
+        assert time.perf_counter() - started < 0.5
     finally:
-        release_write.set()
-        process.kill() if process.poll() is None else None
-        process.wait()
+        fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def test_stop_worker_has_finite_timeout_with_hung_lifecycle_writer(tmp_path: Path):
+    import fcntl
+
+    _, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    paths.lock.touch()
+    fd = os.open(paths.lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        started = time.perf_counter()
+        assert stop_worker(config.database, paths, timeout=0.1) is False
+        assert time.perf_counter() - started < 0.5
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_old_format_lock_content_does_not_break_startup(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    core.index(config)
+    paths = worker_paths(config.database)
+    _write_record(paths.lock, {"pid": 999999, "readiness": "starting"})
+    try:
+        assert ensure_worker(config, config_path, time.perf_counter() + 2, paths) is not None
+        assert _read_record(paths.record)["pid"] != 999999
+    finally:
+        stop_worker(config.database, paths)
 
 def test_generation_invalidation_loads_new_matrix_mid_lifecycle(tmp_path: Path):
     config_path, config = make_config(tmp_path)
