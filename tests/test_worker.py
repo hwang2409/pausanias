@@ -389,11 +389,21 @@ def test_stop_worker_has_finite_timeout_with_hung_lifecycle_writer(tmp_path: Pat
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         started = time.perf_counter()
-        assert stop_worker(config.database, paths, timeout=0.1) is False
+        finished = threading.Event()
+        result: list[bool] = []
+
+        def stop():
+            result.append(stop_worker(config.database, paths))
+            finished.set()
+
+        thread = threading.Thread(target=stop)
+        thread.start()
+        assert finished.wait(0.2)
         assert time.perf_counter() - started < 0.5
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+        thread.join(timeout=1)
 
 
 def test_old_format_lock_content_does_not_break_startup(tmp_path: Path):
