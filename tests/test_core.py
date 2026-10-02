@@ -1092,6 +1092,27 @@ def test_strict_matches_prevent_relaxed_admission(tmp_path: Path):
     assert all("partial match" not in item.reason for item in results)
 
 
+def test_strong_heading_relaxed_match_survives_unrelated_strict_body_hit(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "conventions.md").write_text(
+        "# Vault Conventions\n\nRules for every note.\n\n"
+        "## Frontmatter\n\nEvery note starts with a type and an updated date.\n"
+    )
+    (root / "transcript.md").write_text(
+        "# Meeting transcript\n\nSomeone asked, what are the vault conventions for frontmatter?\n"
+        "The meeting moved to another topic without answering.\n"
+    )
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+
+    results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("transcript.md")
+    assert results[1].heading == "Frontmatter"
+    assert "partial match (3/3 terms)" in results[1].reason
+
+
 def test_relaxed_matching_rejects_near_miss_without_rare_term(tmp_path: Path):
     _, config = _relaxed_vault(tmp_path)
 
