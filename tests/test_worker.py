@@ -270,7 +270,7 @@ print(result is not None, flush=True)
     ) for _ in range(32)]
     try:
         outputs = [process.communicate(timeout=8)[0].strip() for process in processes]
-        assert outputs == ["True"] * 4
+        assert outputs == ["True"] * 32
         paths = worker_paths(config.database)
         pids = worker_pids(config_path)
         assert len(pids) == 1
