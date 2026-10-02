@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import json
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -313,6 +316,103 @@ def test_worker_death_mid_query_recovers_on_next_hook(tmp_path: Path):
         stop_worker(config.database, paths)
 
 
+def test_ensure_rejects_foreign_socket_with_forged_ready_record(tmp_path: Path):
+    import pausanias.worker as worker_module
+
+    config_path, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(paths.socket))
+    server.listen(4)
+    server.settimeout(0.05)
+    stopping = threading.Event()
+
+    def serve_foreign_socket() -> None:
+        while not stopping.is_set():
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            with connection:
+                try:
+                    data = connection.recv(65536)
+                    if data:
+                        connection.sendall(
+                            json.dumps({"pid": os.getpid(), "launch_nonce": "foreign"}).encode()
+                            + b"\n"
+                        )
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=serve_foreign_socket)
+    thread.start()
+    _write_record(paths.record, {
+        "config_fingerprint": worker_module._config_fingerprint(config),
+        "launch_nonce": "forged", "pid": 999999, "readiness": "ready",
+        "socket_path": str(paths.socket),
+    })
+    try:
+        assert ensure_worker(config, config_path, time.perf_counter() + 0.1, paths) is None
+    finally:
+        stopping.set()
+        server.close()
+        thread.join(timeout=2)
+        paths.socket.unlink(missing_ok=True)
+        paths.record.unlink(missing_ok=True)
+
+
+def test_stop_worker_never_signals_unverified_record_pid(tmp_path: Path):
+    _, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    _write_record(paths.record, {
+        "launch_nonce": "stale", "pid": sleeper.pid, "readiness": "ready",
+        "socket_path": str(paths.socket),
+    })
+    try:
+        assert stop_worker(config.database, paths, timeout=0.05) is False
+        assert sleeper.poll() is None
+        assert not paths.record.exists()
+    finally:
+        if sleeper.poll() is None:
+            sleeper.terminate()
+        sleeper.wait(timeout=2)
+
+
+def test_sigterm_worker_cleans_socket_and_record(tmp_path: Path):
+    config_path, config = make_config(tmp_path)
+    core.index(config)
+    paths = worker_paths(config.database)
+    result = ensure_worker(config, config_path, time.perf_counter() + 2, paths)
+    assert result is not None
+    record = _read_record(paths.record)
+    pid = record["pid"]
+    assert isinstance(pid, int)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not pid_alive(pid)
+        assert not paths.socket.exists()
+        assert not paths.record.exists()
+    finally:
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGTERM)
+
+
+def test_record_is_private_under_permissive_umask(tmp_path: Path):
+    path = tmp_path / "record"
+    previous = os.umask(0o022)
+    try:
+        _write_record(path, {"pid": os.getpid()})
+    finally:
+        os.umask(previous)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_live_pid_lock_is_not_treated_as_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_path, config = make_config(tmp_path)
     paths = worker_paths(config.database)
@@ -333,6 +433,91 @@ def test_dead_pid_lock_is_taken_over(tmp_path: Path):
         assert socket_ready(paths.socket)
     finally:
         stop_worker(config.database, paths)
+
+
+def test_socket_is_not_connectable_before_complete_record_is_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+    worker = PersistentWorker(config, paths, idle_seconds=2)
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    original_publish = worker._publish
+
+    def delayed_publish(state: str, pid: int) -> None:
+        publish_started.set()
+        assert release_publish.wait(2)
+        original_publish(state, pid)
+
+    monkeypatch.setattr(worker, "_publish", delayed_publish)
+    thread = threading.Thread(target=worker.serve)
+    thread.start()
+    try:
+        assert publish_started.wait(2)
+        assert not socket_ready(paths.socket)
+        assert _read_record(getattr(paths, "record", paths.lock)) == {}
+        release_publish.set()
+        wait_for_socket(paths.socket)
+        record = _read_record(getattr(paths, "record", paths.lock))
+        assert record["pid"] == os.getpid()
+        assert isinstance(record.get("launch_nonce"), str) and record["launch_nonce"]
+        assert record["readiness"] == "ready"
+    finally:
+        release_publish.set()
+        worker._stopping.set()
+        thread.join(timeout=2)
+
+
+def test_record_reader_never_observes_truncate_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import pausanias.worker as worker_module
+
+    path = tmp_path / "record"
+    old = {"pid": 1, "readiness": "ready"}
+    new = {"pid": 42, "readiness": "ready"}
+    _write_record(path, old)
+    write_paused = threading.Event()
+    release_write = threading.Event()
+
+    if hasattr(worker_module, "_write_record_fd"):
+        original_ftruncate = worker_module.os.ftruncate
+
+        def delayed_ftruncate(fd: int, length: int) -> None:
+            original_ftruncate(fd, length)
+            write_paused.set()
+            assert release_write.wait(2)
+
+        monkeypatch.setattr(worker_module.os, "ftruncate", delayed_ftruncate)
+        fd = os.open(path, os.O_RDWR)
+
+        def publish() -> None:
+            try:
+                worker_module._write_record_fd(fd, new)
+            finally:
+                os.close(fd)
+    else:
+        original_replace = worker_module.os.replace
+
+        def delayed_replace(source, destination) -> None:
+            write_paused.set()
+            assert release_write.wait(2)
+            original_replace(source, destination)
+
+        monkeypatch.setattr(worker_module.os, "replace", delayed_replace)
+
+        def publish() -> None:
+            worker_module._write_record(path, new)
+
+    writer = threading.Thread(target=publish)
+    writer.start()
+    assert write_paused.wait(2)
+    assert _read_record(path) == old
+    release_write.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    assert _read_record(path) == new
 
 
 def test_record_reader_never_sees_partial_atomic_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
