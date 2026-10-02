@@ -14,22 +14,19 @@ python -m eval.benchmarks.locomo.run --retrieval-mode {lexical,fused} --abstenti
 
 ## Verbatim precision gate fix
 
-The regression was caused by relaxed lexical candidates being admitted to the fused lexical lane alongside strict matches; their lexical RRF credit could displace strict/semantic results in the top four. Fused retrieval now keeps the strict pass authoritative when semantic fusion is active; lexical retrieval retains the relaxed pass.
+Exactly one verbatim case regressed. For `concept-turn-idempotence` (`same turn id packet`), pre-PAUS-17 returned only `beacon/concepts/idempotence.md` at rank 1. PAUS-17 kept that result at rank 1 but added the irrelevant `beacon/concepts/timeout.md` relaxed `2/3`-term body match at rank 2, reducing that case's precision@4 from 1.0 to 0.5 and fused verbatim precision@4 from 0.927419 to 0.911290.
 
-| check | before PAUS-17 | after fix |
-| --- | ---: | ---: |
-| fused verbatim precision@4 | 0.911290 | 0.927419 |
-| lexical verbatim precision@4 | 0.983871 | 1.000000 |
-| `eval.run` recall@4 / precision@4 / MRR / abstention | 0.735 / 0.724 / 0.735 / 1.000 | 0.735 / 0.735 / 0.735 / 1.000 |
+Three general policy families were measured. Harness columns are fused/lexical exit codes followed by verbatim, paraphrase, and held-out precision@4. `eval.run` is recall@4 / precision@4 / MRR / abstention accuracy. LOCOMO is recall@10 / MRR; false injection (FI) uses all 446 category-5 questions.
 
-LOCOMO retrieval-only comparison (1,540 category 1–4 questions):
+| policy | harness exit F/L | fused V/P/H | lexical V/P/H | `eval.run` | LOCOMO fused | LOCOMO lexical | FI fused/lexical |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| PAUS-17 as-is (all relaxed admitted) | 2 / 2 | .911 / .688 / .813 | .984 / .167 / .250 | .735 / .724 / .735 / 1.000 | 50.5% / .405 | 38.9% / .363 | 100.00% / 67.71% |
+| c73db4a (disable fused relaxed pass) | 0 / 2 | .927 / .688 / .813 | .984 / .167 / .250 | .735 / .735 / .735 / 1.000 | 40.8% / .271 | 38.9% / .363 | 100.00% / 67.71% |
+| semantic-overlap admission (relaxed with a strict hit needs a semantic-lane hit) | 0 / 0 | .927 / .688 / .813 | 1.000 / .167 / .250 | .735 / .735 / .735 / 1.000 | 50.49% / .4053 | 38.82% / .3627 | 100.00% / 67.71% |
+| **strict K=1 (chosen: relaxed only when strict returns zero hits)** | **0 / 0** | **.927 / .688 / .813** | **1.000 / .167 / .250** | **.735 / .735 / .735 / 1.000** | **50.43% / .4051** | **38.82% / .3627** | **99.78% / 67.71%** |
+| 75% content-term coverage | 0 / 0 | .927 / .688 / .813 | 1.000 / .000 / .000 | .673 / .673 / .673 / 1.000 | 41.70% / .3104 | 21.34% / .2127 | 100.00% / 27.58% |
 
-| mode | recorded PAUS-17 recall@10 / MRR | fix recall@10 / MRR | delta |
-| --- | ---: | ---: | ---: |
-| lexical | 38.9% / 0.363 | 38.9% / 0.363 | 0.0 / 0.000 |
-| fused | 50.5% / 0.405 | 29.8% / 0.161 | -20.7pp / -0.244 |
-
-Category-5 false injection remained 67.71% lexical and 100.00% fused. The fused LOCOMO loss is material; retaining PAUS-17's fused gain requires a more selective strict/relaxed admission policy than this gate-safe fallback.
+Strict K=1 was selected because it passes every internal gate in both modes, exceeds the 48% / .38 fused LOCOMO bars, retains all but 0.07 percentage points of PAUS-17 recall, and is the simplest policy. It also avoids one fused category-5 injection that the slightly higher-recall semantic-overlap option does not. The lexical LOCOMO difference from the original 38.9% rounds to 0.1 percentage point. No threshold, case, or lock file changed.
 
 
 | mode | run | recall@10 | MRR@10 | recall@50 | recall@200 |

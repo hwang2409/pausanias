@@ -69,6 +69,13 @@ jobs:
         run: .venv/bin/python -m pip install ".[semantic]"
       - name: run tests
         run: .venv/bin/python -m pytest -q
+      - name: cache pinned semantic model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pausanias/models/all-MiniLM-L6-v2
+          key: pausanias-model-${{ runner.os }}-all-MiniLM-L6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-${{ hashFiles('src/model_bundle.py') }}
+      - name: fetch pinned semantic model
+        run: .venv/bin/pausanias --config eval/corpus.toml model fetch
       - name: run retrieval harness gates
         run: |
           .venv/bin/python -m eval.harness --retrieval-mode fused

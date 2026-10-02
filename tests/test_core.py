@@ -507,7 +507,7 @@ def test_selection_reason_reports_body_match(tmp_path: Path):
     assert search(config, "body-only", project="p", semantic=False)[0].reason == "body match"
 
 
-def test_fused_relaxed_candidate_cannot_displace_strict_match(tmp_path: Path):
+def test_fused_candidate_without_relaxed_lexical_credit_cannot_displace_strict_match(tmp_path: Path):
     def candidate(section_id: str, heading: str) -> Candidate:
         return Candidate(
             section_id, f"{section_id}.md", heading, (heading,), 1, 2, "vault", "p",
@@ -517,10 +517,7 @@ def test_fused_relaxed_candidate_cannot_displace_strict_match(tmp_path: Path):
     strict = candidate("strict", "Strict")
     relaxed = replace(candidate("relaxed", "Relaxed"), reason="partial match (2/3 terms)")
     results = core._fuse_candidates(
-        [
-            replace(strict, lexical_rank=1),
-            replace(relaxed, lexical_rank=2),
-        ],
+        [replace(strict, lexical_rank=1)],
         [
             replace(relaxed, vector_rank=1, vector_score=1.0),
             replace(strict, vector_rank=10, vector_score=1.0),
@@ -1086,14 +1083,13 @@ def test_relaxed_matching_answers_natural_language_questions(tmp_path: Path):
     assert "partial match (3/3 terms)" in results[0].reason
 
 
-def test_strict_matches_rank_before_relaxed_matches(tmp_path: Path):
+def test_strict_matches_prevent_relaxed_admission(tmp_path: Path):
     _, config = _relaxed_vault(tmp_path)
 
     results = search(config, "what are the vault conventions for frontmatter?", project="p", semantic=False)
 
     assert results[0].canonical_path.endswith("strict.md")
-    assert "partial match" not in results[0].reason
-    assert any("partial match" in item.reason for item in results[1:])
+    assert all("partial match" not in item.reason for item in results)
 
 
 def test_relaxed_matching_rejects_near_miss_without_rare_term(tmp_path: Path):

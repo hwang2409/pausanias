@@ -73,10 +73,10 @@ RELAXED_LEXICAL_MATCHING = True
 RELAXED_MIN_COVERAGE = 0.5
 RELAXED_MIN_IDF_COVERAGE = 0.45
 RELAXED_LEXICAL_MATCHING_RATIONALE = (
-    "after strict all-term matches, admit sections that contain enough of the query's content terms "
+    "when strict all-term matching returns no candidates, admit sections that contain enough of the query's content terms "
     "(stopwords dropped; needs 2+ content terms; at least 2, or every term when there are exactly 2) and most of their IDF "
     "weight, so natural-language questions reach the lexical lane without dropping a query's most "
-    "distinctive term; strict matches always rank first and quoted queries stay strict"
+    "distinctive term; quoted queries stay strict"
 )
 MAX_RELAXED_ROWS = 1000
 # Relaxed matches rank by sum(idf(term) * weight of where it matched): the section's
@@ -124,6 +124,7 @@ SELECTION_POLICIES = {
         "enabled": RELAXED_LEXICAL_MATCHING,
         "value": RELAXED_MIN_COVERAGE,
         "idf_coverage": RELAXED_MIN_IDF_COVERAGE,
+        "strict_hit_limit": 0,
         "rationale": RELAXED_LEXICAL_MATCHING_RATIONALE,
     },
 }
@@ -814,7 +815,7 @@ def _lexical_candidates(
         relaxed_coverage: dict[str, int] = {}
         relaxed_weight: dict[str, float] = {}
         # A lone leftover keyword ("what about that decision") is too weak to match on.
-        if len(rows_by_id) < 2 and len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
+        if not rows_by_id and len(relaxed_terms) >= 2 and relaxed_required < len({token.casefold() for token in tokens}):
             relaxed_fts = " OR ".join('"' + term.replace('"', '""') + '"' for term in relaxed_terms)
             rows = connection.execute(
                 "SELECT s.*, bm25(sections_fts) AS fts_score FROM sections s "
@@ -965,10 +966,6 @@ def _lexical_candidates(
     return ranked[:candidate_limit], primary_rank, atom_matches, bool(_guard_atoms(query))
 
 
-def _is_relaxed_candidate(candidate: Candidate) -> bool:
-    return "partial match (" in candidate.reason
-
-
 def _fuse_candidates(
     lexical: list[Candidate],
     vector: list[Candidate],
@@ -1024,17 +1021,9 @@ def _fuse_candidates(
     guard_status = (
         "protected" if protected_order else ("bypassed:no-protected-hit" if guarded else "not-applicable")
     )
-    relaxed_ids = {candidate.section_id for candidate in lexical if _is_relaxed_candidate(candidate)}
-    strict_lexical_exists = any(
-        candidate.lexical_rank is not None and candidate.section_id not in relaxed_ids
-        for candidate in lexical
-    )
     fused: list[Candidate] = []
     for section_id, candidate in admitted.items():
-        relaxed_without_strict_lane = strict_lexical_exists and (
-            section_id in relaxed_ids or _is_relaxed_candidate(candidate)
-        )
-        lexical_rank = None if relaxed_without_strict_lane else candidate.lexical_rank
+        lexical_rank = candidate.lexical_rank
         vector_rank = candidate.vector_rank
         fused_score = (1.0 / (RRF_RANK_CONSTANT + lexical_rank) if lexical_rank is not None else 0.0) + (
             1.0 / (RRF_RANK_CONSTANT + vector_rank) if vector_rank is not None else 0.0
@@ -1093,7 +1082,7 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
     validation_refresh: set[str] = set()
     lexical, primary_rank, atom_matches, guarded = _lexical_candidates(
         config, query, project, root_id, all_projects, candidate_limit, validation_refresh, timings,
-        synonym_expansion, relaxed_matching=False,
+        synonym_expansion, relaxed_matching=relaxed_matching,
     )
     if timings is not None:
         timings.setdefault("semantic_available", 0.0)
@@ -1138,10 +1127,6 @@ def semantic_search(config: Config, query: str, project: str | None = None, root
                 if (candidate.vector_score or 0.0) >= semantic_floor
                 or candidate.section_id in lexical_ids
             ]
-    lexical = [
-        replace(item, lexical_rank=None) if _is_relaxed_candidate(item) else item
-        for item in lexical
-    ]
     return _fuse_candidates(
         lexical, semantic, primary_rank, atom_matches, guarded, limit, timings, semantic_score_floor,
         balanced_admission,
