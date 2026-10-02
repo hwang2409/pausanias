@@ -39,6 +39,7 @@ ADAPTER_DEADLINE_MS = 750.0
 DEFAULT_IDLE_SECONDS = 30 * 60
 SOCKET_TIMEOUT_SECONDS = 0.05
 CANCELLATION_TOMBSTONE_SECONDS = 5.0
+WORKER_PROTOCOL_VERSION = 2
 
 
 class WorkerError(RuntimeError):
@@ -83,7 +84,14 @@ def worker_paths(database: Path) -> WorkerPaths:
     identity = str(database.expanduser().resolve())
     digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
     parent = Path(tempfile.gettempdir())
-    return WorkerPaths(parent / f"pausanias-{digest}.sock", parent / f"pausanias-{digest}.lock")
+    namespace = f"pausanias-{digest}-v{WORKER_PROTOCOL_VERSION}"
+    return WorkerPaths(parent / f"{namespace}.sock", parent / f"{namespace}.lock")
+
+
+def _paths_use_current_protocol(paths: WorkerPaths) -> bool:
+    version = f"-v{WORKER_PROTOCOL_VERSION}"
+    return (paths.socket.name.endswith(f"{version}.sock")
+            and paths.lock.name.endswith(f"{version}.lock"))
 
 
 def _positive_ms(started: float) -> float:
@@ -217,6 +225,7 @@ def _identity_matches(paths: WorkerPaths, record: dict[str, object], timeout: fl
         return False
     response = _worker_request(paths, {"command": "identity"}, timeout)
     return (response is not None
+            and response.get("protocol_version") == WORKER_PROTOCOL_VERSION
             and response.get("pid") == identity[0]
             and response.get("launch_nonce") == identity[1])
 
@@ -238,6 +247,8 @@ def stop_worker(database: Path, paths: WorkerPaths | None = None, timeout: float
     removed; the unverified process is left untouched.
     """
     worker_paths_value = paths or worker_paths(database)
+    if not _paths_use_current_protocol(worker_paths_value):
+        return False
     record = _read_record(worker_paths_value.record)
     deadline = time.monotonic() + max(timeout, 0.0)
     remaining = max(deadline - time.monotonic(), 0.0)
@@ -285,6 +296,8 @@ class PersistentWorker:
                  encoder: object | None = None):
         self.config = config
         self.paths = paths or worker_paths(config.database)
+        if not _paths_use_current_protocol(self.paths):
+            raise WorkerError("worker paths do not match the current protocol namespace")
         self.encoder_factory = encoder_factory or OnnxEncoder
         self._injected_encoder_factory = encoder_factory is not None or encoder is not None
         self.idle_seconds = idle_seconds
@@ -310,7 +323,8 @@ class PersistentWorker:
             "database": str(self.config.database), "pid": pid,
             "launch_nonce": self._launch_nonce,
             "start_time": self._started, "socket_path": str(self.paths.socket),
-            "readiness": state, "config_fingerprint": _config_fingerprint(self.config),
+            "readiness": state, "protocol_version": WORKER_PROTOCOL_VERSION,
+            "config_fingerprint": _config_fingerprint(self.config),
         }
         _write_record(self.paths.record, record)
 
@@ -531,7 +545,10 @@ class PersistentWorker:
                 raise WorkerError("worker request must be an object")
             command = request.get("command")
             if command == "identity":
-                response = {"pid": os.getpid(), "launch_nonce": self._launch_nonce}
+                response = {
+                    "pid": os.getpid(), "launch_nonce": self._launch_nonce,
+                    "protocol_version": WORKER_PROTOCOL_VERSION,
+                }
             elif command == "shutdown":
                 nonce = request.get("launch_nonce")
                 if not isinstance(nonce, str) or not nonce or nonce != self._launch_nonce:
@@ -691,6 +708,7 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
     initial_record = {
         "database": str(database or paths.lock.parent), "pid": 0, "launch_nonce": nonce,
         "start_time": time.time(), "socket_path": str(paths.socket), "readiness": "starting",
+        "protocol_version": WORKER_PROTOCOL_VERSION,
         "config_fingerprint": config_fingerprint_value,
     }
     _write_record(paths.record, initial_record)
@@ -709,6 +727,8 @@ def launch_worker(config_path: Path, paths: WorkerPaths, lock_fd: int,
 def ensure_worker(config: Config, config_path: Path, deadline: float,
                   paths: WorkerPaths | None = None) -> tuple[WorkerPaths, float] | None:
     worker_paths_value = paths or worker_paths(config.database)
+    if not _paths_use_current_protocol(worker_paths_value):
+        return None
     started = time.perf_counter()
     expected_fingerprint = _config_fingerprint(config)
 
@@ -716,6 +736,7 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
         record = _read_record(worker_paths_value.record)
         remaining = min(SOCKET_TIMEOUT_SECONDS, max(deadline - time.perf_counter(), 0.0))
         return (_record_identity(record) is not None
+                and record.get("protocol_version") == WORKER_PROTOCOL_VERSION
                 and record.get("config_fingerprint") == expected_fingerprint
                 and record.get("readiness") == "ready"
                 and record.get("socket_path") == str(worker_paths_value.socket)
@@ -765,6 +786,8 @@ def ensure_worker(config: Config, config_path: Path, deadline: float,
 
 class WorkerClient:
     def __init__(self, paths: WorkerPaths):
+        if not _paths_use_current_protocol(paths):
+            raise WorkerError("worker paths do not match the current protocol namespace")
         self.paths = paths
 
     def query(self, request: dict[str, object], deadline: float) -> dict[str, object]:

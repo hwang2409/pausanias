@@ -567,6 +567,13 @@ loads from normal turns without making semantic retrieval a prerequisite for a t
 
 The worker lifecycle is bounded and recoverable:
 
+- Namespace lifecycle files by worker protocol version. Protocol v2 uses
+  `pausanias-<database-digest>-v2.sock`, `.lock`, and `.lock.record`; v2 clients never
+  connect to, authenticate, or signal the legacy unversioned paths. During an upgrade,
+  the first v2 hook starts a v2 worker while the legacy worker remains untouched. Both
+  may coexist briefly, and the legacy worker exits on its own after at most the 30-minute
+  idle period because v2 traffic cannot refresh it. This transition temporarily costs one
+  additional worker's memory (roughly the 90 MB model plus its runtime and matrix caches).
 - Keep one ONNX session per model-manifest fingerprint and one vector matrix per index
   generation plus scope key. Load each lazily on the first request that needs it.
 - Record a fingerprint of the resolved worker configuration, including the synonym-table

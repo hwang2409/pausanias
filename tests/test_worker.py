@@ -259,6 +259,28 @@ def test_worker_paths_use_protocol_versioned_namespace(tmp_path: Path):
     assert paths.record.name.endswith("-v2.lock.record")
 
 
+def test_worker_apis_reject_unversioned_paths_without_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import pausanias.worker as worker_module
+
+    config_path, config = make_config(tmp_path)
+    legacy_paths = WorkerPaths(tmp_path / "legacy.sock", tmp_path / "legacy.lock")
+
+    def unexpected_connection(*_args, **_kwargs):
+        raise AssertionError("unversioned worker path was accessed")
+
+    monkeypatch.setattr(worker_module, "_worker_request", unexpected_connection)
+    monkeypatch.setattr(worker_module, "socket_ready", unexpected_connection)
+
+    assert ensure_worker(config, config_path, time.perf_counter() + 1, legacy_paths) is None
+    assert stop_worker(config.database, legacy_paths) is False
+    with pytest.raises(WorkerError, match="protocol namespace"):
+        WorkerClient(legacy_paths)
+    with pytest.raises(WorkerError, match="protocol namespace"):
+        PersistentWorker(config, legacy_paths)
+
+
 def test_upgrade_ignores_real_legacy_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     legacy_tree_value = os.environ.get("PAUSANIAS_MAIN_TREE")
     if legacy_tree_value is None:
@@ -280,8 +302,21 @@ def test_upgrade_ignores_real_legacy_worker(tmp_path: Path, monkeypatch: pytest.
     )
     connection_count = tmp_path / "legacy-connections"
     script = """
+import importlib.util
 import sys
 from pathlib import Path
+
+legacy_tree = Path(sys.argv[5]).resolve()
+package_root = legacy_tree / "src"
+spec = importlib.util.spec_from_file_location(
+    "pausanias", package_root / "__init__.py",
+    submodule_search_locations=[str(package_root)],
+)
+assert spec is not None and spec.loader is not None
+package = importlib.util.module_from_spec(spec)
+sys.modules["pausanias"] = package
+spec.loader.exec_module(package)
+
 from pausanias.config import load_config
 from pausanias.worker import PersistentWorker, WorkerPaths
 
@@ -305,7 +340,7 @@ worker.serve()
     environment["PYTHONPATH"] = str(legacy_tree)
     legacy = subprocess.Popen(
         [sys.executable, "-c", script, str(config_path), str(legacy_paths.socket),
-         str(legacy_paths.lock), str(connection_count)],
+         str(legacy_paths.lock), str(connection_count), str(legacy_tree)],
         cwd=legacy_tree, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     signalled: list[int] = []
