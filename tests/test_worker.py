@@ -250,6 +250,105 @@ def test_worker_abstains_when_a_matching_source_is_deleted(tmp_path: Path):
         note.write_bytes(original)
 
 
+def test_worker_paths_use_protocol_versioned_namespace(tmp_path: Path):
+    _, config = make_config(tmp_path)
+    paths = worker_paths(config.database)
+
+    assert paths.socket.name.endswith("-v2.sock")
+    assert paths.lock.name.endswith("-v2.lock")
+    assert paths.record.name.endswith("-v2.lock.record")
+
+
+def test_upgrade_ignores_real_legacy_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    legacy_tree_value = os.environ.get("PAUSANIAS_MAIN_TREE")
+    if legacy_tree_value is None:
+        pytest.skip("set PAUSANIAS_MAIN_TREE to run the cross-version worker test")
+    legacy_tree = Path(legacy_tree_value)
+    if not (legacy_tree / "src/worker.py").exists():
+        pytest.skip("PAUSANIAS_MAIN_TREE does not contain the legacy worker")
+
+    import pausanias.worker as worker_module
+
+    config_path, config = make_config(tmp_path, semantic_bundle=tmp_path / "missing-bundle")
+    core.index(config)
+    digest = worker_module.hashlib.sha256(
+        str(config.database.expanduser().resolve()).encode()
+    ).hexdigest()[:20]
+    parent = Path(worker_module.tempfile.gettempdir())
+    legacy_paths = WorkerPaths(
+        parent / f"pausanias-{digest}.sock", parent / f"pausanias-{digest}.lock",
+    )
+    connection_count = tmp_path / "legacy-connections"
+    script = """
+import sys
+from pathlib import Path
+from pausanias.config import load_config
+from pausanias.worker import PersistentWorker, WorkerPaths
+
+config_path = Path(sys.argv[1])
+paths = WorkerPaths(Path(sys.argv[2]), Path(sys.argv[3]))
+connection_count = Path(sys.argv[4])
+worker = PersistentWorker(load_config(config_path), paths, idle_seconds=0.5)
+original = worker._serve_connection
+
+def counted(connection):
+    try:
+        count = int(connection_count.read_text()) if connection_count.exists() else 0
+        connection_count.write_text(str(count + 1))
+    finally:
+        original(connection)
+
+worker._serve_connection = counted
+worker.serve()
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(legacy_tree)
+    legacy = subprocess.Popen(
+        [sys.executable, "-c", script, str(config_path), str(legacy_paths.socket),
+         str(legacy_paths.lock), str(connection_count)],
+        cwd=legacy_tree, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    signalled: list[int] = []
+    real_kill = worker_module.os.kill
+
+    def record_signal(pid: int, signum: int) -> None:
+        if pid == legacy.pid and signum != 0:
+            signalled.append(signum)
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(worker_module.os, "kill", record_signal)
+    try:
+        deadline = time.monotonic() + 2
+        while not legacy_paths.socket.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert legacy_paths.socket.exists()
+
+        startup = ensure_worker(config, config_path, time.perf_counter() + 2)
+        assert startup is not None
+        current_paths, _ = startup
+        assert current_paths != legacy_paths
+        assert socket_ready(current_paths.socket)
+        observed_connections = connection_count.read_text() if connection_count.exists() else "0"
+        assert observed_connections == "0"
+        assert signalled == []
+
+        legacy.wait(timeout=2)
+        assert legacy.returncode == 0
+        assert signalled == []
+
+        response = run_hook(config, config_path, "alpha memory", project="p")
+        assert [item.heading for item in response.candidates] == ["Note"]
+        assert response.metrics.status == "semantic_disabled"
+        assert _read_record(current_paths.record)["pid"] != legacy.pid
+    finally:
+        stop_worker(config.database)
+        if legacy.poll() is None:
+            real_kill(legacy.pid, signal.SIGTERM)
+            legacy.wait(timeout=2)
+        legacy_paths.socket.unlink(missing_ok=True)
+        legacy_paths.lock.unlink(missing_ok=True)
+
+
 def test_concurrent_startup_launches_one_real_worker(tmp_path: Path):
     config_path, config = make_config(tmp_path)
     core.index(config)
