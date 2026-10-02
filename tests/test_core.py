@@ -1106,6 +1106,24 @@ def test_body_only_relaxed_match_stays_excluded_when_strict_match_exists(tmp_pat
     assert all(not item.canonical_path.endswith("body-echo.md") for item in results)
 
 
+def test_ancestor_heading_does_not_anchor_relaxed_match_after_strict_hit(tmp_path: Path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "strict.md").write_text(
+        "# Direct answer\n\nThe literal question was: what are notes alpha beta?\n"
+    )
+    (root / "shopping.md").write_text(
+        "# Notes\n\n## Shopping\n\nRemember to compare alpha beta products.\n"
+    )
+    config = make_config(tmp_path, [("vault", "p", root)])
+    index(config)
+
+    results = search(config, "what are notes alpha beta?", project="p", semantic=False)
+
+    assert results[0].canonical_path.endswith("strict.md")
+    assert all(item.heading != "Shopping" for item in results)
+
+
 def test_strong_heading_relaxed_match_survives_unrelated_strict_body_hit(tmp_path: Path):
     root = tmp_path / "vault"
     root.mkdir()
